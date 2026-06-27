@@ -1,0 +1,61 @@
+name: Doxygen
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# Allow only one concurrent Pages deployment; don't cancel in-progress runs so a
+# deploy that is already publishing is allowed to finish.
+concurrency:
+  group: "pages"
+  cancel-in-progress: false
+
+jobs:
+  build-documentation:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Doxygen
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            cmake doxygen graphviz
+
+      - name: Configure with CMake
+        run: |
+          cmake -S . -B build \
+            -DSOFAB_ENABLE_DOXYGEN=ON
+
+      - name: Build documentation
+        run: cmake --build build --target doc
+
+      - name: Upload documentation
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: build/docs/html
+
+  # Publish only on pushes to main; pull requests just build the docs above to
+  # verify they compile, without overwriting the live site.
+  deploy:
+    needs: build-documentation
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4

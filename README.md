@@ -9,7 +9,11 @@
 
 ## SofaBuffers C++ library
 
-[GitHub repository](https://github.com/sofa-buffers/corelib-cpp)
+[![Coverage](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/sofa-buffers/corelib-cpp/badges/coverage-cpp.json)](https://github.com/sofa-buffers/corelib-cpp/actions/workflows/coverage.yaml)
+[![Docs](https://img.shields.io/badge/docs-online-blue)](https://sofa-buffers.github.io/corelib-cpp/)
+
+[GitHub repository](https://github.com/sofa-buffers/corelib-cpp) ·
+[API documentation](https://sofa-buffers.github.io/corelib-cpp/)
 
 A **streaming**, **dependency-free**, pure-**C++20** implementation of the
 SofaBuffers (*Sofab*) serialization format — written from scratch with no C
@@ -20,6 +24,17 @@ It is API-compatible with the C/C++ corelib's
 [`sofab.hpp`](https://github.com/sofa-buffers/corelib-c-cpp) — same
 `sofab::OStream` / `sofab::OStreamInline` / `sofab::IStreamObject` surface — but
 shares no code with it and is tuned for raw speed. Requires **C++20** or later.
+
+### Built with following compilers
+
+| Target | Status |
+| - | - |
+| GCC x86_64 (little endian) | [![badge](https://github.com/sofa-buffers/corelib-cpp/actions/workflows/build-gcc-x86_64.yaml/badge.svg)](https://github.com/sofa-buffers/corelib-cpp/actions/workflows/build-gcc-x86_64.yaml) |
+| Clang x86_64 (little endian) | [![badge](https://github.com/sofa-buffers/corelib-cpp/actions/workflows/build-clang-x86_64.yaml/badge.svg)](https://github.com/sofa-buffers/corelib-cpp/actions/workflows/build-clang-x86_64.yaml) |
+| GCC ppc64 (big endian) | [![badge](https://github.com/sofa-buffers/corelib-cpp/actions/workflows/build-gcc-ppc64-bigendian.yaml/badge.svg)](https://github.com/sofa-buffers/corelib-cpp/actions/workflows/build-gcc-ppc64-bigendian.yaml) |
+
+The big-endian job cross-compiles to PowerPC64 and runs the full suite under
+qemu, exercising the byte-swapping float paths that little-endian hosts skip.
 
 Header-only: add `include/` to your include path, or install via CMake:
 
@@ -120,10 +135,29 @@ Requires a C++20-capable compiler (GCC 11+, Clang 14+, MSVC 19.30+) and CMake 3.
 
 Test suites:
 
-- **`test_roundtrip`** — focused encode/decode/nested/chunked/skip checks.
+- **`test_roundtrip`** — focused encode/decode/nested/chunked/skip checks plus
+  malformed-input handling (truncated/overlong varints, oversized lengths,
+  stray markers) and resync after a skipped sub-sequence.
 - **`test_vectors`** — replays the shared `assets/test_vectors.json` conformance
   suite (copied verbatim from the `documentation` repo) for encode, decode, and
   byte-at-a-time chunked streaming.
+
+### Coverage and API docs
+
+```sh
+# line/branch coverage of the header (needs gcovr)
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug -DSOFAB_ENABLE_COVERAGE=ON
+cmake --build build --parallel && ctest --test-dir build
+gcovr --root . --filter '^include/sofab/.*\.hpp$' --object-directory build --print-summary
+
+# Doxygen HTML into build/docs/html (needs doxygen + graphviz)
+cmake -S . -B build -DSOFAB_ENABLE_DOXYGEN=ON
+cmake --build build --target doc
+```
+
+CI runs these on every push: GCC/Clang build+test, a big-endian (ppc64) build
+that runs the suite under qemu, a coverage job that publishes the badge above,
+and a Doxygen job that deploys the API docs to GitHub Pages.
 
 ## Benchmarks
 

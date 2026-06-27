@@ -1,0 +1,46 @@
+name: GCC ppc64 (big endian) Build & Test
+
+# The wire format is little-endian. On a big-endian host the float encode/decode
+# paths take the byte-swapping `else` branch that x86_64 CI never reaches, so we
+# cross-compile to 64-bit big-endian PowerPC and run the full test suite under
+# qemu-user (registered through binfmt by qemu-user-static).
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install cross toolchain and qemu
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            cmake g++-powerpc64-linux-gnu gcc-powerpc64-linux-gnu qemu-user-static
+
+      - name: Configure with CMake (cross, static)
+        run: |
+          cmake -S . -B build \
+            -DCMAKE_BUILD_TYPE=Debug \
+            -DCMAKE_SYSTEM_NAME=Linux \
+            -DCMAKE_SYSTEM_PROCESSOR=ppc64 \
+            -DCMAKE_C_COMPILER=powerpc64-linux-gnu-gcc \
+            -DCMAKE_CXX_COMPILER=powerpc64-linux-gnu-g++ \
+            -DCMAKE_EXE_LINKER_FLAGS=-static
+
+      - name: Build project
+        run: cmake --build build --parallel
+
+      - name: Confirm binaries are big-endian PowerPC
+        run: file build/test_roundtrip build/test_vectors
+
+      - name: Run tests (under qemu via binfmt)
+        working-directory: build
+        run: ctest --output-on-failure --verbose
