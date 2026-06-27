@@ -2,4 +2,3 @@ build
 
 # Local secrets — never commit
 .env
-.devcontainer/.env
