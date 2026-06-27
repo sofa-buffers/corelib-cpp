@@ -17,15 +17,16 @@ below).
 load the shared conformance vectors so `test/test_vectors.cpp` can replay them
 through this repo's pure-C++20 `sofab::OStream` / `sofab::IStream`.
 
-The vectors it loads are **also vendored**, from a different upstream:
+The vectors it loads are **also vendored**, from the same upstream:
 
 | File | Upstream source | Pinned at |
 |------|-----------------|-----------|
-| `../../assets/test_vectors.json` | [`sofa-buffers/documentation`](https://github.com/sofa-buffers/documentation) → `assets/test_vectors.json` | commit `30bc30874726` (2026-06-25) |
+| `../../assets/test_vectors.json` | [`sofa-buffers/corelib-c-cpp`](https://github.com/sofa-buffers/corelib-c-cpp) → `assets/test_vectors.json` | commit `30a24305871b` (2026-06-27) |
 
 `test_vectors.json` is the cross-language source of truth for the wire format and
-is copied verbatim into every SofaBuffers corelib. `documentation` is the
-authority: if it and this copy ever disagree, the upstream file wins.
+is copied verbatim into every SofaBuffers corelib. We track the copy vendored in
+`corelib-c-cpp` (which itself mirrors the `documentation` repo, the ultimate
+authority); if our copy and upstream ever disagree, the upstream file wins.
 
 ## ⚠️ Keep in sync
 
@@ -36,7 +37,7 @@ happens:
 1. **The JSON reader changes upstream** (`corelib-c-cpp/test/shared/`) — re-copy
    `sofab_test_json.{c,h}` so this harness keeps parity with the rest of the
    family.
-2. **The vector file changes upstream** (`documentation/assets/test_vectors.json`)
+2. **The vector file changes upstream** (`corelib-c-cpp/assets/test_vectors.json`)
    — re-copy it. If the change introduces a new field-operation kind, element
    type, or JSON shape, the reader **and** `test/test_vectors.cpp` (which maps
    the JSON ops onto encode/decode calls) may also need updating, not just the
@@ -53,8 +54,8 @@ spec.
 curl -fsSL https://raw.githubusercontent.com/sofa-buffers/corelib-c-cpp/main/test/shared/sofab_test_json.c -o test/shared/sofab_test_json.c
 curl -fsSL https://raw.githubusercontent.com/sofa-buffers/corelib-c-cpp/main/test/shared/sofab_test_json.h -o test/shared/sofab_test_json.h
 
-# conformance vectors  <- documentation (source of truth)
-curl -fsSL https://raw.githubusercontent.com/sofa-buffers/documentation/main/assets/test_vectors.json -o assets/test_vectors.json
+# conformance vectors  <- corelib-c-cpp (mirrors documentation, the source of truth)
+curl -fsSL https://raw.githubusercontent.com/sofa-buffers/corelib-c-cpp/main/assets/test_vectors.json -o assets/test_vectors.json
 ```
 
 Then update the "Pinned at" commits in the table above to the new upstream SHAs.
