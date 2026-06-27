@@ -12,8 +12,7 @@
 [![Coverage](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/sofa-buffers/corelib-cpp/badges/coverage-cpp.json)](https://github.com/sofa-buffers/corelib-cpp/actions/workflows/coverage.yaml)
 [![Docs](https://img.shields.io/badge/docs-online-blue)](https://sofa-buffers.github.io/corelib-cpp/)
 
-[GitHub repository](https://github.com/sofa-buffers/corelib-cpp) ·
-[API documentation](https://sofa-buffers.github.io/corelib-cpp/)
+[GitHub repository](https://github.com/sofa-buffers/corelib-cpp)
 
 A **streaming**, **dependency-free**, pure-**C++20** implementation of the
 SofaBuffers (*Sofab*) serialization format — written from scratch with no C
