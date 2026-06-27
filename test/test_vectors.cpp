@@ -51,6 +51,7 @@ struct Vector
     std::string name;
     std::vector<Op> ops;
     std::vector<uint8_t> bytes;
+    std::vector<uint32_t> skip;   // field ids a receiver is expected to skip (skip_ids)
 };
 
 bool eq32(float a, float b) { return std::bit_cast<uint32_t>(a) == std::bit_cast<uint32_t>(b); }
@@ -184,6 +185,10 @@ bool loadVectors(const char *path, std::vector<Vector> &out, std::string &err)
             if (!loadOp(sofab_json_array_at(fields, k), op)) { err = v.name + ": bad field"; sofab_json_free(root); return false; }
             v.ops.push_back(std::move(op));
         }
+        const sofab_json_t *skip = sofab_json_get(vj, "skip_ids");
+        size_t nsk = sofab_json_array_size(skip);
+        for (size_t k = 0; k < nsk; k++)
+            v.skip.push_back(static_cast<uint32_t>(sofab_json_u64(sofab_json_array_at(skip, k))));
         size_t hl; const char *hex = sofab_json_string(sofab_json_get(sofab_json_get(vj, "serialized"), "hex"), &hl);
         if (!hex || !hex2bin(hex, hl, v.bytes)) { err = v.name + ": bad hex"; sofab_json_free(root); return false; }
         out.push_back(std::move(v));
@@ -260,9 +265,17 @@ bool encode(const Vector &v, size_t tiny, std::string &err)
 struct Cursor
 {
     const std::vector<Op> *ops = nullptr;
+    const std::vector<uint32_t> *skip = nullptr;   // null => skip nothing (plain decode)
     size_t i = 0;
     bool fail = false;
     std::string err;
+
+    bool skipId(uint32_t id) const
+    {
+        if (!skip) return false;
+        for (uint32_t s : *skip) if (s == id) return true;
+        return false;
+    }
 };
 
 struct GenericMsg : sofab::IStreamMessage
@@ -275,6 +288,24 @@ struct GenericMsg : sofab::IStreamMessage
         while (cur->i < ops.size() && ops[cur->i].kind == K::SeqE) cur->i++;
         if (cur->i >= ops.size()) { cur->fail = true; cur->err = "extra field"; return; }
         const Op &op = ops[cur->i++];
+
+        /* skip-ids: leave the field unread so the decoder auto-skips its payload.
+         * For a sequence, don't descend — the decoder skips the whole sub-tree —
+         * and advance the op cursor past the matching SequenceEnd (any nesting). */
+        if (cur->skipId(op.id))
+        {
+            if (op.kind == K::SeqB)
+            {
+                int depth = 1;
+                while (depth > 0 && cur->i < ops.size())
+                {
+                    K k = ops[cur->i++].kind;
+                    if (k == K::SeqB) ++depth;
+                    else if (k == K::SeqE) --depth;
+                }
+            }
+            return;
+        }
 
         auto bad = [&](const char *m) { if (!cur->fail) { cur->fail = true; cur->err = m; } };
 
@@ -318,9 +349,9 @@ struct GenericMsg : sofab::IStreamMessage
     }
 };
 
-bool decode(const Vector &v, bool oneByte, std::string &err)
+bool decode(const Vector &v, bool oneByte, std::string &err, const std::vector<uint32_t> *skip = nullptr)
 {
-    Cursor cur; cur.ops = &v.ops;
+    Cursor cur; cur.ops = &v.ops; cur.skip = skip;
     sofab::IStreamObject<GenericMsg> in;
     (*in).cur = &cur;
 
@@ -372,6 +403,11 @@ int main()
         for (size_t t : tinies) { std::string e; run(encode(v, t, e), v, "chunked-encode", e); }
         std::string d2; run(decode(v, false, d2), v, "decode", d2);
         std::string d3; run(decode(v, true, d3), v, "chunked-decode", d3);
+        if (!v.skip.empty())
+        {
+            std::string s1; run(decode(v, false, s1, &v.skip), v, "skip-ids", s1);
+            std::string s2; run(decode(v, true,  s2, &v.skip), v, "skip-ids-chunked", s2);
+        }
         std::string d4; run(roundtrip(v, d4), v, "roundtrip", d4);
     }
 
