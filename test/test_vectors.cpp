@@ -31,6 +31,54 @@ namespace {
 enum class K { U, S, B, F32, F64, Str, Blob, Arr, SeqB, SeqE };
 enum class E { U8, U16, U32, U64, I8, I16, I32, I64, F32, F64 };
 
+/* Optional library-feature capability tags (see assets/test_vectors_README.md).
+ * A vector's "requires" list names the features it needs; a build compiled
+ * without a feature (a SOFAB_DISABLE_* flag) skips the vectors that need it, so
+ * the same vector file drives every build configuration. This pure-C++20
+ * implementation always supports the full wire format, so buildCaps() reports
+ * everything and nothing is skipped — but the filter mirrors the shared C runner
+ * so a feature-reduced build (if ever introduced) would Just Work. */
+enum Cap : uint32_t
+{
+    CAP_FIXLEN   = 1u << 0,
+    CAP_ARRAY    = 1u << 1,
+    CAP_SEQUENCE = 1u << 2,
+    CAP_FP64     = 1u << 3,
+    CAP_INT64    = 1u << 4,
+};
+
+constexpr uint32_t buildCaps()
+{
+    uint32_t c = 0;
+#if !defined(SOFAB_DISABLE_FIXLEN_SUPPORT)
+    c |= CAP_FIXLEN;
+#endif
+#if !defined(SOFAB_DISABLE_ARRAY_SUPPORT)
+    c |= CAP_ARRAY;
+#endif
+#if !defined(SOFAB_DISABLE_SEQUENCE_SUPPORT)
+    c |= CAP_SEQUENCE;
+#endif
+    /* fp64 helpers live inside the fixlen block, so they need both. */
+#if !defined(SOFAB_DISABLE_FP64_SUPPORT) && !defined(SOFAB_DISABLE_FIXLEN_SUPPORT)
+    c |= CAP_FP64;
+#endif
+#if !defined(SOFAB_DISABLE_INT64_SUPPORT)
+    c |= CAP_INT64;
+#endif
+    return c;
+}
+
+uint32_t capFromName(const char *s)
+{
+    if (!std::strcmp(s, "fixlen"))   return CAP_FIXLEN;
+    if (!std::strcmp(s, "array"))    return CAP_ARRAY;
+    if (!std::strcmp(s, "sequence")) return CAP_SEQUENCE;
+    if (!std::strcmp(s, "fp64"))     return CAP_FP64;
+    if (!std::strcmp(s, "int64"))    return CAP_INT64;
+    return 0; /* unknown tag: ignore (forward-compatible) */
+}
+
 struct Op
 {
     K kind{};
@@ -52,6 +100,7 @@ struct Vector
     std::vector<Op> ops;
     std::vector<uint8_t> bytes;
     std::vector<uint32_t> skip;   // field ids a receiver is expected to skip (skip_ids)
+    uint32_t req = 0;             // capability mask from the "requires" tags
 };
 
 bool eq32(float a, float b) { return std::bit_cast<uint32_t>(a) == std::bit_cast<uint32_t>(b); }
@@ -189,6 +238,13 @@ bool loadVectors(const char *path, std::vector<Vector> &out, std::string &err)
         size_t nsk = sofab_json_array_size(skip);
         for (size_t k = 0; k < nsk; k++)
             v.skip.push_back(static_cast<uint32_t>(sofab_json_u64(sofab_json_array_at(skip, k))));
+        const sofab_json_t *req = sofab_json_get(vj, "requires");
+        size_t nr = sofab_json_array_size(req);
+        for (size_t k = 0; k < nr; k++)
+        {
+            size_t tl; const char *tn = sofab_json_string(sofab_json_array_at(req, k), &tl);
+            if (tn) v.req |= capFromName(tn);
+        }
         size_t hl; const char *hex = sofab_json_string(sofab_json_get(sofab_json_get(vj, "serialized"), "hex"), &hl);
         if (!hex || !hex2bin(hex, hl, v.bytes)) { err = v.name + ": bad hex"; sofab_json_free(root); return false; }
         out.push_back(std::move(v));
@@ -395,9 +451,15 @@ int main()
         if (!ok) { ++failures; if (first.empty()) first = v.name + "/" + scenario + ": " + detail; }
     };
 
+    const uint32_t caps = buildCaps();
+    int skipped = 0;
+
     const size_t tinies[] = {1, 3, 7};
     for (const Vector &v : vectors)
     {
+        /* skip vectors needing a feature this build was compiled without */
+        if (v.req & ~caps) { ++skipped; continue; }
+
         std::string d;
         run(encode(v, 0, d), v, "encode", d);
         for (size_t t : tinies) { std::string e; run(encode(v, t, e), v, "chunked-encode", e); }
@@ -411,7 +473,8 @@ int main()
         std::string d4; run(roundtrip(v, d4), v, "roundtrip", d4);
     }
 
-    std::printf("%zu vectors, %d checks, %d failures\n", vectors.size(), checks, failures);
+    std::printf("%zu vectors, %d run, %d skipped, %d checks, %d failures\n",
+                vectors.size(), static_cast<int>(vectors.size()) - skipped, skipped, checks, failures);
     if (failures) std::printf("first failure: %s\n", first.c_str());
     return failures ? 1 : 0;
 }

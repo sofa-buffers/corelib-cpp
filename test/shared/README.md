@@ -21,7 +21,7 @@ The vectors it loads are **also vendored**, from the same upstream:
 
 | File | Upstream source | Pinned at |
 |------|-----------------|-----------|
-| `../../assets/test_vectors.json` | [`sofa-buffers/corelib-c-cpp`](https://github.com/sofa-buffers/corelib-c-cpp) → `assets/test_vectors.json` | commit `30a24305871b` (2026-06-27) |
+| `../../assets/test_vectors.json` | [`sofa-buffers/corelib-c-cpp`](https://github.com/sofa-buffers/corelib-c-cpp) → `assets/test_vectors.json` | commit `c0579e940e37` (2026-06-27) |
 
 `test_vectors.json` is the cross-language source of truth for the wire format and
 is copied verbatim into every SofaBuffers corelib. We track the copy vendored in
@@ -41,7 +41,13 @@ happens:
    — re-copy it. If the change introduces a new field-operation kind, element
    type, or JSON shape, the reader **and** `test/test_vectors.cpp` (which maps
    the JSON ops onto encode/decode calls) may also need updating, not just the
-   data file.
+   data file. A vector may carry an optional top-level `requires` array of
+   capability tags (`fixlen`, `array`, `sequence`, `fp64`, `int64`); a build
+   compiled without a feature (a `SOFAB_DISABLE_*` flag) skips the vectors that
+   need it. This full-feature C++20 build provides every capability, so it runs
+   all vectors — the filter exists only so a feature-reduced build would skip
+   what it cannot represent. See `assets/test_vectors_README.md` upstream for the
+   authoritative format description.
 
 After any re-sync, run the suite (`ctest --test-dir build`) — a green
 `test_vectors` run is what proves this implementation still matches the shared
