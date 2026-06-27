@@ -1,0 +1,69 @@
+# ---------------------------------------------------------
+#       SofaBuffers C++ — Doxygen Configuration
+# ---------------------------------------------------------
+# Consumed by CMake (configure_file, @ONLY) when -DSOFAB_ENABLE_DOXYGEN=ON;
+# `cmake --build build --target doc` writes HTML to @CMAKE_BINARY_DIR@/docs/html.
+
+# Project information
+PROJECT_NAME            = "SofaBuffers C++"
+PROJECT_BRIEF           = "Pure-C++20 SofaBuffers — API Documentation"
+PROJECT_NUMBER          = "@PROJECT_VERSION@"
+PROJECT_LOGO            = "@CMAKE_SOURCE_DIR@/assets/sofabuffers_icon.png"
+
+# Input paths (the header is the whole library)
+INPUT                   = "@CMAKE_SOURCE_DIR@/include" \
+                          "@CMAKE_SOURCE_DIR@/README.md"
+FILE_PATTERNS           = *.hpp *.md
+RECURSIVE               = YES
+FULL_PATH_NAMES         = NO
+STRIP_FROM_PATH         = "@CMAKE_SOURCE_DIR@/include"
+
+# Output
+OUTPUT_DIRECTORY        = "@CMAKE_BINARY_DIR@/docs"
+GENERATE_HTML           = YES
+GENERATE_LATEX          = NO
+GENERATE_XML            = NO
+
+# C++-specific options
+OPTIMIZE_OUTPUT_FOR_C   = NO
+TYPEDEF_HIDES_STRUCT    = NO
+BUILTIN_STL_SUPPORT     = YES
+
+# Documentation content — public API only (the detail/ namespace stays internal)
+EXTRACT_ALL             = YES
+EXTRACT_STATIC          = YES
+EXTRACT_PRIVATE         = NO
+EXTRACT_PACKAGE         = NO
+EXTRACT_LOCAL_CLASSES   = NO
+EXTRACT_ANON_NSPACES    = NO
+HIDE_UNDOC_MEMBERS      = NO
+
+# Source code output
+SOURCE_BROWSER          = YES
+INLINE_SOURCES          = NO
+STRIP_CODE_COMMENTS     = NO
+
+# Markdown support
+MARKDOWN_SUPPORT        = YES
+USE_MDFILE_AS_MAINPAGE  = "@CMAKE_SOURCE_DIR@/README.md"
+
+# Diagrams (Graphviz)
+HAVE_DOT                = YES
+DOT_IMAGE_FORMAT        = svg
+CLASS_GRAPH             = YES
+COLLABORATION_GRAPH     = YES
+DOT_MULTI_TARGETS       = YES
+
+# HTML options
+GENERATE_TREEVIEW       = YES
+FULL_SIDEBAR            = YES
+
+# Warnings
+WARNINGS                = YES
+WARN_IF_UNDOCUMENTED    = NO
+WARN_NO_PARAMDOC        = YES
+
+# Miscellaneous
+QUIET                   = NO
+JAVADOC_AUTOBRIEF       = YES
+AUTOLINK_SUPPORT        = YES

@@ -221,6 +221,68 @@ static void skippingUnknownFields()
     CHECK((*in).b == -222, "skip: read only field 2");
 }
 
+/* --- malformed input (architecture §7.2): the decoder must never crash or read
+ *     out of bounds; corruption it can detect is surfaced as InvalidMessage, and
+ *     anything it cannot yet judge is held as "needs more bytes". --- */
+
+static void malformedInput()
+{
+    /* Truncated value varint (continuation bit set, then the buffer ends). A
+     * streaming decoder treats this as an incomplete tail — no field delivered,
+     * no error, no crash. */
+    {
+        sofab::IStreamObject<ScalarMsg> in;
+        const uint8_t bytes[] = {0x08, 0x80}; /* id 1, unsigned, dangling varint */
+        auto r = in.feed(bytes, sizeof bytes);
+        CHECK(r.code() == sofab::Error::None, "malformed: truncated varint buffered, not errored");
+        CHECK((*in).a == 0, "malformed: truncated varint yields no value");
+    }
+
+    /* Overlong varint (more than 10 groups → exceeds 64 bits): rejected. */
+    {
+        sofab::IStreamObject<ScalarMsg> in;
+        std::vector<uint8_t> bytes = {0x08}; /* id 1, unsigned */
+        for (int i = 0; i < 12; ++i) bytes.push_back(0x80);
+        bytes.push_back(0x01);
+        auto r = in.feed(bytes.data(), bytes.size());
+        CHECK(r.code() == sofab::Error::InvalidMessage, "malformed: overlong varint rejected");
+    }
+
+    /* Oversized fixlen length: the header claims far more payload than is
+     * present. Must be held as incomplete, never read past the buffer. */
+    {
+        sofab::IStreamObject<ScalarMsg> in;
+        const uint8_t bytes[] = {0x2a, static_cast<uint8_t>((200u << 3) | 2u), 'h', 'i'};
+        auto r = in.feed(bytes, sizeof bytes); /* id 5, string, len=200 */
+        CHECK(r.code() == sofab::Error::None, "malformed: oversized fixlen buffered, no OOB read");
+        CHECK((*in).s.empty(), "malformed: oversized fixlen yields no string");
+    }
+
+    /* A stray sequence-end marker at top level must be skipped, not crash. */
+    {
+        sofab::IStreamObject<ScalarMsg> in;
+        const uint8_t bytes[] = {0x07};
+        in.feed(bytes, sizeof bytes);
+        CHECK(true, "malformed: stray sequence-end survived");
+    }
+
+    /* Skip an entire unread sub-sequence, then resync on the field after it. */
+    {
+        sofab::OStreamInline<256> os;
+        os.sequenceBegin(1).write(0, uint64_t{7}).write(1, uint64_t{8}).sequenceEnd()
+          .write(2, int64_t{-222});
+
+        struct Only2 : sofab::IStreamMessage {
+            int64_t b = 0;
+            void deserialize(sofab::IStreamImpl &is, sofab::id id, size_t, size_t) noexcept override
+            { if (id == 2) is.read(b); }
+        };
+        sofab::IStreamObject<Only2> in;
+        in.feed(os.data(), os.bytesUsed());
+        CHECK((*in).b == -222, "malformed/skip: resync after skipped sub-sequence");
+    }
+}
+
 int main()
 {
     encodeVectors();
@@ -229,6 +291,7 @@ int main()
     roundtripNested();
     chunkedDecode();
     skippingUnknownFields();
+    malformedInput();
 
     std::printf("\n%d checks, %d failures\n", g_checks, g_failures);
     return g_failures ? 1 : 0;
