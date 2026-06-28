@@ -177,16 +177,16 @@ int main()
     static uint8_t buf[512];
     size_t msg_size = 0;
 
-    printf("=== SofaBuffers pure-C++20 per-op benchmark ===\n");
-    printf("(cycles/op = cost of the code; MB/s = speedtest for this host)\n");
+    printf("=== SofaBuffers pure-C++20 per-op cost (cycles/op + throughput MB/s) ===\n");
 
     PerfResult enc = measure_encode(buf, sizeof buf, msg_size);
-    perf_report("encode", enc, msg_size);
+    perf_report("serialize (stream API)", enc, msg_size);
 
     size_t len = perf_encode(buf, sizeof buf);
     PerfOut out;
     PerfResult dec = measure_decode(buf, len, out);
-    perf_report("decode", dec, len);
+    perf_report("deserialize (stream API)", dec, len);
 
+    printf("\ncycles/op tracks code cost; MB/s is this machine's throughput.\n");
     return 0;
 }
