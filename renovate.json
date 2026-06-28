@@ -1,0 +1,23 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "extends": [
+    "config:recommended",
+    ":dependencyDashboard",
+    ":semanticCommits"
+  ],
+  "timezone": "Europe/Berlin",
+  "schedule": ["before 6am on monday"],
+  "labels": ["dependencies"],
+  "packageRules": [
+    {
+      "description": "This repo builds with CMake and has no package-manager manifest; only GitHub Actions and the devcontainer base image are version-managed.",
+      "matchManagers": ["github-actions"],
+      "groupName": "github-actions"
+    },
+    {
+      "description": "Devcontainer base image (.devcontainer/Dockerfile -> ubuntu).",
+      "matchManagers": ["dockerfile"],
+      "groupName": "devcontainer image"
+    }
+  ]
+}
