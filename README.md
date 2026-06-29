@@ -101,7 +101,12 @@ os.flush(); // push the tail
 | `OStreamInline<N, Offset=0>` | Stack-allocated N-byte output stream — zero heap, suitable for any target |
 | `OStream(buf, len, offset, flush)` | Buffer + flush-callback encoder; `flush` called whenever the buffer fills |
 
-Common methods: `write(id, value)` (deduces type — unsigned, signed, bool, fp32, fp64, string, blob, array); `sequenceBegin(id)` / `sequenceEnd()`; `flush()`; `bytesUsed()`; `data()`.
+Common methods: `write(id, value)` (deduces type — unsigned, signed, bool, fp32,
+fp64, string, blob, array); `write(id, ptr, size)` (blob from a raw pointer);
+`writeIf(id, value, cond)`; `sequenceBegin(id)` / `sequenceEnd()`; `flush()`;
+`bytesUsed()`; `data()`. Every call returns a chainable `Result` that latches the
+first error (`ok()`, `code()`, `operator bool`), so a whole message can be written
+fluently and checked once at the end.
 
 **Decoder**
 
@@ -111,9 +116,108 @@ Common methods: `write(id, value)` (deduces type — unsigned, signed, bool, fp3
 | `IStreamObject<T>` | Wraps an `IStreamMessage`; call `feed(buf, len)` to decode; access via `->` / `*` |
 | `IStreamInline` | Lambda-based decoder — pass a `std::function` without subclassing |
 
-Inside `deserialize`, call `is.read(dest)` to bind a field or do nothing to skip.
+`feed(const uint8_t* buf, size_t len)` drives decoding and returns a `Result`
+(`ok()` / `code()` / `operator bool`). For each top-level field it invokes the
+callback / `deserialize(is, id, size, count)`, where `size` is the field's payload
+length in bytes (element size for fixlen arrays) and `count` is the array element
+count (`0` for scalars). Inside that callback, call `is.read(dest)` to bind the
+field or **do nothing to skip it** — an unconsumed field is automatically stepped
+over, so unknown / unwanted fields cost only a measure-and-advance.
 
-**Constants:** `sofab::API_VERSION` (`1`), `sofab::ID_MAX`.
+### Read operations
+
+All reads happen on the `IStreamImpl& is` passed to the callback; the type of the
+destination selects the decoder via `if constexpr`. The cursor is bounds-checked —
+on a malformed/truncated field the stream latches an error and `feed()` returns
+`Error::InvalidMessage`.
+
+| Call | Destination type | Result |
+|------|------------------|--------|
+| `is.read(x)` | `uint8_t … uint64_t` | unsigned varint decoded into `x` |
+| `is.read(x)` | `int8_t … int64_t` | zig-zag varint decoded into `x` |
+| `is.read(x)` | `bool` | varint `!= 0` |
+| `is.read(x)` | `float` / `double` | fp32 / fp64 loaded from the little-endian payload |
+| `is.read(x)` | `std::string_view` | **zero-copy** view onto the `size` payload bytes in the buffer |
+| `is.read(x)` | `std::string` | owning **copy** of the `size` payload bytes |
+| `is.read(x)` | `std::span<I>` / contiguous container of `I` (`I` an integer) | up to `min(dest.size(), count)` varints decoded element-wise into the caller's storage |
+| `is.read(x)` | `std::span<float/double>` / container thereof | array bulk-`memcpy`'d into the caller's storage (per-element byte-swap on big-endian) |
+| `is.read(dst, maxlen)` | `void* dst, size_t maxlen` | blob copied into the caller buffer; **returns** `size_t` bytes copied (`min(maxlen, size)`) |
+| `is.read(nested)` | a type derived from `IStreamMessage` | descends the sub-sequence, dispatching its fields to `nested.deserialize(...)` |
+| *(skip)* | — | leave the field unread; the payload is measured and skipped |
+
+### Allowed templates
+
+`write()` and `read()` deduce the wire type from the C++ type; only these are
+accepted (anything else is a hard `static_assert`):
+
+| Category | Types | Wire form |
+|----------|-------|-----------|
+| Unsigned ints | `uint8_t`, `uint16_t`, `uint32_t`, `uint64_t` | unsigned varint |
+| Signed ints | `int8_t`, `int16_t`, `int32_t`, `int64_t` | zig-zag varint |
+| Bool | `bool` | varint `0`/`1` |
+| Floats | `float` → fp32, `double` → fp64 | fixlen little-endian |
+| String | anything convertible to `std::string_view` (encode); `std::string_view` / `std::string` (decode) | fixlen string |
+| Blob | `write(id, const void*, int32_t)` (encode); `read(void*, size_t)` (decode) | fixlen blob |
+| Fixlen arrays | `std::span<I>` / contiguous containers of the **integer or float** scalars above | array-unsigned / array-signed / array-fixlen |
+| Sequences | a type deriving `OStreamMessage` (encode) / `IStreamMessage` (decode), or explicit `sequenceBegin`/`sequenceEnd` | nested sequence |
+
+Not allowed: arrays whose element type is itself a *dynamic* subtype — i.e. spans
+of `bool`, `std::string`, blobs, or nested messages. Fixlen arrays carry a single
+fixed element size on the wire, so only the scalar integer/float element types are
+permitted; passing any other span element type is a compile error.
+
+Inline encoders take their capacity as template parameters:
+`OStreamInline<N, Offset = 0>` reserves an `N`-byte stack buffer and starts writing
+at byte `Offset` (`Offset < N`), leaving room for a caller-prepended header.
+`OStreamObject<Msg, N = Msg::_maxSize, Offset = 0>` couples that buffer with a
+message instance.
+
+### Memory handling
+
+This is the defining trade-off of the C++ port, and it is the opposite of the C
+(`corelib-c-cpp`) port.
+
+**Decoder — zero-copy views into the caller's buffer.** `feed()` parses *in place*:
+when nothing is buffered (the common case — a whole message handed in at once) the
+cursor walks straight over the caller's contiguous `buf`, allocating nothing and
+copying nothing. Consequently:
+
+- `read(std::string_view&)` returns a view that **points directly into `buf`**; no
+  bytes are copied. The view stays valid only as long as that source buffer stays
+  alive and unmodified — outliving the buffer is a dangling-view bug. Use
+  `read(std::string&)` when you need an owning copy.
+- Integer arrays are decoded element-wise straight into the caller-provided
+  `span`/container; float arrays are bulk-`memcpy`'d into it (one `memcpy` on
+  little-endian). Either way the destination storage is the caller's — the stream
+  never allocates it.
+- `read(void* dst, size_t maxlen)` copies a blob into the caller's `dst`.
+- Because decoding is a pointer walk over contiguous memory, **the whole message
+  must already be in one contiguous buffer.** If a chunk handed to `feed()` ends
+  mid-field, only that incomplete trailing field is copied into an internal
+  accumulator and re-parsed on the next `feed()`; views read from such a stitched
+  field point into that accumulator instead of the original chunk.
+
+This is the inverse of the C port's deferred-copy model, where `read()` only *binds*
+a destination pointer and a later `feed()` copies the bytes into it as they arrive
+(so destinations must be address-stable). Here `read()` pulls the value out
+immediately and strings come back as views, so there is no per-field destination to
+keep stable — but the **input buffer** must stay alive for as long as any returned
+view is used.
+
+**Encoder — writes into an owned, fixed-size buffer; flushes, never grows.** An
+`OStream` owns its buffer through a `std::shared_ptr<uint8_t[]>` (allocated for you,
+or one you hand in / share); an `OStreamInline<N>` owns an `N`-byte `std::array` on
+the stack with zero heap use. Neither buffer grows. When the cursor reaches the end
+it calls the flush callback with the filled bytes and rewinds to the buffer start;
+**without** a callback a full buffer yields `Error::BufferFull`. So to emit a message
+larger than the buffer you supply a flush callback (see "Streaming a message larger
+than the buffer" above) and the buffer acts as a small reusable window. `bytesUsed()`
+/ `data()` expose the current contents, `flush()` pushes the tail, and `OStream`'s
+destructor flushes automatically.
+
+**Constants:** `sofab::API_VERSION` (`1`), `sofab::id` (the `uint32_t` field-id
+type), and the `sofab::Error` codes (`None`, `BufferFull`, `InvalidArgument`,
+`InvalidMessage`, `UsageError`) returned via `Result`.
 
 ## Feature flags
 
