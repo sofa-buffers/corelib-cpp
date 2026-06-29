@@ -45,55 +45,109 @@
 
 namespace sofab
 {
+    /// Version of the SofaBuffers public API implemented by this header.
     inline constexpr int API_VERSION = 1;
 
+    /**
+     * @brief Always-false trait used to trigger `static_assert` in the
+     *        otherwise-unreachable branch of an `if constexpr` chain.
+     *
+     * Because the value depends on the template parameter, the assertion only
+     * fires when that branch is actually instantiated, which is the idiomatic
+     * way to reject unsupported types at compile time.
+     *
+     * @tparam T The type the dependent assertion is bound to.
+     */
     template <typename>
     inline constexpr bool always_false_v = false;
 
+    /// Status codes returned by the encode/decode API; `None` signals success.
     enum class Error
     {
-        None = 0,
-        UsageError = 2,
-        BufferFull = 3,
-        InvalidArgument = 1,
-        InvalidMessage = 4,
+        None = 0,            ///< Operation succeeded.
+        UsageError = 2,      ///< The API was used incorrectly (e.g. out-of-order calls).
+        BufferFull = 3,      ///< The output buffer filled and no flush callback was set.
+        InvalidArgument = 1, ///< An argument was out of range (e.g. a field id above the limit).
+        InvalidMessage = 4,  ///< The input bytes are malformed or truncated.
     };
 
+    /// Field identifier on the wire. Valid range is `[0, INT32_MAX]`.
     using id = uint32_t;
 
     /* ---------------------------------------------------------------------- */
     /* wire-format primitives                                                 */
     /* ---------------------------------------------------------------------- */
 
+    /// Implementation details of the wire format; not part of the public API.
     namespace detail
     {
+        /// Wire type stored in the low 3 bits of every field header.
         enum class Wire : uint8_t
         {
-            Unsigned = 0, Signed = 1, Fixlen = 2,
-            ArrayUnsigned = 3, ArraySigned = 4, ArrayFixlen = 5,
-            SequenceStart = 6, SequenceEnd = 7,
+            Unsigned = 0,      ///< Unsigned integer encoded as a varint.
+            Signed = 1,        ///< Signed integer, zig-zag encoded as a varint.
+            Fixlen = 2,        ///< Length-prefixed payload (float, string or blob).
+            ArrayUnsigned = 3, ///< Count-prefixed array of unsigned varints.
+            ArraySigned = 4,   ///< Count-prefixed array of zig-zag varints.
+            ArrayFixlen = 5,   ///< Count-prefixed array of fixed-size elements.
+            SequenceStart = 6, ///< Opens a nested sub-message.
+            SequenceEnd = 7,   ///< Closes the most recently opened sub-message.
         };
 
-        enum class Fix : uint8_t { Fp32 = 0, Fp64 = 1, String = 2, Blob = 3 };
+        /// Sub-type of a length-prefixed (`Fixlen`) payload, stored in the low 3 bits of its length word.
+        enum class Fix : uint8_t
+        {
+            Fp32 = 0,   ///< 32-bit IEEE-754 float.
+            Fp64 = 1,   ///< 64-bit IEEE-754 double.
+            String = 2, ///< UTF-8 text.
+            Blob = 3,   ///< Opaque byte string.
+        };
 
+        /// Largest permitted field id (`INT32_MAX`); larger ids are rejected with @ref Error::InvalidArgument.
         inline constexpr uint32_t kIdMax = 0x7fffffffu; /* INT32_MAX */
 
+        /**
+         * @brief Map a signed integer to an unsigned one with the zig-zag scheme.
+         *
+         * Small-magnitude values of either sign map to small unsigned values, so
+         * they encode to short varints.
+         *
+         * @param v Signed value to transform.
+         * @return The zig-zag-encoded unsigned representation.
+         */
         constexpr uint64_t zigzagEncode(int64_t v) noexcept
         {
             return (static_cast<uint64_t>(v) << 1) ^ static_cast<uint64_t>(v >> 63);
         }
+        /**
+         * @brief Inverse of @ref zigzagEncode.
+         * @param u Zig-zag-encoded unsigned value.
+         * @return The original signed value.
+         */
         constexpr int64_t zigzagDecode(uint64_t u) noexcept
         {
             return static_cast<int64_t>((u >> 1) ^ (~(u & 1) + 1));
         }
 
-        /* Little-endian store/load of the raw bits of a float/double. */
+        /**
+         * @brief Reinterpret a float/double as the unsigned integer holding its bits.
+         * @tparam F Floating-point type (`float` or `double`).
+         * @param v Value whose object representation is extracted.
+         * @return `uint32_t` for a 4-byte `F`, otherwise `uint64_t`.
+         */
         template <std::floating_point F>
         constexpr auto floatBits(F v) noexcept
         {
             if constexpr (sizeof(F) == 4) return std::bit_cast<uint32_t>(v);
             else                          return std::bit_cast<uint64_t>(v);
         }
+        /**
+         * @brief Reconstruct a floating-point value from its raw bits.
+         * @tparam F Target floating-point type.
+         * @tparam U Unsigned integer type holding the bit pattern.
+         * @param bits Object representation produced by @ref floatBits.
+         * @return The floating-point value those bits encode.
+         */
         template <std::floating_point F, std::unsigned_integral U>
         constexpr F bitsFloat(U bits) noexcept
         {
@@ -107,19 +161,38 @@ namespace sofab
 
     class OStreamMessage;
 
+    /**
+     * @brief Base of the output streams: encodes values into a caller-provided buffer.
+     *
+     * Holds the write cursor and the encoding logic but owns no storage itself;
+     * the buffer is supplied by a derived class (@ref OStream, @ref OStreamInline).
+     * When the buffer fills, the optional flush callback is invoked with the bytes
+     * accumulated so far and the cursor rewinds, so a message may exceed the buffer
+     * (and even RAM). Without a callback, overflow returns @ref Error::BufferFull.
+     *
+     * Write calls return a chainable @ref Result that latches the first error.
+     */
     class OStreamImpl
     {
     public:
+        /// Callback invoked with a span of finished bytes whenever the buffer flushes.
         using flushCallback = std::function<void(std::span<const uint8_t>)>;
 
     protected:
-        uint8_t *buffer_ = nullptr;   /* start of the active buffer */
-        uint8_t *cursor_ = nullptr;   /* current write position */
-        uint8_t *end_ = nullptr;      /* one past the buffer */
-        flushCallback flushCallback_;
+        uint8_t *buffer_ = nullptr;   ///< Start of the active buffer.
+        uint8_t *cursor_ = nullptr;   ///< Current write position.
+        uint8_t *end_ = nullptr;      ///< One past the end of the buffer.
+        flushCallback flushCallback_; ///< Invoked when the buffer fills; may be empty.
 
+        /// Construct an unattached stream; a derived class must call @ref initBuffer.
         OStreamImpl() noexcept = default;
 
+        /**
+         * @brief Point the stream at a buffer and position the write cursor.
+         * @param buffer Storage to encode into.
+         * @param buflen Capacity of @p buffer in bytes.
+         * @param offset Number of leading bytes to leave untouched before the cursor.
+         */
         void initBuffer(uint8_t *buffer, size_t buflen, size_t offset) noexcept
         {
             buffer_ = buffer;
@@ -127,7 +200,12 @@ namespace sofab
             end_ = buffer + buflen;
         }
 
-        /* Encode a varint into a caller stack buffer; returns bytes written. */
+        /**
+         * @brief Encode an unsigned value as a base-128 varint.
+         * @param out Destination buffer; must hold at least 10 bytes.
+         * @param v Value to encode.
+         * @return Number of bytes written to @p out (1–10).
+         */
         static size_t encodeVarint(uint8_t *out, uint64_t v) noexcept
         {
             size_t n = 0;
@@ -140,6 +218,12 @@ namespace sofab
             return n;
         }
 
+        /**
+         * @brief Append a single byte, flushing first if the buffer is full.
+         * @param b Byte to write.
+         * @return @ref Error::None on success, or @ref Error::BufferFull if the
+         *         buffer is full and no flush callback is set.
+         */
         [[nodiscard]] Error pushByte(uint8_t b) noexcept
         {
             if (cursor_ == end_)
@@ -152,8 +236,18 @@ namespace sofab
             return Error::None;
         }
 
-        /* Bulk write: a single memcpy when the payload fits the current buffer
-         * (the common case); only crosses flush boundaries byte-by-byte. */
+        /**
+         * @brief Append a run of bytes.
+         *
+         * Uses a single `memcpy` when the payload fits the remaining buffer (the
+         * common case); otherwise falls back to a byte-by-byte copy that flushes
+         * across buffer boundaries.
+         *
+         * @param data Source bytes.
+         * @param len Number of bytes to append.
+         * @return @ref Error::None on success, or @ref Error::BufferFull if the
+         *         buffer fills with no flush callback set.
+         */
         [[nodiscard]] Error pushBytes(const uint8_t *data, size_t len) noexcept
         {
             if (static_cast<size_t>(end_ - cursor_) >= len) [[likely]]
@@ -167,19 +261,38 @@ namespace sofab
             return Error::None;
         }
 
+        /**
+         * @brief Encode a value as a varint and append it to the buffer.
+         * @param v Value to write.
+         * @return @ref Error::None on success, or @ref Error::BufferFull on overflow.
+         */
         [[nodiscard]] Error putVarint(uint64_t v) noexcept
         {
             uint8_t tmp[10];
             return pushBytes(tmp, encodeVarint(tmp, v));
         }
 
+        /**
+         * @brief Write a field header (field id and wire type) as one varint.
+         * @param fieldId Field identifier; must not exceed @ref detail::kIdMax.
+         * @param type Wire type of the field.
+         * @return @ref Error::InvalidArgument if @p fieldId is too large,
+         *         @ref Error::BufferFull on overflow, otherwise @ref Error::None.
+         */
         [[nodiscard]] Error putHeader(sofab::id fieldId, detail::Wire type) noexcept
         {
             if (fieldId > detail::kIdMax) return Error::InvalidArgument;
             return putVarint((static_cast<uint64_t>(fieldId) << 3) | static_cast<uint64_t>(type));
         }
 
-        /* header varint + one value varint emitted as a single bulk write */
+        /**
+         * @brief Write a scalar field: header varint plus one value varint, in a single bulk write.
+         * @param fieldId Field identifier; must not exceed @ref detail::kIdMax.
+         * @param type Wire type (@ref detail::Wire::Unsigned or @ref detail::Wire::Signed).
+         * @param value Already-encoded scalar value (zig-zagged for signed fields).
+         * @return @ref Error::InvalidArgument if @p fieldId is too large,
+         *         @ref Error::BufferFull on overflow, otherwise @ref Error::None.
+         */
         [[nodiscard]] Error writeScalar(sofab::id fieldId, detail::Wire type, uint64_t value) noexcept
         {
             if (fieldId > detail::kIdMax) return Error::InvalidArgument;
@@ -189,6 +302,15 @@ namespace sofab
             return pushBytes(tmp, n);
         }
 
+        /**
+         * @brief Write a length-prefixed field (string, blob or other fixlen payload).
+         * @param fieldId Field identifier; must not exceed @ref detail::kIdMax.
+         * @param ft Payload sub-type (@ref detail::Fix::String, @ref detail::Fix::Blob, ...).
+         * @param data Payload bytes.
+         * @param len Payload length in bytes.
+         * @return @ref Error::InvalidArgument if @p fieldId is too large,
+         *         @ref Error::BufferFull on overflow, otherwise @ref Error::None.
+         */
         [[nodiscard]] Error writeFixlen(sofab::id fieldId, detail::Fix ft, const uint8_t *data, size_t len) noexcept
         {
             if (fieldId > detail::kIdMax) return Error::InvalidArgument;
@@ -199,6 +321,14 @@ namespace sofab
             return pushBytes(data, len);
         }
 
+        /**
+         * @brief Write a single float or double as a little-endian fixlen field.
+         * @tparam F Floating-point type (`float` or `double`).
+         * @param fieldId Field identifier; must not exceed @ref detail::kIdMax.
+         * @param value Value to encode.
+         * @return @ref Error::InvalidArgument if @p fieldId is too large,
+         *         @ref Error::BufferFull on overflow, otherwise @ref Error::None.
+         */
         template <std::floating_point F>
         [[nodiscard]] Error writeFloatScalar(sofab::id fieldId, F value) noexcept
         {
@@ -212,6 +342,18 @@ namespace sofab
             return pushBytes(tmp, n);
         }
 
+        /**
+         * @brief Write an array of integers as a count-prefixed run of varints.
+         *
+         * The wire type is chosen from the element's signedness; signed elements
+         * are zig-zag encoded.
+         *
+         * @tparam E Integral element type.
+         * @param fieldId Field identifier; must not exceed @ref detail::kIdMax.
+         * @param elems Elements to encode, in order.
+         * @return @ref Error::InvalidArgument if @p fieldId is too large,
+         *         @ref Error::BufferFull on overflow, otherwise @ref Error::None.
+         */
         template <std::integral E>
         [[nodiscard]] Error writeIntArray(sofab::id fieldId, std::span<const E> elems) noexcept
         {
@@ -232,6 +374,18 @@ namespace sofab
             return Error::None;
         }
 
+        /**
+         * @brief Write an array of floats or doubles as a count-prefixed fixlen array.
+         *
+         * On little-endian hosts the payload is copied in one block since the wire
+         * layout matches native memory; on big-endian hosts each element is byte-swapped.
+         *
+         * @tparam F Floating-point element type (`float` or `double`).
+         * @param fieldId Field identifier; must not exceed @ref detail::kIdMax.
+         * @param elems Elements to encode, in order.
+         * @return @ref Error::InvalidArgument if @p fieldId is too large,
+         *         @ref Error::BufferFull on overflow, otherwise @ref Error::None.
+         */
         template <std::floating_point F>
         [[nodiscard]] Error writeFloatArray(sofab::id fieldId, std::span<const F> elems) noexcept
         {
@@ -262,7 +416,13 @@ namespace sofab
         }
 
     public:
-        /* Chainable result: each call short-circuits once an error is latched. */
+        /**
+         * @brief Chainable result of a write operation.
+         *
+         * Each chained call is a no-op once an error has been latched, so a
+         * sequence of writes can be expressed fluently and the first failure
+         * inspected at the end via @ref ok / @ref code.
+         */
         class Result
         {
             OStreamImpl &os_;
@@ -271,32 +431,61 @@ namespace sofab
             Result(OStreamImpl &os, Error e) noexcept : os_(os), error_(e) {}
 
         public:
+            /**
+             * @brief Chain another field write onto the same stream.
+             * @tparam T Value type accepted by @ref OStreamImpl::write.
+             * @param fieldId Field identifier.
+             * @param value Value to encode.
+             * @return `*this`, for further chaining.
+             */
             template <typename T>
             Result write(sofab::id fieldId, const T &value) noexcept
             {
                 if (error_ == Error::None) error_ = os_.write(fieldId, value).error_;
                 return *this;
             }
+            /**
+             * @brief Chain a field write that only happens when @p condition holds.
+             * @tparam T Value type accepted by @ref OStreamImpl::write.
+             * @param fieldId Field identifier.
+             * @param value Value to encode when @p condition is true.
+             * @param condition Write the field only if this is true.
+             * @return `*this`, for further chaining.
+             */
             template <typename T>
             Result writeIf(sofab::id fieldId, const T &value, bool condition) noexcept
             {
                 if (error_ == Error::None && condition) error_ = os_.write(fieldId, value).error_;
                 return *this;
             }
+            /**
+             * @brief Chain the opening of a nested sub-message.
+             * @param fieldId Field identifier of the sub-message.
+             * @return `*this`, for further chaining.
+             */
             Result sequenceBegin(sofab::id fieldId) noexcept
             {
                 if (error_ == Error::None) error_ = os_.sequenceBegin(fieldId).error_;
                 return *this;
             }
+            /**
+             * @brief Chain the closing of the current nested sub-message.
+             * @return `*this`, for further chaining.
+             */
             Result sequenceEnd() noexcept
             {
                 if (error_ == Error::None) error_ = os_.sequenceEnd().error_;
                 return *this;
             }
+            /// @return `true` if no error has been latched.
             [[nodiscard]] explicit operator bool() const noexcept { return ok(); }
+            /// @return `true` if no error has been latched.
             [[nodiscard]] bool ok() const noexcept { return error_ == Error::None; }
+            /// @return The latched status code (@ref Error::None if all writes succeeded).
             [[nodiscard]] Error code() const noexcept { return error_; }
+            /// @return `true` if the latched code equals @p e.
             bool operator==(Error e) const noexcept { return error_ == e; }
+            /// @return `true` if the latched code differs from @p e.
             bool operator!=(Error e) const noexcept { return error_ != e; }
         };
 
@@ -304,8 +493,13 @@ namespace sofab
         OStreamImpl &operator=(const OStreamImpl &) = delete;
         OStreamImpl(OStreamImpl &&) noexcept = default;
         OStreamImpl &operator=(OStreamImpl &&) noexcept = default;
+        /// Flushes any buffered bytes through the callback before destruction.
         virtual ~OStreamImpl() noexcept { flush(); }
 
+        /**
+         * @brief Hand any buffered bytes to the flush callback and rewind the cursor.
+         * @return Number of bytes that were buffered before the flush.
+         */
         size_t flush() noexcept
         {
             size_t used = static_cast<size_t>(cursor_ - buffer_);
@@ -315,9 +509,25 @@ namespace sofab
             return used;
         }
 
+        /// @return Number of bytes written into the buffer since the last flush.
         [[nodiscard]] size_t bytesUsed() const noexcept { return static_cast<size_t>(cursor_ - buffer_); }
+        /// @return Pointer to the start of the buffer; the first @ref bytesUsed bytes are valid.
         [[nodiscard]] const uint8_t *data() const noexcept { return buffer_; }
 
+        /**
+         * @brief Write a field, dispatching on the value's type.
+         *
+         * Handles integers (signed values are zig-zag encoded), `bool`, `float`,
+         * `double`, anything convertible to `std::string_view`, contiguous ranges
+         * of integers or floats (encoded as arrays), and nested @ref sofab::OStreamMessage
+         * objects (encoded as a sub-message). Unsupported types fail to compile.
+         *
+         * @tparam T Deduced value type.
+         * @param fieldId Field identifier; must not exceed @ref detail::kIdMax.
+         * @param value Value to encode.
+         * @return A @ref Result carrying @ref Error::None on success, or the first
+         *         error encountered.
+         */
         template <typename T>
         Result write(sofab::id fieldId, const T &value) noexcept
         {
@@ -367,68 +577,139 @@ namespace sofab
             return Result{*this, err};
         }
 
+        /**
+         * @brief Write a raw byte blob field.
+         * @param fieldId Field identifier; must not exceed @ref detail::kIdMax.
+         * @param value Pointer to the bytes to copy.
+         * @param size Number of bytes to copy.
+         * @return A @ref Result carrying @ref Error::None on success, or the error encountered.
+         */
         Result write(sofab::id fieldId, const void *value, int32_t size) noexcept
         {
             return Result{*this, writeFixlen(fieldId, detail::Fix::Blob,
                           static_cast<const uint8_t *>(value), static_cast<size_t>(size))};
         }
 
+        /**
+         * @brief Write a field only when @p condition holds.
+         * @tparam T Value type accepted by @ref write.
+         * @param fieldId Field identifier.
+         * @param value Value to encode when @p condition is true.
+         * @param condition Write the field only if this is true.
+         * @return The result of the write, or a success @ref Result if skipped.
+         */
         template <typename T>
         Result writeIf(sofab::id fieldId, const T &value, bool condition) noexcept
         {
             return condition ? write(fieldId, value) : Result{*this, Error::None};
         }
 
+        /**
+         * @brief Open a nested sub-message under @p fieldId.
+         *
+         * Fields written after this call belong to the sub-message until the
+         * matching @ref sequenceEnd.
+         *
+         * @param fieldId Field identifier of the sub-message.
+         * @return A @ref Result carrying @ref Error::None on success, or the error encountered.
+         */
         Result sequenceBegin(sofab::id fieldId) noexcept
         {
             return Result{*this, putHeader(fieldId, detail::Wire::SequenceStart)};
         }
+        /**
+         * @brief Close the most recently opened sub-message.
+         * @return A @ref Result carrying @ref Error::None on success, or the error encountered.
+         */
         Result sequenceEnd() noexcept
         {
             return Result{*this, putHeader(0, detail::Wire::SequenceEnd)};
         }
     };
 
+    /**
+     * @brief Output stream backed by a heap buffer held in a `shared_ptr`.
+     *
+     * The buffer can be allocated by the stream, adopted from the caller, or
+     * swapped at runtime via @ref setBuffer, and retrieved with @ref getBuffer
+     * so it may be shared with whatever consumes the encoded bytes.
+     */
     class OStream : public OStreamImpl
     {
     protected:
-        std::shared_ptr<uint8_t[]> bufferOwner_;
+        std::shared_ptr<uint8_t[]> bufferOwner_; ///< Owned backing storage.
+        /// Construct without a buffer; one must be set via @ref setBuffer.
         OStream() noexcept = default;
 
     public:
+        /**
+         * @brief Construct with a freshly allocated buffer.
+         * @param buflen Buffer capacity in bytes.
+         * @param offset Number of leading bytes to reserve before the write cursor.
+         */
         explicit OStream(size_t buflen, size_t offset = 0) noexcept
         {
             bufferOwner_ = std::make_shared<uint8_t[]>(buflen);
             initBuffer(bufferOwner_.get(), buflen, offset);
         }
+        /**
+         * @brief Construct over a caller-supplied buffer.
+         * @param buffer Backing storage to adopt.
+         * @param buflen Capacity of @p buffer in bytes.
+         * @param offset Number of leading bytes to reserve before the write cursor.
+         */
         OStream(std::shared_ptr<uint8_t[]> buffer, size_t buflen, size_t offset = 0) noexcept
             : bufferOwner_{std::move(buffer)}
         {
             initBuffer(bufferOwner_.get(), buflen, offset);
         }
+        /**
+         * @brief Construct over a caller-supplied buffer with a flush callback.
+         * @param callback Invoked with finished bytes whenever the buffer fills.
+         * @param buffer Backing storage to adopt.
+         * @param buflen Capacity of @p buffer in bytes.
+         * @param offset Number of leading bytes to reserve before the write cursor.
+         */
         OStream(flushCallback callback, std::shared_ptr<uint8_t[]> buffer, size_t buflen, size_t offset = 0) noexcept
             : bufferOwner_{std::move(buffer)}
         {
             flushCallback_ = std::move(callback);
             initBuffer(bufferOwner_.get(), buflen, offset);
         }
+        /**
+         * @brief Replace the backing buffer and reset the write cursor.
+         * @param buffer New backing storage to adopt.
+         * @param buflen Capacity of @p buffer in bytes.
+         * @param offset Number of leading bytes to reserve before the write cursor.
+         */
         void setBuffer(std::shared_ptr<uint8_t[]> buffer, size_t buflen, size_t offset = 0) noexcept
         {
             bufferOwner_ = std::move(buffer);
             initBuffer(bufferOwner_.get(), buflen, offset);
         }
+        /// @return A shared handle to the backing buffer.
         [[nodiscard]] std::shared_ptr<uint8_t[]> getBuffer() noexcept { return bufferOwner_; }
     };
 
+    /**
+     * @brief Output stream whose buffer is stored inline (no heap allocation).
+     * @tparam N Buffer capacity in bytes; must be greater than zero.
+     * @tparam Offset Number of leading bytes to reserve before the cursor; must be less than @p N.
+     */
     template <size_t N, size_t Offset = 0>
     class OStreamInline : public OStreamImpl
     {
         static_assert(N > 0, "Buffer size N must be greater than zero");
         static_assert(Offset < N, "Offset must be less than buffer size N");
-        std::array<uint8_t, N> bufferOwner_{};
+        std::array<uint8_t, N> bufferOwner_{}; ///< Inline backing storage.
 
     public:
+        /// Construct with no flush callback; overflow returns @ref Error::BufferFull.
         OStreamInline() noexcept { initBuffer(bufferOwner_.data(), N, Offset); }
+        /**
+         * @brief Construct with a flush callback.
+         * @param callback Invoked with finished bytes whenever the buffer fills.
+         */
         explicit OStreamInline(flushCallback callback) noexcept
         {
             flushCallback_ = std::move(callback);
@@ -436,31 +717,69 @@ namespace sofab
         }
     };
 
+    /**
+     * @brief Constrains a serialisable message: derives from @ref sofab::OStreamMessage
+     *        and exposes a `static constexpr std::size_t _maxSize`.
+     * @tparam T Candidate message type.
+     */
     template <class T>
     concept OutputMessage =
         std::derived_from<T, OStreamMessage> &&
         requires { { T::_maxSize } -> std::convertible_to<std::size_t>; } &&
         std::is_same_v<decltype(T::_maxSize), const std::size_t>;
 
+    /**
+     * @brief Base class for user-defined messages that can serialise themselves.
+     *
+     * Derive from this and implement @ref serialize to write the message's fields;
+     * the object can then be passed to @ref OStreamImpl::write to be encoded as a
+     * nested sub-message.
+     */
     class OStreamMessage
     {
     protected:
         friend class OStreamImpl;
+        /**
+         * @brief Write this message's fields into @p ostream.
+         * @param ostream Stream to encode into.
+         * @return A @ref OStreamImpl::Result carrying the outcome.
+         */
         virtual OStreamImpl::Result serialize(OStreamImpl &ostream) const noexcept = 0;
     };
 
+    /**
+     * @brief Bundles a message with an inline output buffer sized for it.
+     *
+     * Combines an @ref OStreamInline buffer with an instance of @p MessageType,
+     * so a message can be populated through `operator->` and then encoded in one
+     * @ref serialize call without managing a separate stream and buffer.
+     *
+     * @tparam MessageType A type satisfying @ref sofab::OutputMessage.
+     * @tparam N Buffer capacity in bytes; defaults to `MessageType::_maxSize`.
+     * @tparam Offset Number of leading bytes to reserve before the cursor.
+     */
     template <OutputMessage MessageType, size_t N = MessageType::_maxSize, size_t Offset = 0>
     class OStreamObject : public OStreamInline<N + Offset, Offset>
     {
         MessageType message_;
 
     public:
+        /// Construct with no flush callback.
         OStreamObject() noexcept = default;
+        /**
+         * @brief Construct with a flush callback.
+         * @param callback Invoked with finished bytes whenever the buffer fills.
+         */
         explicit OStreamObject(typename OStreamImpl::flushCallback callback) noexcept
             : OStreamInline<N + Offset, Offset>{std::move(callback)} {}
 
+        /// @return The wrapped message, so its fields can be populated via `obj->field`.
         MessageType &operator->() noexcept { return message_; }
 
+        /**
+         * @brief Serialise the wrapped message into the inline buffer and flush.
+         * @return A @ref OStreamImpl::Result carrying the outcome.
+         */
         OStreamImpl::Result serialize() noexcept
         {
             auto result = message_.serialize(static_cast<OStreamImpl &>(*this));
@@ -474,46 +793,70 @@ namespace sofab
     /* ---------------------------------------------------------------------- */
 
     class IStreamMessage;
+    /**
+     * @brief Constrains a deserialisable message: must derive from @ref sofab::IStreamMessage.
+     * @tparam T Candidate message type.
+     */
     template <typename T>
     concept InputMessage = std::derived_from<T, IStreamMessage>;
 
+    /**
+     * @brief Base of the input streams: decodes fields from fed bytes.
+     *
+     * Bytes are supplied through @ref feed, which may be called repeatedly with
+     * chunks. A whole message handed in at once is parsed in place with no copy;
+     * an incomplete trailing field is buffered and resumed on the next @ref feed.
+     * Each complete top-level field is delivered to a callback, inside which
+     * @ref read pulls the field's value out at the matching type.
+     */
     class IStreamImpl
     {
     public:
+        /// Outcome of a @ref feed call.
         class Result
         {
             Error error_;
             friend class IStreamImpl;
             explicit Result(Error e) noexcept : error_(e) {}
         public:
+            /// @return `true` if decoding succeeded.
             [[nodiscard]] explicit operator bool() const noexcept { return ok(); }
+            /// @return `true` if decoding succeeded.
             [[nodiscard]] bool ok() const noexcept { return error_ == Error::None; }
+            /// @return The status code (@ref Error::InvalidMessage on malformed input).
             [[nodiscard]] Error code() const noexcept { return error_; }
+            /// @return `true` if the status code equals @p e.
             bool operator==(Error e) const noexcept { return error_ == e; }
+            /// @return `true` if the status code differs from @p e.
             bool operator!=(Error e) const noexcept { return error_ != e; }
         };
 
     protected:
-        /* accumulated input; top-level fields are dispatched as they complete */
-        std::vector<uint8_t> acc_;
-        size_t topPos_ = 0;
+        std::vector<uint8_t> acc_; ///< Buffered bytes spanning @ref feed calls (incomplete trailing field).
+        size_t topPos_ = 0;        ///< Parse offset into @ref acc_ of the next unconsumed top-level field.
 
         /* cursor + current-field metadata, valid during a deliver callback */
-        const uint8_t *p_ = nullptr;
-        const uint8_t *end_ = nullptr;
-        detail::Wire type_{};
-        detail::Fix fixType_{};
-        size_t fixLen_ = 0;       /* payload bytes for fixlen / fixlen-array elem size */
-        size_t count_ = 0;        /* array element count */
-        bool consumed_ = false;
-        bool error_ = false;
+        const uint8_t *p_ = nullptr;   ///< Read cursor.
+        const uint8_t *end_ = nullptr; ///< One past the last readable byte.
+        detail::Wire type_{};          ///< Wire type of the field being delivered.
+        detail::Fix fixType_{};        ///< Sub-type of the current fixlen field.
+        size_t fixLen_ = 0;            ///< Payload length (fixlen) or element size (fixlen array), in bytes.
+        size_t count_ = 0;             ///< Element count of the current array field.
+        bool consumed_ = false;        ///< Set once the callback has read the current field's value.
+        bool error_ = false;           ///< Sticky decode-error flag for the current @ref feed.
 
-        /* deliver target for top-level fields */
-        std::function<void(sofab::id, size_t, size_t)> topCallback_;
+        std::function<void(sofab::id, size_t, size_t)> topCallback_; ///< Delivers each top-level field.
 
+        /// Construct an empty stream; a derived class installs @ref topCallback_.
         IStreamImpl() noexcept = default;
 
-        /* --- low-level cursor reads (bounds-checked) --- */
+        /**
+         * @brief Read one base-128 varint, advancing the cursor (bounds-checked).
+         * @param[in,out] p Cursor; advanced past the varint on success.
+         * @param end One past the last readable byte.
+         * @param[out] out Decoded value.
+         * @return `true` on success, `false` if the buffer ends mid-varint or it overflows 64 bits.
+         */
         static bool getVarint(const uint8_t *&p, const uint8_t *end, uint64_t &out) noexcept
         {
             uint64_t v = 0; int shift = 0;
@@ -527,14 +870,28 @@ namespace sofab
             }
             return false;
         }
+        /**
+         * @brief Advance the cursor past one varint without decoding it (bounds-checked).
+         * @param[in,out] p Cursor; advanced past the varint on success.
+         * @param end One past the last readable byte.
+         * @return `true` on success, `false` if the buffer ends mid-varint.
+         */
         static bool skipVarint(const uint8_t *&p, const uint8_t *end) noexcept
         {
             while (p < end) if (!(*p++ & 0x80)) return true;
             return false;
         }
 
-        /* Append n bytes to a byte vector. The pragma silences a GCC-13
-         * -Wstringop-overflow false positive on vector growth from a pointer. */
+        /**
+         * @brief Append @p n bytes to a byte vector.
+         *
+         * The surrounding pragma silences a GCC-13 `-Wstringop-overflow` false
+         * positive triggered by growing the vector from a raw pointer.
+         *
+         * @param v Vector to extend.
+         * @param p Source bytes.
+         * @param n Number of bytes to append.
+         */
 #if defined(__GNUC__) && !defined(__clang__)
 #  pragma GCC diagnostic push
 #  pragma GCC diagnostic ignored "-Wstringop-overflow"
@@ -548,6 +905,12 @@ namespace sofab
 #if defined(__GNUC__) && !defined(__clang__)
 #  pragma GCC diagnostic pop
 #endif
+        /**
+         * @brief Load a little-endian float or double from raw bytes.
+         * @tparam F Floating-point type to read (`float` or `double`).
+         * @param p Pointer to at least `sizeof(F)` readable bytes.
+         * @return The decoded value.
+         */
         template <std::floating_point F>
         static F loadFloat(const uint8_t *p) noexcept
         {
@@ -565,8 +928,15 @@ namespace sofab
             }
         }
 
-        /* Advance over one complete field WITHOUT firing callbacks.
-         * Returns false if the buffer ends mid-field (need more bytes). */
+        /**
+         * @brief Advance over one complete field (including nested sequences) without firing callbacks.
+         *
+         * Used to confirm a whole top-level field is present before delivering it.
+         *
+         * @param[in,out] p Cursor; advanced past the field on success.
+         * @param end One past the last readable byte.
+         * @return `true` if a full field was spanned, `false` if the buffer ends mid-field.
+         */
         bool measureField(const uint8_t *&p, const uint8_t *end) const noexcept
         {
             uint64_t header;
@@ -620,8 +990,17 @@ namespace sofab
             return false;
         }
 
-        /* Dispatch fields at one level, firing the given callback per field.
-         * `stopAtEnd` true => stop at a SequenceEnd marker (nested level). */
+        /**
+         * @brief Decode fields at the current nesting level, firing @p cb for each.
+         *
+         * For every field the metadata members (@ref type_, @ref fixLen_,
+         * @ref count_, ...) are set before @p cb runs; a field whose value the
+         * callback does not @ref read is skipped automatically.
+         *
+         * @param cb Callback invoked as `(fieldId, size, count)` per field.
+         * @param stopAtEnd If `true`, return at a @ref detail::Wire::SequenceEnd
+         *        marker (nested level); if `false`, such a marker is a decode error.
+         */
         void dispatchLevel(const std::function<void(sofab::id, size_t, size_t)> &cb, bool stopAtEnd) noexcept
         {
             while (p_ < end_ && !error_)
@@ -671,7 +1050,12 @@ namespace sofab
             }
         }
 
-        /* Skip the payload of the current field (cursor at payload start). */
+        /**
+         * @brief Skip the payload of the current field, leaving the cursor at the next field.
+         *
+         * Called for fields the user callback chose not to read. Assumes the cursor
+         * sits at the start of the payload and the field metadata is set.
+         */
         void skipPayload() noexcept
         {
             switch (type_)
@@ -710,6 +1094,18 @@ namespace sofab
         IStreamImpl &operator=(IStreamImpl &&) noexcept = default;
         virtual ~IStreamImpl() = default;
 
+        /**
+         * @brief Feed bytes into the decoder, delivering every complete top-level field.
+         *
+         * May be called repeatedly with successive chunks; a field split across
+         * chunks is buffered internally and completed on a later call. When nothing
+         * is buffered, the chunk is parsed in place without copying.
+         *
+         * @param buffer Bytes to decode.
+         * @param buflen Number of bytes in @p buffer.
+         * @return A @ref Result carrying @ref Error::None, or @ref Error::InvalidMessage
+         *         if the bytes are malformed.
+         */
         Result feed(const uint8_t *buffer, size_t buflen) noexcept
         {
             /* Fast path: nothing buffered. Parse straight over the caller's
@@ -738,8 +1134,13 @@ namespace sofab
         }
 
     protected:
-        /* Deliver every complete top-level field in [p, end); return the start
-         * of the first incomplete field (== end when all were consumed). */
+        /**
+         * @brief Deliver every complete top-level field in `[p, end)`.
+         * @param p Start of the bytes to parse.
+         * @param end One past the last readable byte.
+         * @return The start of the first incomplete field (equals @p end when all
+         *         bytes were consumed).
+         */
         const uint8_t *parseTopLevel(const uint8_t *p, const uint8_t *end) noexcept
         {
             while (p < end)
@@ -757,7 +1158,20 @@ namespace sofab
 
     public:
 
-        /* Read the current field's value into `value` (call inside a callback). */
+        /**
+         * @brief Read the current field's value, dispatching on @p value's type.
+         *
+         * Call from inside a deliver callback. The requested type must match the
+         * field's wire type. Handles integers (signed values are un-zig-zagged),
+         * `bool`, `float`, `double`, `std::string`, `std::string_view` (zero-copy,
+         * valid while the source bytes live), nested @ref sofab::IStreamMessage objects,
+         * and writable contiguous ranges of integers or floats (excess wire
+         * elements past the span's capacity are read and discarded). On a malformed
+         * or truncated field the stream's error flag is set.
+         *
+         * @tparam T Type to decode into.
+         * @param[out] value Destination for the decoded value.
+         */
         template <typename T>
         void read(T &value) noexcept
         {
@@ -849,7 +1263,16 @@ namespace sofab
             }
         }
 
-        /* Read a blob into a caller buffer; returns the number of bytes copied. */
+        /**
+         * @brief Read the current blob field into a caller buffer.
+         *
+         * Copies up to @p maxlen bytes; the field is consumed regardless of how
+         * much fit. Call from inside a deliver callback.
+         *
+         * @param dst Destination buffer.
+         * @param maxlen Capacity of @p dst in bytes.
+         * @return Number of bytes copied (`min(maxlen, payload length)`), or 0 on a truncated field.
+         */
         size_t read(void *dst, size_t maxlen) noexcept
         {
             size_t n = std::min(maxlen, fixLen_);
@@ -861,7 +1284,13 @@ namespace sofab
         }
 
     private:
-        /* deliver exactly one field at the current cursor to `cb` */
+        /**
+         * @brief Decode the field at the cursor, set its metadata and deliver it to @p cb.
+         *
+         * A field whose value @p cb does not @ref read is skipped automatically.
+         *
+         * @param cb Callback invoked as `(fieldId, size, count)` for the field.
+         */
         void dispatchOne(const std::function<void(sofab::id, size_t, size_t)> &cb) noexcept
         {
             uint64_t header;
@@ -895,33 +1324,72 @@ namespace sofab
         }
     };
 
+    /**
+     * @brief Input stream that delivers each top-level field to a user callback.
+     *
+     * The lightweight way to decode: supply a callback, then drive bytes through
+     * @ref feed and pull values out with @ref read inside the callback.
+     */
     class IStreamInline : public IStreamImpl
     {
     public:
+        /// Callback type invoked per top-level field as `(fieldId, size, count)`.
         using fieldCallback = std::function<void(sofab::id, size_t, size_t)>;
 
+        /**
+         * @brief Construct with the per-field callback.
+         * @param callback Invoked for each complete top-level field.
+         */
         explicit IStreamInline(fieldCallback callback) noexcept
         {
             topCallback_ = std::move(callback);
         }
     };
 
+    /**
+     * @brief Base class for user-defined messages that can deserialise themselves.
+     *
+     * Derive from this and implement @ref deserialize to read the message's fields;
+     * the type can then be decoded directly (e.g. via @ref IStreamObject or by
+     * reading a nested sub-message with @ref IStreamImpl::read).
+     */
     class IStreamMessage
     {
         template <InputMessage MessageType>
         friend class IStreamObject;
 
     public:
+        /**
+         * @brief Consume one of this message's fields from @p istream.
+         *
+         * Invoked once per field of the message; use @p id to dispatch and
+         * @ref IStreamImpl::read to pull the value.
+         *
+         * @param istream Stream positioned at the field's value.
+         * @param id Identifier of the field being delivered.
+         * @param size Payload length (fixlen) or element size (fixlen array), in bytes.
+         * @param count Element count for array fields, otherwise 0.
+         */
         virtual void deserialize(IStreamImpl &istream, sofab::id id, size_t size, size_t count) noexcept = 0;
         virtual ~IStreamMessage() = default;
     };
 
+    /**
+     * @brief Holds a message and routes decoded top-level fields into it.
+     *
+     * Owns a @p MessageType instance and wires its @ref sofab::IStreamMessage::deserialize
+     * as the per-field callback, so feeding bytes populates the message directly.
+     * The decoded message is reached through `operator->` / `operator*`.
+     *
+     * @tparam MessageType A type satisfying @ref sofab::InputMessage.
+     */
     template <InputMessage MessageType>
     class IStreamObject : public IStreamImpl
     {
         MessageType data_;
 
     public:
+        /// Construct and route each top-level field into the wrapped message.
         IStreamObject() noexcept
         {
             topCallback_ = [this](sofab::id id, size_t size, size_t count) {
@@ -929,9 +1397,13 @@ namespace sofab
             };
         }
 
+        /// @return The wrapped message (mutable access).
         MessageType &operator->() noexcept { return data_; }
+        /// @return The wrapped message (const access).
         const MessageType &operator->() const noexcept { return data_; }
+        /// @return Reference to the wrapped message (mutable access).
         MessageType &operator*() noexcept { return data_; }
+        /// @return Reference to the wrapped message (const access).
         const MessageType &operator*() const noexcept { return data_; }
     };
 
