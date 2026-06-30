@@ -48,6 +48,16 @@ namespace sofab
     /// Version of the SofaBuffers public API implemented by this header.
     inline constexpr int API_VERSION = 1;
 
+    /// Largest valid field id (`INT32_MAX`); see §6.2 of the spec.
+    inline constexpr uint32_t ID_MAX = 0x7fffffffu;
+    /// Largest fixlen payload byte-length (`INT32_MAX`); see §6.2 of the spec.
+    inline constexpr uint32_t FIXLEN_MAX = 0x7fffffffu;
+    /// Largest array element count (`INT32_MAX`); see §6.2 of the spec.
+    inline constexpr uint32_t ARRAY_MAX = 0x7fffffffu;
+    /// Maximum nested-sequence depth (§4.9, §6.2). Deeper nesting is rejected
+    /// (encode: @ref Error::InvalidArgument; decode: @ref Error::InvalidMessage).
+    inline constexpr int MAX_DEPTH = 255;
+
     /**
      * @brief Always-false trait used to trigger `static_assert` in the
      *        otherwise-unreachable branch of an `if constexpr` chain.
@@ -183,6 +193,7 @@ namespace sofab
         uint8_t *cursor_ = nullptr;   ///< Current write position.
         uint8_t *end_ = nullptr;      ///< One past the end of the buffer.
         flushCallback flushCallback_; ///< Invoked when the buffer fills; may be empty.
+        size_t seqDepth_ = 0;         ///< Number of currently-open nested sequences (§4.9 @ref MAX_DEPTH).
 
         /// Construct an unattached stream; a derived class must call @ref initBuffer.
         OStreamImpl() noexcept = default;
@@ -394,6 +405,9 @@ namespace sofab
             uint8_t hdr[20];
             size_t hn = encodeVarint(hdr, (static_cast<uint64_t>(fieldId) << 3) | static_cast<uint64_t>(detail::Wire::ArrayFixlen));
             hn += encodeVarint(hdr + hn, elems.size());
+            /* §4.8: a zero-count fixlen array is exactly [header][count=0] — no
+             * fixlen_word and no payload follow. */
+            if (elems.empty()) return pushBytes(hdr, hn);
             hn += encodeVarint(hdr + hn, (static_cast<uint64_t>(sizeof(F)) << 3) | static_cast<uint64_t>(ft));
             if (Error e = pushBytes(hdr, hn); e != Error::None) return e;
 
@@ -615,7 +629,12 @@ namespace sofab
          */
         Result sequenceBegin(sofab::id fieldId) noexcept
         {
-            return Result{*this, putHeader(fieldId, detail::Wire::SequenceStart)};
+            /* §4.9/§6.2: never open more than MAX_DEPTH nested sequences. */
+            if (seqDepth_ >= static_cast<size_t>(MAX_DEPTH))
+                return Result{*this, Error::InvalidArgument};
+            Result r{*this, putHeader(fieldId, detail::Wire::SequenceStart)};
+            if (r.ok()) ++seqDepth_;
+            return r;
         }
         /**
          * @brief Close the most recently opened sub-message.
@@ -623,6 +642,7 @@ namespace sofab
          */
         Result sequenceEnd() noexcept
         {
+            if (seqDepth_ > 0) --seqDepth_;
             return Result{*this, putHeader(0, detail::Wire::SequenceEnd)};
         }
     };
@@ -844,6 +864,7 @@ namespace sofab
         size_t count_ = 0;             ///< Element count of the current array field.
         bool consumed_ = false;        ///< Set once the callback has read the current field's value.
         bool error_ = false;           ///< Sticky decode-error flag for the current @ref feed.
+        int seqDepth_ = 0;             ///< Current nested-sequence depth during dispatch (§4.9 @ref MAX_DEPTH).
 
         std::function<void(sofab::id, size_t, size_t)> topCallback_; ///< Delivers each top-level field.
 
@@ -935,9 +956,12 @@ namespace sofab
          *
          * @param[in,out] p Cursor; advanced past the field on success.
          * @param end One past the last readable byte.
-         * @return `true` if a full field was spanned, `false` if the buffer ends mid-field.
+         * @param depth Current nesting depth; nesting past @ref MAX_DEPTH sets the
+         *        error flag (§4.9) so the caller reports @ref Error::InvalidMessage.
+         * @return `true` if a full field was spanned, `false` if the buffer ends
+         *         mid-field or the error flag was set (check @ref error_ to tell them apart).
          */
-        bool measureField(const uint8_t *&p, const uint8_t *end) const noexcept
+        bool measureField(const uint8_t *&p, const uint8_t *end, int depth = 0) noexcept
         {
             uint64_t header;
             if (!getVarint(p, end, header)) return false;
@@ -964,6 +988,7 @@ namespace sofab
                 case detail::Wire::ArrayFixlen:
                 {
                     uint64_t n; if (!getVarint(p, end, n)) return false;
+                    if (n == 0) return true; /* §4.8: zero-count → no fixlen_word, no payload */
                     uint64_t sub; if (!getVarint(p, end, sub)) return false;
                     size_t esize = static_cast<size_t>(sub >> 3);
                     size_t bytes = static_cast<size_t>(n) * esize;
@@ -972,6 +997,8 @@ namespace sofab
                 }
                 case detail::Wire::SequenceStart:
                 {
+                    /* §4.9: reject nesting past MAX_DEPTH instead of recursing unbounded. */
+                    if (depth + 1 > MAX_DEPTH) { error_ = true; return false; }
                     for (;;)
                     {
                         const uint8_t *save = p;
@@ -981,7 +1008,7 @@ namespace sofab
                         if (static_cast<detail::Wire>(peek & 0x7) == detail::Wire::SequenceEnd)
                         { p = q; return true; }
                         p = save;
-                        if (!measureField(p, end)) return false;
+                        if (!measureField(p, end, depth + 1)) return false;
                     }
                 }
                 case detail::Wire::SequenceEnd:
@@ -1032,10 +1059,14 @@ namespace sofab
                 else if (type_ == detail::Wire::ArrayFixlen)
                 {
                     uint64_t n; if (!getVarint(p_, end_, n)) { error_ = true; return; }
-                    uint64_t sub; if (!getVarint(p_, end_, sub)) { error_ = true; return; }
                     count_ = static_cast<size_t>(n);
-                    fixLen_ = static_cast<size_t>(sub >> 3); /* element size */
-                    fixType_ = static_cast<detail::Fix>(sub & 0x7);
+                    if (n == 0) { fixLen_ = 0; } /* §4.8: no fixlen_word for an empty array */
+                    else
+                    {
+                        uint64_t sub; if (!getVarint(p_, end_, sub)) { error_ = true; return; }
+                        fixLen_ = static_cast<size_t>(sub >> 3); /* element size */
+                        fixType_ = static_cast<detail::Fix>(sub & 0x7);
+                    }
                 }
 
                 consumed_ = false;
@@ -1080,7 +1111,10 @@ namespace sofab
                     break;
                 }
                 case detail::Wire::SequenceStart:
+                    if (seqDepth_ >= MAX_DEPTH) { error_ = true; break; } /* §4.9 */
+                    ++seqDepth_;
                     dispatchLevel([](sofab::id, size_t, size_t) {}, /*stopAtEnd*/ true);
+                    --seqDepth_;
                     break;
                 case detail::Wire::SequenceEnd:
                     break;
@@ -1146,7 +1180,11 @@ namespace sofab
             while (p < end)
             {
                 const uint8_t *probe = p;
-                if (!measureField(probe, end)) break; /* need more bytes */
+                if (!measureField(probe, end))
+                {
+                    if (error_) return p; /* malformed (e.g. nesting past MAX_DEPTH) */
+                    break;                /* need more bytes */
+                }
                 p_ = p;
                 end_ = end;
                 dispatchOne(topCallback_);
@@ -1216,9 +1254,12 @@ namespace sofab
             else if constexpr (InputMessage<T>)
             {
                 /* descend into a nested sequence */
+                if (seqDepth_ >= MAX_DEPTH) { error_ = true; return; } /* §4.9 */
+                ++seqDepth_;
                 dispatchLevel([this, &value](sofab::id i, size_t s, size_t c) {
                     value.deserialize(*this, i, s, c);
                 }, /*stopAtEnd*/ true);
+                --seqDepth_;
                 consumed_ = true;
             }
             else if constexpr (requires { typename T::value_type; std::span{std::declval<T &>()}; } &&
@@ -1312,9 +1353,13 @@ namespace sofab
             else if (type_ == detail::Wire::ArrayFixlen)
             {
                 uint64_t n; if (!getVarint(p_, end_, n)) { error_ = true; return; }
-                uint64_t sub; if (!getVarint(p_, end_, sub)) { error_ = true; return; }
                 count_ = static_cast<size_t>(n);
-                fixLen_ = static_cast<size_t>(sub >> 3); fixType_ = static_cast<detail::Fix>(sub & 0x7);
+                if (n == 0) { fixLen_ = 0; } /* §4.8: no fixlen_word for an empty array */
+                else
+                {
+                    uint64_t sub; if (!getVarint(p_, end_, sub)) { error_ = true; return; }
+                    fixLen_ = static_cast<size_t>(sub >> 3); fixType_ = static_cast<detail::Fix>(sub & 0x7);
+                }
             }
 
             consumed_ = false;
