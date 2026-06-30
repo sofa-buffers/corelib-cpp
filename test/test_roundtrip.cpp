@@ -283,6 +283,111 @@ static void malformedInput()
     }
 }
 
+/* --- zero-length wire forms (§4.7–4.9): zero-count arrays and empty sequences --- */
+
+struct EmptyArrMsg : sofab::IStreamMessage
+{
+    std::array<uint32_t, 4> u{9, 9, 9, 9};
+    std::array<int32_t, 4> s{9, 9, 9, 9};
+    std::array<float, 4> f{9, 9, 9, 9};
+    size_t uCount = 999, sCount = 999, fCount = 999;
+    int64_t tail = 0;
+    void deserialize(sofab::IStreamImpl &is, sofab::id id, size_t, size_t count) noexcept override
+    {
+        switch (id)
+        {
+            case 1: uCount = count; is.read(u); break;
+            case 2: sCount = count; is.read(s); break;
+            case 3: fCount = count; is.read(f); break;
+            case 4: is.read(tail); break;
+        }
+    }
+};
+
+static void zeroLengthForms()
+{
+    /* encode: exact wire bytes. A zero-count array is [header][count=0]; a
+     * zero-count fixlen array carries NO fixlen_word (§4.8), so fp32 and fp64
+     * empties are byte-identical. An empty sequence is [start][0x07] (§4.9). */
+    checkEncode("array_unsigned_empty", "0300", [](auto &os){ std::array<uint32_t, 0> a{}; os.write(0, a); });
+    checkEncode("array_signed_empty",   "0400", [](auto &os){ std::array<int32_t, 0> a{}; os.write(0, a); });
+    checkEncode("array_fp32_empty",     "0500", [](auto &os){ std::array<float, 0> a{}; os.write(0, a); });
+    checkEncode("array_fp64_empty",     "0500", [](auto &os){ std::array<double, 0> a{}; os.write(0, a); });
+    checkEncode("empty_sequence",       "0607", [](auto &os){ os.sequenceBegin(0).sequenceEnd(); });
+
+    /* decode: empty arrays followed by a real field must keep the cursor aligned
+     * (no spurious fixlen_word consumed). Feed whole, then one byte at a time. */
+    sofab::OStreamInline<64> os;
+    std::array<uint32_t, 0> eu{};
+    std::array<int32_t, 0> es{};
+    std::array<float, 0> ef{};
+    os.write(1, eu).write(2, es).write(3, ef).write(4, int64_t{-42});
+
+    for (int pass = 0; pass < 2; ++pass)
+    {
+        sofab::IStreamObject<EmptyArrMsg> in;
+        if (pass == 0)
+            in.feed(os.data(), os.bytesUsed());
+        else
+            for (size_t i = 0; i < os.bytesUsed(); ++i) in.feed(os.data() + i, 1);
+
+        CHECK((*in).uCount == 0, "zero-count unsigned array: count 0");
+        CHECK((*in).sCount == 0, "zero-count signed array: count 0");
+        CHECK((*in).fCount == 0, "zero-count fixlen array: count 0");
+        CHECK((*in).tail == -42, pass == 0 ? "zero-len: resync tail (whole)"
+                                           : "zero-len: resync tail (chunked)");
+    }
+
+    /* an empty sequence must round-trip: a child message whose sub-sequence has
+     * no fields decodes cleanly and the following field resyncs. */
+    {
+        sofab::OStreamInline<64> seq;
+        seq.sequenceBegin(1).sequenceEnd().write(2, int64_t{-7});
+        struct OnlyTail : sofab::IStreamMessage {
+            int64_t t = 0;
+            void deserialize(sofab::IStreamImpl &is, sofab::id id, size_t, size_t) noexcept override
+            { if (id == 2) is.read(t); }
+        };
+        sofab::IStreamObject<OnlyTail> in;
+        in.feed(seq.data(), seq.bytesUsed());
+        CHECK((*in).t == -7, "empty sequence: resync after empty sub-sequence");
+    }
+}
+
+/* --- MAX_DEPTH = 255 (§4.9, §6.2): bounded nesting on encode and decode --- */
+
+static void maxDepth()
+{
+    CHECK(sofab::MAX_DEPTH == 255, "MAX_DEPTH constant is 255");
+
+    /* encoder refuses to open a 256th nested sequence. */
+    {
+        sofab::OStreamInline<1024> os;
+        sofab::Error firstErr = sofab::Error::None;
+        int opened = 0;
+        for (int i = 0; i < 300; ++i)
+        {
+            auto r = os.sequenceBegin(0);
+            if (!r.ok()) { firstErr = r.code(); break; }
+            ++opened;
+        }
+        CHECK(opened == 255, "encoder opens exactly MAX_DEPTH sequences");
+        CHECK(firstErr == sofab::Error::InvalidArgument, "encoder rejects the 256th with InvalidArgument");
+    }
+
+    /* decoder rejects a message nested past MAX_DEPTH with InvalidMessage and
+     * never recurses unbounded (would otherwise overflow the native stack). */
+    {
+        std::vector<uint8_t> deep(300, 0x06); /* 300 bare sequence-start markers */
+        struct Empty : sofab::IStreamMessage {
+            void deserialize(sofab::IStreamImpl &, sofab::id, size_t, size_t) noexcept override {}
+        };
+        sofab::IStreamObject<Empty> in;
+        auto r = in.feed(deep.data(), deep.size());
+        CHECK(r.code() == sofab::Error::InvalidMessage, "decoder rejects nesting past MAX_DEPTH");
+    }
+}
+
 int main()
 {
     encodeVectors();
@@ -292,6 +397,8 @@ int main()
     chunkedDecode();
     skippingUnknownFields();
     malformedInput();
+    zeroLengthForms();
+    maxDepth();
 
     std::printf("\n%d checks, %d failures\n", g_checks, g_failures);
     return g_failures ? 1 : 0;
