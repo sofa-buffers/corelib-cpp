@@ -14,7 +14,7 @@ else
   echo "warning: $ENV_FILE not found — copy .devcontainer/.env.example to .devcontainer/.env to load secrets." >&2
 fi
 
-docker run -it --rm --name cpp-devcontainer \
+docker run -it --rm --name corelib-cpp-dev \
   "${env_args[@]}" \
   -e CLAUDE_CONFIG_DIR=/root/.claude \
   -v "$(pwd)":/workspace \

@@ -1,2 +1,2 @@
 #!/usr/bin/env bash
-docker exec -it cpp-devcontainer bash
+docker exec -it corelib-cpp-dev bash
