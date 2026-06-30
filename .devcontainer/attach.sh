@@ -1,2 +1,2 @@
 #!/usr/bin/env bash
-docker exec -it sofa-cpp-dev bash
+docker exec -it cpp-devcontainer bash

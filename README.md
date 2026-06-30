@@ -81,16 +81,26 @@ in.feed(msg.data(), msg.size());
 
 ```cpp
 #include "sofab/sofab.hpp"
+#include <span>
 #include <vector>
 
 std::vector<uint8_t> out;
-uint8_t scratch[16];
-sofab::OStream os(scratch, sizeof(scratch), 0,
-    [&](const uint8_t* p, size_t n){ out.insert(out.end(), p, p + n); });
+
+// A 16-byte window — far smaller than the message. The flush callback drains it
+// each time it fills (and once more at the end), so the encoder never needs the
+// whole message in memory. The callback takes a std::span<const uint8_t>.
+sofab::OStreamInline<16> os(
+    [&](std::span<const uint8_t> chunk){ out.insert(out.end(), chunk.begin(), chunk.end()); });
+
 for (uint32_t i = 0; i < 1000; i++)
     os.write(sofab::id(i), uint64_t(i));
-os.flush(); // push the tail
+os.flush(); // push the tail; `out` now holds the complete message
 ```
+
+A heap-backed `OStream` works the same way and additionally lets you swap the
+backing buffer mid-stream (typically inside the callback):
+`sofab::OStream os(callback, buffer, buflen, offset = 0)` where `buffer` is a
+`std::shared_ptr<uint8_t[]>` and `callback` is the same `std::span` sink.
 
 ## API summary
 
@@ -99,7 +109,8 @@ os.flush(); // push the tail
 | Class | Purpose |
 |-------|---------|
 | `OStreamInline<N, Offset=0>` | Stack-allocated N-byte output stream — zero heap, suitable for any target |
-| `OStream(buf, len, offset, flush)` | Buffer + flush-callback encoder; `flush` called whenever the buffer fills |
+| `OStream(flush, buf, len, offset=0)` | Heap-buffer + flush-callback encoder (`flush` first; `buf` is a `std::shared_ptr<uint8_t[]>`); `flush` is called whenever the buffer fills, and the buffer can be swapped mid-stream via `setBuffer` |
+| `OStreamInline<N>(flush)` | Stack-buffer encoder with a flush callback — small reusable window, zero heap |
 
 Common methods: `write(id, value)` (deduces type — unsigned, signed, bool, fp32,
 fp64, string, blob, array); `write(id, ptr, size)` (blob from a raw pointer);
@@ -215,16 +226,45 @@ than the buffer" above) and the buffer acts as a small reusable window. `bytesUs
 / `data()` expose the current contents, `flush()` pushes the tail, and `OStream`'s
 destructor flushes automatically.
 
-**Constants:** `sofab::API_VERSION` (`1`), `sofab::id` (the `uint32_t` field-id
-type), and the `sofab::Error` codes (`None`, `BufferFull`, `InvalidArgument`,
-`InvalidMessage`, `UsageError`) returned via `Result`.
+**Constants:** `sofab::API_VERSION` (`1`); the spec §6.2 limits `sofab::ID_MAX`,
+`sofab::FIXLEN_MAX`, `sofab::ARRAY_MAX` (all `INT32_MAX`) and `sofab::MAX_DEPTH`
+(`255`, the maximum nested-sequence depth); `sofab::id` (the `uint32_t` field-id
+type); and the `sofab::Error` codes (`None`, `BufferFull`, `InvalidArgument`,
+`InvalidMessage`, `UsageError`) returned via `Result`. Opening more than
+`MAX_DEPTH` nested sequences fails encoding with `InvalidArgument`; a message that
+nests deeper is rejected on decode with `InvalidMessage` (never an unbounded
+recursion).
 
 ## Feature flags
 
-The library is header-only C++20. All wire features — fixlen values (fp32/fp64,
-string, blob), arrays, and sequences — are always included; there are no
-compile-time disable switches. Use the C corelib (`corelib-c-cpp`) if binary
-footprint is a constraint.
+The library is header-only C++20 and **ships with every wire feature enabled by
+default** — this port optimises for throughput rather than footprint, so unlike the
+C corelib (`corelib-c-cpp`) the header itself contains no `#ifdef` gating and all
+features are always compiled in. The conformance harness (`test/test_vectors.cpp`),
+however, recognises the family-standard `SOFAB_DISABLE_*` toggles and skips the
+vectors a disabled feature would exercise, so a feature-reduced profile can be
+described and tested with the same switches used across the other ports.
+
+| Build option (define) | Default | Effect |
+|-----------------------|---------|--------|
+| `SOFAB_DISABLE_FIXLEN_SUPPORT`   | off (fixlen on)   | Drops fp32/fp64, string and blob fixlen values (and fixlen arrays). |
+| `SOFAB_DISABLE_FP64_SUPPORT`     | off (fp64 on)     | Drops 64-bit `double` support (fp32 stays). |
+| `SOFAB_DISABLE_ARRAY_SUPPORT`    | off (arrays on)   | Drops the array wire types (unsigned / signed / fixlen arrays). |
+| `SOFAB_DISABLE_SEQUENCE_SUPPORT` | off (sequences on)| Drops nested sequences (`sequenceBegin`/`sequenceEnd`). |
+| `SOFAB_DISABLE_INT64_SUPPORT`    | off (int64 on)    | Restricts integers to 32-bit. |
+
+Minimal build (drop fp64 and sequences, keep everything else):
+
+```sh
+cmake -S . -B build -DCMAKE_CXX_FLAGS="-DSOFAB_DISABLE_FP64_SUPPORT -DSOFAB_DISABLE_SEQUENCE_SUPPORT"
+cmake --build build --parallel
+ctest --test-dir build --output-on-failure   # the matching vectors are skipped automatically
+```
+
+> Note: because this header is intentionally always-on, the `SOFAB_DISABLE_*`
+> defines currently affect only which conformance vectors run; they are the
+> forward-compatible hooks a footprint-constrained fork would gate the header on.
+> If a strictly minimal binary is the goal, prefer the C corelib (`corelib-c-cpp`).
 
 ## Build & test
 
@@ -242,8 +282,8 @@ Test suites:
   malformed-input handling (truncated/overlong varints, oversized lengths,
   stray markers) and resync after a skipped sub-sequence.
 - **`test_vectors`** — replays the shared `assets/test_vectors.json` conformance
-  suite (copied verbatim from the `documentation` repo) for encode, decode, and
-  byte-at-a-time chunked streaming.
+  suite (generated by and copied verbatim from `corelib-c-cpp`, the authoritative
+  source per the spec) for encode, decode, and byte-at-a-time chunked streaming.
 
 ### Coverage and API docs
 
@@ -261,6 +301,14 @@ cmake --build build --target doc
 CI runs these on every push: GCC/Clang build+test, a big-endian (ppc64) build
 that runs the suite under qemu, a coverage job that publishes the badge above,
 and a Doxygen job that deploys the API docs to GitHub Pages.
+
+> CI layout vs. the spec: the language-independent plan (§12) names two canonical
+> workflows, `ci.yml` and `docs.yml`. This repo instead splits CI across
+> per-target files (`build-gcc-x86_64.yaml`, `build-clang-x86_64.yaml`,
+> `build-gcc-ppc64-bigendian.yaml`, `coverage.yaml`) plus a separate
+> `build-doxygen.yaml` for docs; the build matrix currently exercises the **Debug**
+> configuration only. These are tracked deviations — the build/test/coverage/docs
+> coverage itself is equivalent, only the file names and the Release leg differ.
 
 ## Benchmarks
 
