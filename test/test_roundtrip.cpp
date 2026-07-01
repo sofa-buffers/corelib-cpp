@@ -306,17 +306,19 @@ struct EmptyArrMsg : sofab::IStreamMessage
 
 static void zeroLengthForms()
 {
-    /* encode: exact wire bytes. A zero-count array is [header][count=0]; a
-     * zero-count fixlen array carries NO fixlen_word (§4.8), so fp32 and fp64
-     * empties are byte-identical. An empty sequence is [start][0x07] (§4.9). */
-    checkEncode("array_unsigned_empty", "0300", [](auto &os){ std::array<uint32_t, 0> a{}; os.write(0, a); });
-    checkEncode("array_signed_empty",   "0400", [](auto &os){ std::array<int32_t, 0> a{}; os.write(0, a); });
-    checkEncode("array_fp32_empty",     "0500", [](auto &os){ std::array<float, 0> a{}; os.write(0, a); });
-    checkEncode("array_fp64_empty",     "0500", [](auto &os){ std::array<double, 0> a{}; os.write(0, a); });
+    /* encode: exact wire bytes. A zero-count integer array is [header][count=0];
+     * a zero-count fixlen array still carries its fixlen_word (§4.8), so an empty
+     * fp32 (0x20) and fp64 (0x41) stay distinct. An empty sequence is [start][0x07]
+     * (§4.9). */
+    checkEncode("array_unsigned_empty", "0300",   [](auto &os){ std::array<uint32_t, 0> a{}; os.write(0, a); });
+    checkEncode("array_signed_empty",   "0400",   [](auto &os){ std::array<int32_t, 0> a{}; os.write(0, a); });
+    checkEncode("array_fp32_empty",     "050020", [](auto &os){ std::array<float, 0> a{}; os.write(0, a); });
+    checkEncode("array_fp64_empty",     "050041", [](auto &os){ std::array<double, 0> a{}; os.write(0, a); });
     checkEncode("empty_sequence",       "0607", [](auto &os){ os.sequenceBegin(0).sequenceEnd(); });
 
     /* decode: empty arrays followed by a real field must keep the cursor aligned
-     * (no spurious fixlen_word consumed). Feed whole, then one byte at a time. */
+     * (the empty fixlen array's fixlen_word is consumed, nothing more). Feed whole,
+     * then one byte at a time. */
     sofab::OStreamInline<64> os;
     std::array<uint32_t, 0> eu{};
     std::array<int32_t, 0> es{};

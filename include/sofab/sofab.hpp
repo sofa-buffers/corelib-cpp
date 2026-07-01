@@ -405,11 +405,11 @@ namespace sofab
             uint8_t hdr[20];
             size_t hn = encodeVarint(hdr, (static_cast<uint64_t>(fieldId) << 3) | static_cast<uint64_t>(detail::Wire::ArrayFixlen));
             hn += encodeVarint(hdr + hn, elems.size());
-            /* §4.8: a zero-count fixlen array is exactly [header][count=0] — no
-             * fixlen_word and no payload follow. */
-            if (elems.empty()) return pushBytes(hdr, hn);
+            /* §4.8: a fixlen array always carries its fixlen_word, even when empty
+             * (count == 0), so an empty fp32 and fp64 array stay distinguishable. */
             hn += encodeVarint(hdr + hn, (static_cast<uint64_t>(sizeof(F)) << 3) | static_cast<uint64_t>(ft));
             if (Error e = pushBytes(hdr, hn); e != Error::None) return e;
+            if (elems.empty()) return Error::None; /* fixlen_word emitted; no payload */
 
             if constexpr (std::endian::native == std::endian::little)
             {
@@ -988,7 +988,7 @@ namespace sofab
                 case detail::Wire::ArrayFixlen:
                 {
                     uint64_t n; if (!getVarint(p, end, n)) return false;
-                    if (n == 0) return true; /* §4.8: zero-count → no fixlen_word, no payload */
+                    /* §4.8: the fixlen_word is always present, even for a zero-count array. */
                     uint64_t sub; if (!getVarint(p, end, sub)) return false;
                     size_t esize = static_cast<size_t>(sub >> 3);
                     size_t bytes = static_cast<size_t>(n) * esize;
@@ -1060,13 +1060,10 @@ namespace sofab
                 {
                     uint64_t n; if (!getVarint(p_, end_, n)) { error_ = true; return; }
                     count_ = static_cast<size_t>(n);
-                    if (n == 0) { fixLen_ = 0; } /* §4.8: no fixlen_word for an empty array */
-                    else
-                    {
-                        uint64_t sub; if (!getVarint(p_, end_, sub)) { error_ = true; return; }
-                        fixLen_ = static_cast<size_t>(sub >> 3); /* element size */
-                        fixType_ = static_cast<detail::Fix>(sub & 0x7);
-                    }
+                    /* §4.8: the fixlen_word is always present, even for an empty array. */
+                    uint64_t sub; if (!getVarint(p_, end_, sub)) { error_ = true; return; }
+                    fixLen_ = static_cast<size_t>(sub >> 3); /* element size */
+                    fixType_ = static_cast<detail::Fix>(sub & 0x7);
                 }
 
                 consumed_ = false;
@@ -1354,12 +1351,9 @@ namespace sofab
             {
                 uint64_t n; if (!getVarint(p_, end_, n)) { error_ = true; return; }
                 count_ = static_cast<size_t>(n);
-                if (n == 0) { fixLen_ = 0; } /* §4.8: no fixlen_word for an empty array */
-                else
-                {
-                    uint64_t sub; if (!getVarint(p_, end_, sub)) { error_ = true; return; }
-                    fixLen_ = static_cast<size_t>(sub >> 3); fixType_ = static_cast<detail::Fix>(sub & 0x7);
-                }
+                /* §4.8: the fixlen_word is always present, even for an empty array. */
+                uint64_t sub; if (!getVarint(p_, end_, sub)) { error_ = true; return; }
+                fixLen_ = static_cast<size_t>(sub >> 3); fixType_ = static_cast<detail::Fix>(sub & 0x7);
             }
 
             consumed_ = false;
