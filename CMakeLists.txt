@@ -15,6 +15,7 @@ option(SOFAB_ENABLE_DOXYGEN  "Add a 'doc' target that builds the Doxygen API doc
 add_library(sofab_cpp INTERFACE)
 target_include_directories(sofab_cpp INTERFACE ${CMAKE_CURRENT_SOURCE_DIR}/include)
 add_library(sofab::cpp ALIAS sofab_cpp)
+add_library(sofa-buffers::corelib ALIAS sofab_cpp)
 
 # Coverage: instrument the test executables (not the speed-tuned benches) so the
 # gcovr report measures how much of include/sofab/sofab.hpp the suites exercise.
