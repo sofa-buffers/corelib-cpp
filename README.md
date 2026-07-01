@@ -41,6 +41,13 @@ Header-only: add `include/` to your include path, or install via CMake:
 cmake -S . -B build && cmake --install build
 ```
 
+### Package name
+
+Distributed as the vcpkg/Conan port `sofa-buffers-corelib` and consumed in CMake
+via the namespaced target `sofa-buffers::corelib` (header-only — just
+`#include <sofab/sofab.hpp>`). The existing `sofab::cpp` alias still works, and
+the code API keeps `namespace sofab`.
+
 ## Why this design
 
 The C corelib is optimised for **minimal code size and RAM** (it targets bare
