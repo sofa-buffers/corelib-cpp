@@ -13,9 +13,10 @@ set -euo pipefail
 cd "$(git rev-parse --show-toplevel)"
 
 extract() {
-    # extract <file> <perl-regex-with-\K-before-the-version>
+    # extract <file> <perl-regex-capturing-the-version-in-$1>. The whole file is
+    # slurped (perl -0777) so a project() call split across lines still matches.
     local file=$1 regex=$2 value
-    value=$(grep -oP "$regex" "$file" || true)
+    value=$(perl -0777 -ne "print \$1 if /$regex/" "$file")
     if [ -z "$value" ]; then
         echo "ERROR: could not find a version in $file" >&2
         exit 1
@@ -24,11 +25,11 @@ extract() {
 }
 
 cmake_ver=$(extract CMakeLists.txt \
-    'project\([^)]*VERSION[[:space:]]+\K[0-9]+\.[0-9]+\.[0-9]+')
+    'project\s*\([^)]*VERSION\s+([0-9]+\.[0-9]+\.[0-9]+)')
 vcpkg_ver=$(extract ports/sofa-buffers-corelib-cpp/vcpkg.json \
-    '"version"[[:space:]]*:[[:space:]]*"\K[0-9]+\.[0-9]+\.[0-9]+')
+    '"version"\s*:\s*"([0-9]+\.[0-9]+\.[0-9]+)"')
 conan_ver=$(extract conanfile.py \
-    'version[[:space:]]*=[[:space:]]*"\K[0-9]+\.[0-9]+\.[0-9]+')
+    'version\s*=\s*"([0-9]+\.[0-9]+\.[0-9]+)"')
 
 echo "Declared versions:"
 echo "  CMakeLists.txt              : $cmake_ver"

@@ -1,6 +1,6 @@
 {
   "name": "sofa-buffers-corelib-cpp",
-  "version": "1.0.0",
+  "version": "0.8.0",
   "description": "Streaming, dependency-free, pure-C++20 implementation of the SofaBuffers (Sofab) serialization format. Header-only.",
   "homepage": "https://github.com/sofa-buffers/corelib-cpp",
   "documentation": "https://sofa-buffers.github.io/corelib-cpp/",
