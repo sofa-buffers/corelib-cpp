@@ -95,87 +95,92 @@ where the whole message is already in contiguous memory.
 
 ## Usage
 
-### Simple encode & decode
+The codec has four use cases — serialize a message that fits in one buffer,
+serialize one too large for the buffer (streamed out in chunks), deserialize a
+whole message, and deserialize one arriving in chunks — plus the generated-code
+path that wraps them.
+
+### Serialize
+
+Write fields into a stack buffer big enough to hold the whole message and take a
+view of the bytes. Every `write()` returns a chainable `Result` that latches the
+first error, so you write fluently and check once at the end.
 
 ```cpp
 #include "sofab/sofab.hpp"
 
-// ---- encode into an inline (stack) buffer, no heap ----
-sofab::OStreamInline<64> os;
-os.write(1, 42u).write(2, -7).write(3, "hi");
+sofab::OStreamInline<64> os;          // 64-byte inline (stack) buffer, no heap
+os.write(1, 42u)
+  .write(2, -7)
+  .write(3, "hi");
 std::span<const uint8_t> msg{os.data(), os.bytesUsed()};
+```
 
-// ---- decode by pushing fields into an IStreamMessage ----
+### Serialize stream
+
+When the message is larger than the buffer, give the stream a flush callback: the
+buffer becomes a small reusable window, drained whenever it fills (and once at the
+end), so the encoder never holds the whole message in memory.
+
+```cpp
+#include "sofab/sofab.hpp"
+
+std::vector<uint8_t> out;
+sofab::OStreamInline<16> os(          // 16-byte window; drained each time it fills
+    [&](std::span<const uint8_t> chunk){ out.insert(out.end(), chunk.begin(), chunk.end()); });
+
+for (uint32_t i = 0; i < 1000; i++)
+    os.write(sofab::id(i), uint64_t(i));
+os.flush();                           // push the tail; `out` holds the whole message
+```
+
+### Deserialize
+
+Derive a message from `IStreamMessage` and dispatch fields in `deserialize()`;
+`IStreamObject` wires the decoder to an embedded instance. Fields you don't
+`read()` are measured and skipped automatically.
+
+```cpp
+#include "sofab/sofab.hpp"
+
 struct Sensor : sofab::IStreamMessage {
     uint32_t id = 0; float value = 0;
     void deserialize(sofab::IStreamImpl& is, sofab::id i, size_t, size_t) noexcept override {
         switch (i) { case 1: is.read(id); break; case 2: is.read(value); break; }
     }
 };
+
 sofab::IStreamObject<Sensor> in;
-in.feed(msg.data(), msg.size());
+in.feed(msg.data(), msg.size());      // msg from the Serialize example above
 // (*in).id and (*in).value now hold the decoded values
 ```
 
-Every `write()` returns a chainable `Result` that latches the first error, so a
-message is written fluently and checked once at the end. During decode, a field
-you don't `read()` is measured and skipped automatically.
+### Deserialize stream
 
-### Streaming a message larger than the buffer (`OStream`)
-
-`OStream`/`OStreamInline` never grow their buffer. Give them a flush callback and
-the buffer becomes a small reusable window, drained whenever it fills (and once
-at the end), so the encoder never needs the whole message in memory.
-
-```cpp
-#include "sofab/sofab.hpp"
-#include <span>
-#include <vector>
-
-std::vector<uint8_t> out;
-
-// A 16-byte window; the flush callback drains it each time it fills.
-sofab::OStreamInline<16> os(
-    [&](std::span<const uint8_t> chunk){ out.insert(out.end(), chunk.begin(), chunk.end()); });
-
-for (uint32_t i = 0; i < 1000; i++)
-    os.write(sofab::id(i), uint64_t(i));
-os.flush(); // push the tail; `out` now holds the complete message
-```
-
-A heap-backed `sofab::OStream` works the same way and additionally lets you swap
-the backing buffer mid-stream via `setBuffer()`. Its buffer is owned through a
-`std::shared_ptr<uint8_t[]>` — either allocated for you (`OStream(buflen, offset
-= 0)`) or handed in (`OStream(flush, buffer, buflen, offset = 0)`).
-
-### Streaming decode (`IStream`)
-
-The decoder is a pull cursor: `feed()` can be called repeatedly with whatever
-bytes have arrived. A field that straddles a chunk boundary is buffered
-internally and re-parsed once its remainder arrives, so the same
-`IStreamObject`/`IStreamInline` decodes a byte-at-a-time stream identically to a
-one-shot buffer:
+`feed()` can be called repeatedly with whatever bytes have arrived; a field that
+straddles a chunk boundary is buffered internally and re-parsed once its remainder
+arrives, so a chunked stream decodes identically to a one-shot buffer — no matter
+where the chunks come from.
 
 ```cpp
 sofab::IStreamObject<Sensor> in;
-for (uint8_t b : wire)            // feed one byte at a time
+for (uint8_t b : wire)                // feed whatever arrives — here one byte at a time
     in.feed(&b, 1);
 // (*in) is fully populated
 ```
 
-`IStreamInline` is the lambda variant of the same decoder — construct it with a
-`(id, size, count)` callback instead of subclassing `IStreamMessage`.
-
-### Generated code (the common case)
+### Code generator
 
 The usual way to drive the library is through **generated object code**: a schema
-compiled by `sofabgen` emits a struct per message that derives `OStreamMessage`
-(with a `serialize`) and `IStreamMessage` (with a `deserialize`) plus a
-`_maxSize` bound. A hand-written equivalent:
+compiled by `sofabgen` emits a struct per message deriving `OStreamMessage` /
+`IStreamMessage`, with `serialize` / `deserialize` bodies, a `_maxSize` bound, and
+`encode()` / `decode()` helpers. A hand-written stand-in, encoded then decoded:
 
 ```cpp
+#include "sofab/sofab.hpp"
+
 struct Point : sofab::OStreamMessage, sofab::IStreamMessage {
-    static constexpr std::size_t _maxSize = 32;  // upper bound on the encoded size
+    static constexpr std::size_t _maxSize = 32;   // upper bound on the encoded size
     int32_t x = 0, y = 0;
 
     sofab::OStreamImpl::Result serialize(sofab::OStreamImpl& os) const noexcept override {
@@ -184,24 +189,22 @@ struct Point : sofab::OStreamMessage, sofab::IStreamMessage {
     void deserialize(sofab::IStreamImpl& is, sofab::id id, size_t, size_t) noexcept override {
         switch (id) { case 1: is.read(x); break; case 2: is.read(y); break; }
     }
+    std::vector<uint8_t> encode() const {
+        sofab::OStreamInline<_maxSize> os; serialize(os);
+        return {os.data(), os.data() + os.bytesUsed()};
+    }
+    static Point decode(const uint8_t* data, size_t len) {
+        sofab::IStreamObject<Point> in; in.feed(data, len); return *in;
+    }
 };
 
-// encode: serialize the message into an inline buffer sized by _maxSize
 Point pt; pt.x = 3; pt.y = 4;
-sofab::OStreamInline<Point::_maxSize> enc;
-pt.serialize(enc);
-std::span<const uint8_t> wire{enc.data(), enc.bytesUsed()};
-
-// decode: IStreamObject routes each top-level field into deserialize()
-sofab::IStreamObject<Point> dec;
-dec.feed(wire.data(), wire.size());
-// (*dec).x == 3, (*dec).y == 4
+std::vector<uint8_t> wire = pt.encode();
+Point got = Point::decode(wire.data(), wire.size());   // got.x == 3, got.y == 4
 ```
 
 Messages nest: passing a message deriving `OStreamMessage` to `write(id, msg)`
 encodes it as a sub-sequence, and `is.read(childMsg)` descends into it on decode.
-`OStreamObject<Msg>` / `IStreamObject<Msg>` bundle a message with an inline
-buffer if you prefer to carry both together.
 
 ## Memory handling
 
