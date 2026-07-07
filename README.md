@@ -47,33 +47,36 @@ dependencies and no C backend.
 | Clang x86_64 (little endian) | [![badge](https://github.com/sofa-buffers/corelib-cpp/actions/workflows/build-clang-x86_64.yaml/badge.svg)](https://github.com/sofa-buffers/corelib-cpp/actions/workflows/build-clang-x86_64.yaml) |
 | GCC ppc64 (big endian) | [![badge](https://github.com/sofa-buffers/corelib-cpp/actions/workflows/build-gcc-ppc64-bigendian.yaml/badge.svg)](https://github.com/sofa-buffers/corelib-cpp/actions/workflows/build-gcc-ppc64-bigendian.yaml) |
 
-The big-endian job cross-compiles to PowerPC64 and runs the full suite under
-qemu, exercising the byte-swapping float paths that little-endian hosts skip.
+> The non-native targets above are built and run under [QEMU](https://www.qemu.org/) user-mode emulation in CI, so you can reproduce any of them locally without the real hardware.
 
-### Package name
+### Packaging
 
-The library is **header-only** — the only thing you truly need is
-`#include <sofab/sofab.hpp>` with `include/` on your include path. To consume it
-through CMake, add this repository (e.g. via `add_subdirectory()` or
-`FetchContent`) and link the interface target:
+Distributed as the port `sofa-buffers-corelib-cpp`; every route exposes the
+same target `sofa-buffers::corelib` and `#include <sofab/…>`.
+
+#### CMake
+
+Pull it straight from the repo with `FetchContent`:
 
 ```cmake
-target_link_libraries(your_app PRIVATE sofa-buffers::corelib)
+include(FetchContent)
+FetchContent_Declare(
+  sofa-buffers-corelib-cpp
+  GIT_REPOSITORY https://github.com/sofa-buffers/corelib-cpp.git
+  GIT_TAG        <tag or branch>
+)
+FetchContent_MakeAvailable(sofa-buffers-corelib-cpp)
+target_link_libraries(my_app PRIVATE sofa-buffers::corelib)
 ```
 
-`sofa-buffers::corelib` is the canonical target; the shorter `sofab::cpp` alias
-is also provided, and the code API lives in `namespace sofab`.
+#### Conan / vcpkg
 
-It is also distributed as the vcpkg/Conan port `sofa-buffers-corelib-cpp`, which
-installs a CMake package config exposing the same target:
+Install the port, then in CMake:
 
 ```cmake
 find_package(sofa-buffers-corelib-cpp CONFIG REQUIRED)
-target_link_libraries(your_app PRIVATE sofa-buffers::corelib)
+target_link_libraries(my_app PRIVATE sofa-buffers::corelib)
 ```
-
-The port recipes live in [`ports/sofa-buffers-corelib-cpp/`](ports/sofa-buffers-corelib-cpp)
-(vcpkg) and [`conanfile.py`](conanfile.py) (Conan).
 
 ## Why this design
 

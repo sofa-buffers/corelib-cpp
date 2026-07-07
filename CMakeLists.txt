@@ -1,11 +1,5 @@
-# Build for the pure-C++20 SofaBuffers core library (header-only).
-#
-#   cmake -S . -B build && cmake --build build && ctest --test-dir build
-
 cmake_minimum_required(VERSION 3.10)
-project(sofabuffers_cpp VERSION
-    0.8.0
-    LANGUAGES C CXX)
+project(sofabuffers_cpp VERSION LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
