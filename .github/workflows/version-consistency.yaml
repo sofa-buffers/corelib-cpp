@@ -1,7 +1,8 @@
 name: "Version consistency"
 
-# The git tag is the source of truth for the version: the package manifest must
-# match it. On branch/PR runs the latest tag is used as the reference.
+# The git tag is the source of truth for the version: every package manifest
+# and the CMake project() version must match it. Each config is checked in its
+# own step. On branch/PR runs the latest tag is used as the reference.
 on:
   push:
     branches: [ main ]
@@ -41,3 +42,19 @@ jobs:
           get() { grep -oP "^\s*$1\s*=\s*\"\K[^\"]+" conanfile.py | head -1; }
           version=$(get version)
           [[ -z "$REF_VERSION" || "$version" == "$REF_VERSION" ]] || { echo "::error::conanfile.py version: '$version' != '$REF_VERSION'"; exit 1; }
+          # conanfile.py is the source of truth for name/license; publish for later steps.
+          {
+            echo "REF_NAME=$(get name)"
+            echo "REF_LICENSE=$(get license)"
+          } >> "$GITHUB_ENV"
+
+      - name: Check CMake (CMakeLists.txt)
+        if: ${{ !cancelled() }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          # project() VERSION lives on its own line; feeds the install config's
+          # package-version file, so it must always be present and in lockstep.
+          version=$(grep -oP '^\s*VERSION \K[0-9]+\.[0-9]+\.[0-9]+' CMakeLists.txt | head -1)
+          [[ -n "$version" ]] || { echo "::error::CMakeLists.txt: no project() VERSION found"; exit 1; }
+          [[ -z "$REF_VERSION" || "$version" == "$REF_VERSION" ]] || { echo "::error::CMakeLists.txt version: '$version' != '$REF_VERSION'"; exit 1; }
