@@ -15,9 +15,9 @@
 [GitHub repository](https://github.com/sofa-buffers/corelib-cpp)
 
 A **streaming**, **dependency-free**, pure-**C++20** implementation of the
-SofaBuffers (*Sofab*) serialization format — written from scratch with no C
+SofaBuffers (*Sofab*) serialization format, written from scratch with no C
 backend. It packs structured fields into a caller-owned buffer and decodes them
-through a protobuf-style cursor that advances a pointer over the message.
+with a protobuf-style cursor that advances over the message.
 
 It presents the same `sofab::OStream` / `sofab::OStreamInline` / `sofab::IStreamObject`
 surface as the footprint-oriented C/C++ corelib
@@ -28,18 +28,21 @@ for when to pick which.
 
 ### Requirements
 
-- A **C++20**-capable compiler — GCC 11+, Clang 14+, or MSVC 19.30+.
-- CMake **3.10+** to build the tests, benchmarks and docs (the library itself is
-  header-only and needs no build step).
+- A **C++20** compiler — GCC 11+, Clang 14+, or MSVC 19.30+.
+- CMake **3.10+** to build the tests, benchmarks and docs. The library itself is
+  header-only and needs no build step.
 
 ### Dependencies
 
 **None** beyond the C++ standard library. The single header pulls in only
 standard headers (`<array>`, `<bit>`, `<concepts>`, `<span>`, `<string>`,
-`<string_view>`, `<memory>`, `<functional>`, …); there are no third-party
-dependencies and no C backend.
+`<string_view>`, `<memory>`, `<functional>`, …). No third-party dependencies, no
+C backend.
 
 ### Built with the following compilers
+
+Non-native targets are built and run under [QEMU](https://www.qemu.org/)
+user-mode emulation in CI, reproducible locally without the real hardware.
 
 | Target | Status |
 | - | - |
@@ -47,16 +50,12 @@ dependencies and no C backend.
 | Clang x86_64 (little endian) | [![badge](https://github.com/sofa-buffers/corelib-cpp/actions/workflows/build-clang-x86_64.yaml/badge.svg)](https://github.com/sofa-buffers/corelib-cpp/actions/workflows/build-clang-x86_64.yaml) |
 | GCC ppc64 (big endian) | [![badge](https://github.com/sofa-buffers/corelib-cpp/actions/workflows/build-gcc-ppc64-bigendian.yaml/badge.svg)](https://github.com/sofa-buffers/corelib-cpp/actions/workflows/build-gcc-ppc64-bigendian.yaml) |
 
-> The non-native targets above are built and run under [QEMU](https://www.qemu.org/) user-mode emulation in CI, so you can reproduce any of them locally without the real hardware.
-
 ### Packaging
 
-Distributed as the port `sofa-buffers-corelib-cpp`; every route exposes the
-same target `sofa-buffers::corelib` and `#include <sofab/…>`.
+Distributed as the port `sofa-buffers-corelib-cpp`; every route exposes the same
+target `sofa-buffers::corelib` and `#include <sofab/…>`.
 
 #### CMake
-
-Pull it straight from the repo with `FetchContent`:
 
 ```cmake
 include(FetchContent)
@@ -71,9 +70,9 @@ target_link_libraries(my_app PRIVATE sofa-buffers::corelib)
 
 #### Conan
 
-Distributed as the Conan package `sofa-buffers-corelib-cpp`
-([`conanfile.py`](conanfile.py)), which installs a CMake package config exposing
-the same target:
+The Conan package `sofa-buffers-corelib-cpp`
+([`conanfile.py`](conanfile.py)) installs a CMake package config exposing the
+same target:
 
 ```cmake
 find_package(sofa-buffers-corelib-cpp CONFIG REQUIRED)
@@ -82,17 +81,17 @@ target_link_libraries(my_app PRIVATE sofa-buffers::corelib)
 
 ## Why this design
 
-The C corelib (`corelib-c-cpp`) is optimised for **minimal code size and RAM**
-(it targets bare metal). This library makes the opposite trade: size and memory
-are not a concern, the goal is **throughput**, and the decoder is tuned for the
-common case where the whole message is already in contiguous memory.
+The C corelib (`corelib-c-cpp`) optimises for **minimal code size and RAM** (it
+targets bare metal). This library makes the opposite trade: size and memory are
+not a concern, the goal is **throughput**, and the decoder is tuned for the case
+where the whole message is already in contiguous memory.
 
 | Goal | How |
 |------|-----|
-| Fast encode | Payloads written with a single `memcpy`; a field's header + value varints emitted as one combined write; whole float arrays copied in one shot on little-endian. |
-| Fast decode | The common case parses **with zero copies and zero allocations** — the cursor walks the caller's buffer in place; float arrays bulk-`memcpy`'d; `std::string_view` reads are zero-copy views into the buffer. |
+| Fast encode | Payloads written with a single `memcpy`; a field's header + value varints emitted as one write; whole float arrays copied in one shot on little-endian. |
+| Fast decode | The common case parses **with zero copies and zero allocations** — the cursor walks the caller's buffer in place; float arrays bulk-`memcpy`'d; `std::string_view` reads are zero-copy views. |
 | Still streamable | `OStream`/`OStreamInline` flush a small buffer via callback; `feed()` dispatches each complete top-level field and buffers only an incomplete tail. |
-| Modern C++ | `std::span`, `std::bit_cast`, concepts, `if constexpr` `write()`/`read()` deduction, `[[nodiscard]]`. Little-endian handled explicitly — no host-endian branching. |
+| Modern C++ | `std::span`, `std::bit_cast`, concepts, `if constexpr` `write()`/`read()` deduction, `[[nodiscard]]`. Little-endian handled explicitly. |
 
 ## Usage
 
@@ -119,15 +118,14 @@ in.feed(msg.data(), msg.size());
 ```
 
 Every `write()` returns a chainable `Result` that latches the first error, so a
-whole message is written fluently and checked once at the end. During decode, a
-field you don't `read()` is measured and skipped automatically — unknown or
-unwanted fields cost only a step-over.
+message is written fluently and checked once at the end. During decode, a field
+you don't `read()` is measured and skipped automatically.
 
 ### Streaming a message larger than the buffer (`OStream`)
 
 `OStream`/`OStreamInline` never grow their buffer. Give them a flush callback and
-the buffer becomes a small reusable window: it is drained whenever it fills (and
-once more at the end), so the encoder never needs the whole message in memory.
+the buffer becomes a small reusable window, drained whenever it fills (and once
+at the end), so the encoder never needs the whole message in memory.
 
 ```cpp
 #include "sofab/sofab.hpp"
@@ -136,8 +134,7 @@ once more at the end), so the encoder never needs the whole message in memory.
 
 std::vector<uint8_t> out;
 
-// A 16-byte window — far smaller than the message. The flush callback takes a
-// std::span<const uint8_t> and drains the window each time it fills.
+// A 16-byte window; the flush callback drains it each time it fills.
 sofab::OStreamInline<16> os(
     [&](std::span<const uint8_t> chunk){ out.insert(out.end(), chunk.begin(), chunk.end()); });
 
@@ -147,17 +144,9 @@ os.flush(); // push the tail; `out` now holds the complete message
 ```
 
 A heap-backed `sofab::OStream` works the same way and additionally lets you swap
-the backing buffer mid-stream (typically inside the callback) via `setBuffer()`.
-Its buffer is owned through a `std::shared_ptr<uint8_t[]>` — either allocated for
-you (`OStream(buflen, offset = 0)`) or handed in
-(`OStream(flush, buffer, buflen, offset = 0)`):
-
-```cpp
-auto buf = std::shared_ptr<uint8_t[]>(new uint8_t[256]);
-sofab::OStream os([&](std::span<const uint8_t> c){ sink(c); }, buf, 256);
-os.write(1, 123u).write(2, "payload");
-os.flush(); // OStream's destructor also flushes automatically
-```
+the backing buffer mid-stream via `setBuffer()`. Its buffer is owned through a
+`std::shared_ptr<uint8_t[]>` — either allocated for you (`OStream(buflen, offset
+= 0)`) or handed in (`OStream(flush, buffer, buflen, offset = 0)`).
 
 ### Streaming decode (`IStream`)
 
@@ -182,8 +171,7 @@ for (uint8_t b : wire)            // feed one byte at a time
 The usual way to drive the library is through **generated object code**: a schema
 compiled by `sofabgen` emits a struct per message that derives `OStreamMessage`
 (with a `serialize`) and `IStreamMessage` (with a `deserialize`) plus a
-`_maxSize` bound, and calls this runtime under the hood. A hand-written
-equivalent looks like:
+`_maxSize` bound. A hand-written equivalent:
 
 ```cpp
 struct Point : sofab::OStreamMessage, sofab::IStreamMessage {
@@ -211,130 +199,50 @@ dec.feed(wire.data(), wire.size());
 ```
 
 Messages nest: passing a message deriving `OStreamMessage` to `write(id, msg)`
-encodes it as a sub-sequence, and `is.read(childMsg)` on the decode side descends
-into it. `OStreamObject<Msg>` / `IStreamObject<Msg>` bundle a message with an
-inline buffer if you prefer to carry both together.
+encodes it as a sub-sequence, and `is.read(childMsg)` descends into it on decode.
+`OStreamObject<Msg>` / `IStreamObject<Msg>` bundle a message with an inline
+buffer if you prefer to carry both together.
 
-## API summary
+## Memory handling
 
-All public types are in the `sofab` namespace.
+Buffer ownership is the defining trade-off of the C++ port, and it is the inverse
+of the C (`corelib-c-cpp`) port.
 
-### Encoding API
+**Decode (`feed` / `IStream`) — zero-copy views into the caller's buffer.**
+`feed()` parses *in place*: when nothing is buffered (the common case, a whole
+message handed in at once) the cursor walks straight over the caller's contiguous
+`buf`, allocating and copying nothing.
 
-Encoders come in three flavours — `OStreamInline<N, Offset = 0>` (an `N`-byte
-stack buffer, zero heap), `OStream` (a `std::shared_ptr`-owned heap buffer that
-can be swapped at runtime), and `OStreamObject<Msg>` (an inline buffer bundled
-with a generated message). All share one chainable, sticky-error API on
-`OStreamImpl`:
+- `read(std::string_view&)` returns a view that **points directly into `buf`** —
+  valid only while that buffer stays alive and unmodified; outliving it is a
+  dangling-view bug. Use `read(std::string&)` for an owning copy.
+- Integer/float arrays decode into the caller-provided `span`/container (float
+  arrays via a single `memcpy` on little-endian); `read(void* dst, size_t maxlen)`
+  copies a blob out. The stream never allocates the destination.
+- If a `feed()` chunk ends mid-field, only that trailing field is copied into an
+  internal accumulator and re-parsed on the next `feed()`; views from a stitched
+  field then point into that accumulator.
 
-- **`write(id, value)`** deduces the wire type from the C++ type — unsigned and
-  signed integers, `bool`, `float`/`double`, strings (anything convertible to
-  `std::string_view`), and `std::span`/contiguous containers of integer or float
-  scalars (encoded as arrays). `write(id, ptr, int32_t size)` writes an opaque
-  blob. `writeIf(id, value, cond)` writes conditionally.
-- **`sequenceBegin(id)` / `sequenceEnd()`** open and close nested sub-messages
-  explicitly; alternatively `write(id, msg)` encodes an `OStreamMessage`.
-- Every call returns a **`Result`** that latches the *first* error (`ok()`,
-  `code()`, `operator bool`), so a message is written fluently and validated
-  once. `bytesUsed()` / `data()` expose the current contents; `flush()` pushes
-  the tail through the flush callback.
+This inverts the C port's deferred-copy model (where `read()` binds an
+address-stable destination that a later `feed()` fills). Here `read()` pulls the
+value out immediately, so no per-field destination must stay stable — but the
+**input buffer must outlive any returned view**.
 
-Anything `write()`/`read()` can't map to a wire type is a compile-time
-`static_assert` — including arrays of *dynamic* element types (spans of `bool`,
-`std::string`, blobs, or nested messages), since fixlen arrays carry one fixed
-element size on the wire.
-
-### Decoding API
-
-Decoding is driven by **`feed(buf, len)`**, which returns a `Result` and can be
-called repeatedly for streaming. For each top-level field it invokes a
-per-field handler — either a subclass's `deserialize(is, id, size, count)`
-(via `IStreamObject<Msg>`) or a `std::function` callback (via `IStreamInline`) —
-where `size` is the payload byte-length (element size for fixlen arrays) and
-`count` is the array element count (`0` for scalars).
-
-Inside the handler, `is.read(dest)` binds the field; the destination type selects
-the decoder via `if constexpr`. Integers, `bool`, and floats decode by value;
-`std::string`/blob reads copy into caller storage; `std::string_view` reads are
-**zero-copy** views into the source buffer; arrays decode into a caller-provided
-`std::span`/container. Reading a message deriving `IStreamMessage` descends a
-sub-sequence. **Doing nothing skips** the field. The cursor is bounds-checked:
-a malformed or truncated field latches an error and `feed()` returns
-`Error::InvalidMessage`.
-
-### Memory handling
-
-This is the defining trade-off of the C++ port, and it is the opposite of the C
-(`corelib-c-cpp`) port.
-
-**Decoder — zero-copy views into the caller's buffer.** `feed()` parses *in
-place*: when nothing is buffered (the common case — a whole message handed in at
-once) the cursor walks straight over the caller's contiguous `buf`, allocating
-nothing and copying nothing. Consequently:
-
-- `read(std::string_view&)` returns a view that **points directly into `buf`**;
-  no bytes are copied. The view stays valid only as long as that source buffer
-  stays alive and unmodified — outliving the buffer is a dangling-view bug. Use
-  `read(std::string&)` when you need an owning copy.
-- Integer arrays are decoded element-wise straight into the caller-provided
-  `span`/container; float arrays are bulk-`memcpy`'d into it (one `memcpy` on
-  little-endian). Either way the destination storage is the caller's — the
-  stream never allocates it.
-- `read(void* dst, size_t maxlen)` copies a blob into the caller's `dst` and
-  returns the number of bytes written (`min(maxlen, size)`).
-- Because decoding is a pointer walk over contiguous memory, **the whole message
-  must eventually be in contiguous buffers.** If a chunk handed to `feed()` ends
-  mid-field, only that incomplete trailing field is copied into an internal
-  accumulator and re-parsed on the next `feed()`; views read from such a stitched
-  field point into that accumulator instead of the original chunk.
-
-This is the inverse of the C port's deferred-copy model, where `read()` only
-*binds* a destination pointer and a later `feed()` copies the bytes into it as
-they arrive (so destinations must be address-stable). Here `read()` pulls the
-value out immediately and strings come back as views, so there is no per-field
-destination to keep stable — but the **input buffer** must stay alive for as long
-as any returned view is used.
-
-**Encoder — writes into an owned, fixed-size buffer; flushes, never grows.** An
-`OStream` owns its buffer through a `std::shared_ptr<uint8_t[]>` (allocated for
-you, handed in, or shared); an `OStreamInline<N>` owns an `N`-byte `std::array`
-on the stack with zero heap use. Neither buffer grows. When the cursor reaches
-the end it calls the flush callback with the filled bytes and rewinds;
-**without** a callback a full buffer yields `Error::BufferFull`. So to emit a
-message larger than the buffer you supply a flush callback (see the streaming
-example above) and the buffer acts as a small reusable window.
+**Encode (`OStream` / `OStreamInline`) — writes into an owned, fixed-size buffer;
+flushes, never grows.** `OStream` owns its buffer through a
+`std::shared_ptr<uint8_t[]>`; `OStreamInline<N>` owns an `N`-byte `std::array` on
+the stack (zero heap). Neither grows: at the buffer end it calls the flush
+callback with the filled bytes and rewinds; **without** a callback a full buffer
+yields `Error::BufferFull`.
 
 ## Feature flags
 
-The library is header-only C++20 and **ships with every wire feature enabled by
-default** — this port optimises for throughput rather than footprint, so unlike
-the C corelib (`corelib-c-cpp`) the header itself contains no `#ifdef` gating and
-all features are always compiled in. The conformance harness
-(`test/test_vectors.cpp`), however, recognises the family-standard
-`SOFAB_DISABLE_*` toggles and skips the vectors a disabled feature would
-exercise, so a feature-reduced profile can be described and tested with the same
-switches used across the other ports.
-
-| Build option (define) | Default | Effect |
-|-----------------------|---------|--------|
-| `SOFAB_DISABLE_FIXLEN_SUPPORT`   | off (fixlen on)   | Drops fp32/fp64, string and blob fixlen values (and fixlen arrays). |
-| `SOFAB_DISABLE_FP64_SUPPORT`     | off (fp64 on)     | Drops 64-bit `double` support (fp32 stays). |
-| `SOFAB_DISABLE_ARRAY_SUPPORT`    | off (arrays on)   | Drops the array wire types (unsigned / signed / fixlen arrays). |
-| `SOFAB_DISABLE_SEQUENCE_SUPPORT` | off (sequences on)| Drops nested sequences (`sequenceBegin`/`sequenceEnd`). |
-| `SOFAB_DISABLE_INT64_SUPPORT`    | off (int64 on)    | Restricts integers to 32-bit. |
-
-```sh
-# drop fp64 and sequences; the matching conformance vectors are skipped automatically
-cmake -S . -B build -DCMAKE_CXX_FLAGS="-DSOFAB_DISABLE_FP64_SUPPORT -DSOFAB_DISABLE_SEQUENCE_SUPPORT"
-cmake --build build --parallel
-ctest --test-dir build --output-on-failure
-```
-
-> Because this header is intentionally always-on, the `SOFAB_DISABLE_*` defines
-> currently affect only which conformance vectors run; they are the
-> forward-compatible hooks a footprint-constrained fork would gate the header on.
-> If a strictly minimal binary is the goal, prefer the C corelib
-> (`corelib-c-cpp`).
+**None.** This header-only C++20 port always compiles the full wire format —
+there is no `#ifdef` gating and nothing to configure. (The conformance harness
+recognises the family's `SOFAB_DISABLE_*` names only so it can skip the matching
+vectors when validating a feature-reduced profile; the defines do **not** change
+this library.) For a strictly minimal binary, use the C corelib
+[`corelib-c-cpp`](https://github.com/sofa-buffers/corelib-c-cpp).
 
 ## Build & test
 
@@ -344,10 +252,9 @@ cmake --build build --parallel
 ctest --test-dir build --output-on-failure
 ```
 
-Requires a C++20 compiler (GCC 11+, Clang 14+, MSVC 19.30+) and CMake 3.10+.
 Two suites run under CTest:
 
-- **`test_roundtrip`** — focused encode/decode/nested/chunked/skip checks plus
+- **`test_roundtrip`** — encode/decode/nested/chunked/skip checks plus
   malformed-input handling (truncated/overlong varints, oversized lengths, stray
   markers) and resync after a skipped sub-sequence.
 - **`test_vectors`** — replays the shared `assets/test_vectors.json` conformance
@@ -369,8 +276,8 @@ cmake --build build --target doc
 
 ## Benchmarks
 
-Two tools mirror the C / C++ / Rust / Go / Java / Python benchmarks — same
-workloads (a 1000-element `u64` array and a typical mixed message) — so results
+Two tools mirror the C / C++ / Rust / Go / Java / Python benchmarks on identical
+workloads (a 1000-element `u64` array and a typical mixed message), so results
 are directly comparable across languages:
 
 ```sh
@@ -381,18 +288,15 @@ cmake --build build --target run_bench   # sustained throughput (MB/s)
 ```
 
 `perf` reads a hardware cycle counter (x86 TSC / AArch64 `cntvct_el0`) for a
-machine-independent cost figure, then reports throughput in MB/s (MB = 1e6
-bytes) over a CPU-time loop; `bench` reports the throughput table on its own. For
-machine-independent instruction counts, the same `bench` binary doubles as a
-Callgrind single-shot driver:
+machine-independent cost figure and reports throughput in MB/s; `bench` reports
+the throughput table. The same `bench` binary doubles as a Callgrind single-shot
+driver for machine-independent instruction counts:
 
 ```sh
 cmake --build build --target run_bench_callgrind  # needs valgrind
 ```
 
-The instruction-count figures it produces are the head-to-head data in
-[Choosing between the two C++ corelibs](#choosing-between-the-two-c-corelibs)
-below.
+Those figures are the head-to-head data below.
 
 ## Choosing between the two C++ corelibs
 
@@ -400,13 +304,12 @@ SofaBuffers ships **two** C++ implementations of the same wire format, tuned for
 opposite ends of the spectrum:
 
 - **`corelib-cpp` (this library)** — pure C++20, no C backend. Optimised for
-  **throughput** on desktop/server targets where code size and RAM are not a
-  concern. Decodes zero-copy in place and returns `std::string_view`s into the
-  caller's buffer.
+  **throughput** on desktop/server targets. Decodes zero-copy in place and
+  returns `std::string_view`s into the caller's buffer.
 - **[`corelib-c-cpp`](https://github.com/sofa-buffers/corelib-c-cpp)** — a C
   object API with a thin C++ wrapper (`sofab.hpp`). Optimised for **minimal code
   size and RAM** on bare-metal / microcontroller targets, using a deferred-copy
-  model (bind destinations, copy on `feed()`) that keeps the footprint tiny.
+  model (bind destinations, copy on `feed()`).
 
 Both expose a compatible `sofab::OStream` / `sofab::IStreamObject` surface, so
 porting between them is mostly mechanical.
@@ -421,10 +324,9 @@ porting between them is mostly mechanical.
 
 ### Instruction counts (Callgrind)
 
-Machine-independent instruction counts from the shared benchmark tooling,
-comparing this library against the C corelib and its C++ wrapper on identical
-workloads (lower is better; the pure-C++20 column is produced by this repo's
-`run_bench_callgrind` target):
+Machine-independent instruction counts from the shared benchmark tooling, this
+library against the C corelib and its C++ wrapper on identical workloads (lower
+is better):
 
 | Workload | C (`-Os`) | C++ wrapper | this (pure C++20) |
 |---|--:|--:|--:|
@@ -435,12 +337,10 @@ workloads (lower is better; the pure-C++20 column is produced by this repo's
 
 The pure-C++20 port wins on instructions across the board because it fuses
 header+value writes, bulk-copies arrays, and parses in place without the C port's
-per-field bookkeeping. In the multi-language benchmark arena it lands around a
-434-byte wire size and roughly **1.5× the throughput of protobuf** for a
-comparable C++ message.
+per-field bookkeeping. In the multi-language arena it lands around a 434-byte
+wire size and roughly **1.5× the throughput of protobuf** for a comparable C++
+message.
 
-**Rule of thumb:** reach for **`corelib-cpp`** for desktop/server throughput,
-and for **`corelib-c-cpp`** when you need a strictly minimal binary and tight RAM
-on a footprint-constrained target — where its C++-wrapper build has been measured
-at roughly 2× the throughput of EmbeddedProto with a fraction of the flash on a
-Cortex-M.
+**Rule of thumb:** reach for **`corelib-cpp`** for desktop/server throughput, and
+for **`corelib-c-cpp`** when you need a strictly minimal binary and tight RAM on a
+footprint-constrained target.
