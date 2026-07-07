@@ -69,9 +69,11 @@ FetchContent_MakeAvailable(sofa-buffers-corelib-cpp)
 target_link_libraries(my_app PRIVATE sofa-buffers::corelib)
 ```
 
-#### Conan / vcpkg
+#### Conan
 
-Install the port, then in CMake:
+Distributed as the Conan package `sofa-buffers-corelib-cpp`
+([`conanfile.py`](conanfile.py)), which installs a CMake package config exposing
+the same target:
 
 ```cmake
 find_package(sofa-buffers-corelib-cpp CONFIG REQUIRED)

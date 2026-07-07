@@ -1,8 +1,7 @@
 name: "Version consistency"
 
-# The git tag is the source of truth for the version: every package manifest
-# must match it. Each config is checked in its own step. On branch/PR runs the
-# latest tag is used as the reference.
+# The git tag is the source of truth for the version: the package manifest must
+# match it. On branch/PR runs the latest tag is used as the reference.
 on:
   push:
     branches: [ main ]
@@ -34,28 +33,11 @@ jobs:
             echo "REF_VERSION=$ref_version"
           } >> "$GITHUB_ENV"
 
-      - name: Check vcpkg (vcpkg.json)
-        if: ${{ !cancelled() }}
-        shell: bash
-        env:
-          VCPKG: ports/sofa-buffers-corelib-cpp/vcpkg.json
-        run: |
-          set -euo pipefail
-          version=$(jq -r .version "$VCPKG")
-          [[ -z "$REF_VERSION" || "$version" == "$REF_VERSION" ]] || { echo "::error::vcpkg.json version: '$version' != '$REF_VERSION'"; exit 1; }
-          # vcpkg.json is the source of truth for name/license; publish for later steps.
-          {
-            echo "REF_NAME=$(jq -r .name "$VCPKG")"
-            echo "REF_LICENSE=$(jq -r .license "$VCPKG")"
-          } >> "$GITHUB_ENV"
-
       - name: Check Conan (conanfile.py)
         if: ${{ !cancelled() }}
         shell: bash
         run: |
           set -euo pipefail
           get() { grep -oP "^\s*$1\s*=\s*\"\K[^\"]+" conanfile.py | head -1; }
-          check() { [[ -z "$3" || "$2" == "$3" ]] || { echo "::error::conanfile.py $1: '$2' != '$3'"; exit 1; }; }
-          check version "$(get version)"  "$REF_VERSION"
-          check name    "$(get name)"     "$REF_NAME"
-          check license "$(get license)"  "$REF_LICENSE"
+          version=$(get version)
+          [[ -z "$REF_VERSION" || "$version" == "$REF_VERSION" ]] || { echo "::error::conanfile.py version: '$version' != '$REF_VERSION'"; exit 1; }

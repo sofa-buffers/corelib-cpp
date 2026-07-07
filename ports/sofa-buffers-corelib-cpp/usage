@@ -1,6 +1,0 @@
-sofa-buffers-corelib-cpp provides CMake targets:
-
-    find_package(sofa-buffers-corelib-cpp CONFIG REQUIRED)
-    target_link_libraries(main PRIVATE sofa-buffers::corelib)
-
-Then just: #include <sofab/sofab.hpp>

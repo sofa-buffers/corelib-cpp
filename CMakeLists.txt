@@ -31,8 +31,8 @@ if(SOFAB_ENABLE_COVERAGE)
 endif()
 
 # Only build the tests/benches when SofaBuffers is the top-level project (or the
-# consumer opts in). Package builds (vcpkg / Conan) add this via add_subdirectory
-# / FetchContent and just want the header-only install target.
+# consumer opts in). Package builds (Conan) and add_subdirectory / FetchContent
+# consumers just want the header-only install target.
 if(NOT DEFINED SOFAB_BUILD_TESTING)
     if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
         set(SOFAB_BUILD_TESTING ON)
@@ -116,8 +116,8 @@ endif()
 
 # Install / packaging. Header-only, so the install just copies include/ and
 # exports an INTERFACE target as sofa-buffers::corelib. The generated
-# sofa-buffers-corelib-cpp package config is what the vcpkg port and the Conan
-# recipe consume (find_package(sofa-buffers-corelib-cpp CONFIG)).
+# sofa-buffers-corelib-cpp package config is what the Conan recipe consumes
+# (find_package(sofa-buffers-corelib-cpp CONFIG)).
 if(SOFAB_INSTALL)
     include(CMakePackageConfigHelpers)
 
