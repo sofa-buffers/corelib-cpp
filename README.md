@@ -64,6 +64,17 @@ target_link_libraries(your_app PRIVATE sofa-buffers::corelib)
 `sofa-buffers::corelib` is the canonical target; the shorter `sofab::cpp` alias
 is also provided, and the code API lives in `namespace sofab`.
 
+It is also distributed as the vcpkg/Conan port `sofa-buffers-corelib-cpp`, which
+installs a CMake package config exposing the same target:
+
+```cmake
+find_package(sofa-buffers-corelib-cpp CONFIG REQUIRED)
+target_link_libraries(your_app PRIVATE sofa-buffers::corelib)
+```
+
+The port recipes live in [`ports/sofa-buffers-corelib-cpp/`](ports/sofa-buffers-corelib-cpp)
+(vcpkg) and [`conanfile.py`](conanfile.py) (Conan).
+
 ## Why this design
 
 The C corelib (`corelib-c-cpp`) is optimised for **minimal code size and RAM**
