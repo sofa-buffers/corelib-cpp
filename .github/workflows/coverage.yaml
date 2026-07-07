@@ -19,6 +19,11 @@ jobs:
 
       - name: Install build dependencies
         run: |
+          # Drop preinstalled third-party apt repos (e.g. Microsoft) whose
+          # signatures intermittently break and abort `apt-get update`.
+          sudo rm -f /etc/apt/sources.list.d/microsoft-prod.list \
+                     /etc/apt/sources.list.d/azure-cli.list \
+                     /etc/apt/sources.list.d/azure-cli.sources
           sudo apt-get update
           sudo apt-get install -y \
             build-essential cmake gcovr jq
