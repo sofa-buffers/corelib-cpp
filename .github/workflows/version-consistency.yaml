@@ -1,0 +1,43 @@
+name: "Version consistency"
+
+# The git tag is the source of truth for the version: the package manifest must
+# match it. On branch/PR runs the latest tag is used as the reference.
+on:
+  push:
+    branches: [ main ]
+    tags: [ 'v*' ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  check-versions:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # need tags for the reference version
+
+      - name: Reference version (git tag)
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "${GITHUB_REF_TYPE:-}" == "tag" ]]; then
+            ref_version=${GITHUB_REF_NAME#v}
+          else
+            # Latest tag on branch/PR runs; empty if the repo has no tags yet,
+            # in which case the version comparison is skipped (name/license only).
+            ref_version=$(git describe --tags --abbrev=0 2>/dev/null | sed 's/^v//' || true)
+            [[ -n "$ref_version" ]] || echo "::notice::no git tag found; skipping version comparison"
+          fi
+          {
+            echo "REF_VERSION=$ref_version"
+          } >> "$GITHUB_ENV"
+
+      - name: Check Conan (conanfile.py)
+        if: ${{ !cancelled() }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          get() { grep -oP "^\s*$1\s*=\s*\"\K[^\"]+" conanfile.py | head -1; }
+          version=$(get version)
+          [[ -z "$REF_VERSION" || "$version" == "$REF_VERSION" ]] || { echo "::error::conanfile.py version: '$version' != '$REF_VERSION'"; exit 1; }

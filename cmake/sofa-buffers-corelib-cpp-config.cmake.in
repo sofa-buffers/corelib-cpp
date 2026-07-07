@@ -1,0 +1,7 @@
+@PACKAGE_INIT@
+
+# sofa-buffers-corelib-cpp — header-only C++20 SofaBuffers core library.
+# Provides the imported INTERFACE target sofa-buffers::corelib.
+include("${CMAKE_CURRENT_LIST_DIR}/sofa-buffers-corelib-cpp-targets.cmake")
+
+check_required_components(sofa-buffers-corelib-cpp)
