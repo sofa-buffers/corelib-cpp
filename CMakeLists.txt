@@ -44,6 +44,11 @@ if(NOT DEFINED SOFAB_BUILD_TESTING)
 endif()
 
 if(SOFAB_BUILD_TESTING)
+    # enable_testing() must run in the top-level directory so CTest generates the
+    # root CTestTestfile.cmake that recurses into test/. Without it, `ctest` from
+    # the build root reports "No tests were found" and every CI test/coverage step
+    # silently passes without running a single test.
+    enable_testing()
     add_subdirectory(test)
     add_subdirectory(bench)
 endif()
