@@ -1,0 +1,27 @@
+name: Package Version Consistency
+
+on:
+  # On a release tag (vX.Y.Z): require every package config to match the tag.
+  push:
+    tags: [ 'v*' ]
+  # On PRs / main: catch version drift between the package configs early,
+  # before a release is ever tagged.
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  check-versions:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Verify package config versions
+        run: |
+          if [ "${{ github.ref_type }}" = "tag" ]; then
+            tag="${{ github.ref_name }}"
+            .github/scripts/check-package-versions.sh "${tag#v}"
+          else
+            .github/scripts/check-package-versions.sh
+          fi
