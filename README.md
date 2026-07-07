@@ -217,6 +217,8 @@ inline buffer if you prefer to carry both together.
 
 ## API summary
 
+All public types are in the `sofab` namespace.
+
 ### Encoding API
 
 Encoders come in three flavours — `OStreamInline<N, Offset = 0>` (an `N`-byte
@@ -302,15 +304,6 @@ the end it calls the flush callback with the filled bytes and rewinds;
 message larger than the buffer you supply a flush callback (see the streaming
 example above) and the buffer acts as a small reusable window.
 
-**Constants.** `sofab::API_VERSION` (`1`); the spec §6.2 limits `sofab::ID_MAX`,
-`sofab::FIXLEN_MAX`, `sofab::ARRAY_MAX` (all `INT32_MAX`) and `sofab::MAX_DEPTH`
-(`255`, the maximum nested-sequence depth); `sofab::id` (the `uint32_t` field-id
-type); and the `sofab::Error` codes (`None`, `InvalidArgument`, `UsageError`,
-`BufferFull`, `InvalidMessage`) carried by `Result`. Opening more than
-`MAX_DEPTH` nested sequences fails encoding with `InvalidArgument`; a message
-that nests deeper is rejected on decode with `InvalidMessage` (never an unbounded
-recursion).
-
 ## Feature flags
 
 The library is header-only C++20 and **ships with every wire feature enabled by
@@ -373,11 +366,6 @@ gcovr --root . --filter '^include/sofab/.*\.hpp$' --object-directory build --pri
 cmake -S . -B build -DSOFAB_ENABLE_DOXYGEN=ON
 cmake --build build --target doc
 ```
-
-CI runs the GCC/Clang build+test jobs, a big-endian (ppc64) build that runs the
-suite under qemu, a coverage job that publishes the badge above, and a Doxygen
-job that deploys the API docs to GitHub Pages. The build matrix currently
-exercises the **Debug** configuration.
 
 ## Benchmarks
 
