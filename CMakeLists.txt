@@ -3,7 +3,9 @@
 #   cmake -S . -B build && cmake --build build && ctest --test-dir build
 
 cmake_minimum_required(VERSION 3.10)
-project(sofabuffers_cpp VERSION 1.0.0 LANGUAGES C CXX)
+project(sofabuffers_cpp VERSION
+    0.8.0
+    LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -24,7 +26,6 @@ target_include_directories(sofab_cpp INTERFACE
 # consumers of the exported target so find_package() users compile at the right
 # standard automatically.
 target_compile_features(sofab_cpp INTERFACE cxx_std_20)
-add_library(sofab::cpp ALIAS sofab_cpp)
 add_library(sofa-buffers::corelib ALIAS sofab_cpp)
 
 # Coverage: instrument the test executables (not the speed-tuned benches) so the
