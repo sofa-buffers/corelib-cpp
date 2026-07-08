@@ -904,6 +904,54 @@ namespace sofab
         }
 
         /**
+         * @brief Validate a single `Fixlen` field's length-and-subtype word (§4.6, §6.2).
+         *
+         * A well-formed word carries a defined subtype (0–3) whose length is legal
+         * for that subtype: a `Fp32` payload is exactly 4 bytes, `Fp64` exactly 8,
+         * and `String`/`Blob` any length up to @ref FIXLEN_MAX. Subtypes `0b100`..`0b111`
+         * are reserved. A violation is malformed **regardless of what follows**
+         * (spec §7 `INVALID`), so it must be rejected rather than mistaken for a
+         * truncated (`INCOMPLETE`) field.
+         *
+         * @param word The decoded `fixlen_word` (`(length << 3) | subtype`).
+         * @return `true` if the subtype/length pair is legal for a scalar fixlen field.
+         */
+        static bool fixlenWordValid(uint64_t word) noexcept
+        {
+            uint64_t len = word >> 3;
+            switch (static_cast<detail::Fix>(word & 0x7))
+            {
+                case detail::Fix::Fp32:   return len == 4;
+                case detail::Fix::Fp64:   return len == 8;
+                case detail::Fix::String:
+                case detail::Fix::Blob:   return len <= FIXLEN_MAX;
+                default:                  return false; /* reserved subtype (§4.6) */
+            }
+        }
+
+        /**
+         * @brief Validate a `ArrayFixlen` element word (§4.8, §6.2).
+         *
+         * A fixlen array may only carry fixed-width elements — `Fp32` (4 bytes) or
+         * `Fp64` (8 bytes). Dynamic subtypes (`String`, `Blob`) and the reserved
+         * subtypes are **not** permitted as array elements (§4.8); such a word is
+         * `INVALID`.
+         *
+         * @param word The decoded per-element `fixlen_word`.
+         * @return `true` if the subtype/element-size pair is legal for a fixlen array.
+         */
+        static bool arrayFixlenWordValid(uint64_t word) noexcept
+        {
+            uint64_t esize = word >> 3;
+            switch (static_cast<detail::Fix>(word & 0x7))
+            {
+                case detail::Fix::Fp32: return esize == 4;
+                case detail::Fix::Fp64: return esize == 8;
+                default:                return false; /* string/blob/reserved (§4.8) */
+            }
+        }
+
+        /**
          * @brief Append @p n bytes to a byte vector.
          *
          * The surrounding pragma silences a GCC-13 `-Wstringop-overflow` false
@@ -974,6 +1022,9 @@ namespace sofab
                 case detail::Wire::Fixlen:
                 {
                     uint64_t sub; if (!getVarint(p, end, sub)) return false;
+                    /* §4.6/§7: a bad subtype or an fp length that isn't 4/8 is
+                     * INVALID regardless of what follows — not a truncated field. */
+                    if (!fixlenWordValid(sub)) { error_ = true; return false; }
                     size_t len = static_cast<size_t>(sub >> 3);
                     if (static_cast<size_t>(end - p) < len) return false;
                     p += len; return true;
@@ -982,14 +1033,19 @@ namespace sofab
                 case detail::Wire::ArraySigned:
                 {
                     uint64_t n; if (!getVarint(p, end, n)) return false;
+                    /* §6.2/§7: a count above ARRAY_MAX is INVALID (and guards the
+                     * skip loop below from a malformed, unbounded element count). */
+                    if (n > ARRAY_MAX) { error_ = true; return false; }
                     for (uint64_t i = 0; i < n; ++i) if (!skipVarint(p, end)) return false;
                     return true;
                 }
                 case detail::Wire::ArrayFixlen:
                 {
                     uint64_t n; if (!getVarint(p, end, n)) return false;
+                    if (n > ARRAY_MAX) { error_ = true; return false; } /* §6.2/§7 */
                     /* §4.8: the fixlen_word is always present, even for a zero-count array. */
                     uint64_t sub; if (!getVarint(p, end, sub)) return false;
+                    if (!arrayFixlenWordValid(sub)) { error_ = true; return false; } /* §4.8/§7 */
                     size_t esize = static_cast<size_t>(sub >> 3);
                     size_t bytes = static_cast<size_t>(n) * esize;
                     if (static_cast<size_t>(end - p) < bytes) return false;
@@ -1012,7 +1068,10 @@ namespace sofab
                     }
                 }
                 case detail::Wire::SequenceEnd:
-                    return true;
+                    /* §7: a sequence-end marker with no open sequence is INVALID.
+                     * A properly-nested end is consumed by its parent's peek loop
+                     * above, so reaching here means a dangling end at this level. */
+                    error_ = true; return false;
             }
             return false;
         }

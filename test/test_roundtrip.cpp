@@ -258,12 +258,81 @@ static void malformedInput()
         CHECK((*in).s.empty(), "malformed: oversized fixlen yields no string");
     }
 
-    /* A stray sequence-end marker at top level must be skipped, not crash. */
+    /* A stray sequence-end marker with no open sequence is INVALID (§7), not a
+     * skippable no-op. Both the bare `0x07` (id 0) and an end with a nonzero id
+     * after a complete field must be rejected. */
     {
         sofab::IStreamObject<ScalarMsg> in;
         const uint8_t bytes[] = {0x07};
-        in.feed(bytes, sizeof bytes);
-        CHECK(true, "malformed: stray sequence-end survived");
+        auto r = in.feed(bytes, sizeof bytes);
+        CHECK(r.code() == sofab::Error::InvalidMessage, "malformed: stray sequence-end rejected");
+    }
+    {
+        sofab::IStreamObject<ScalarMsg> in;
+        const uint8_t bytes[] = {0x08, 0x00, 0x7f}; /* id1 unsigned=0, then dangling end (id15) */
+        auto r = in.feed(bytes, sizeof bytes);
+        CHECK(r.code() == sofab::Error::InvalidMessage, "malformed: dangling sequence-end after a field rejected");
+    }
+
+    /* Fixlen subtype/length must agree (§4.6): an fp32 payload is exactly 4 bytes
+     * and fp64 exactly 8. A float field whose declared length is anything else is
+     * INVALID regardless of what follows — not a truncated tail. This is the
+     * F-0005 reproducer class (`56 0a 59` = seq{ fp64 with length 11 }). */
+    {
+        const uint8_t repro[] = {0x56, 0x0a, 0x59}; /* seq id10 { fixlen id1, fp64, len 11 } */
+        sofab::IStreamObject<ScalarMsg> in;
+        auto r = in.feed(repro, sizeof repro);
+        CHECK(r.code() == sofab::Error::InvalidMessage, "malformed: fp64 length 11 rejected (F-0005 reproducer)");
+    }
+    {
+        /* id5 (reused as a float field here), fixlen, fp32 subtype, wrong lengths. */
+        for (uint8_t len : {0u, 3u, 5u, 8u})
+        {
+            const uint8_t bytes[] = {0x2a, static_cast<uint8_t>((len << 3) | 0u)}; /* fp32 */
+            sofab::IStreamObject<ScalarMsg> in;
+            auto r = in.feed(bytes, sizeof bytes);
+            CHECK(r.code() == sofab::Error::InvalidMessage, "malformed: fp32 with length != 4 rejected");
+        }
+    }
+    {
+        /* An fp32 with the correct length but a truncated payload stays INCOMPLETE
+         * (buffered), so the strictness above never swallows a split chunk. */
+        const uint8_t bytes[] = {0x2a, static_cast<uint8_t>((4u << 3) | 0u), 0x00, 0x00}; /* 2 of 4 bytes */
+        sofab::IStreamObject<ScalarMsg> in;
+        auto r = in.feed(bytes, sizeof bytes);
+        CHECK(r.code() == sofab::Error::None, "malformed: fp32 correct length but truncated payload is buffered");
+    }
+
+    /* Reserved fixlen subtype (0b100..0b111) is INVALID (§4.6). */
+    {
+        const uint8_t bytes[] = {0x2a, static_cast<uint8_t>((4u << 3) | 4u)}; /* subtype 4 = reserved */
+        sofab::IStreamObject<ScalarMsg> in;
+        auto r = in.feed(bytes, sizeof bytes);
+        CHECK(r.code() == sofab::Error::InvalidMessage, "malformed: reserved fixlen subtype rejected");
+    }
+
+    /* A fixlen ARRAY may only carry fp32/fp64 elements (§4.8): a string/blob
+     * element subtype, or a wrong element size, is INVALID. */
+    {
+        const uint8_t bytes[] = {0x2d, 0x01, static_cast<uint8_t>((1u << 3) | 2u)}; /* array id5, count1, string elem */
+        sofab::IStreamObject<ScalarMsg> in;
+        auto r = in.feed(bytes, sizeof bytes);
+        CHECK(r.code() == sofab::Error::InvalidMessage, "malformed: string element in fixlen array rejected");
+    }
+    {
+        const uint8_t bytes[] = {0x2d, 0x01, static_cast<uint8_t>((3u << 3) | 0u)}; /* fp32 elem size 3 */
+        sofab::IStreamObject<ScalarMsg> in;
+        auto r = in.feed(bytes, sizeof bytes);
+        CHECK(r.code() == sofab::Error::InvalidMessage, "malformed: fixlen array fp32 element size != 4 rejected");
+    }
+
+    /* An array count above ARRAY_MAX (INT32_MAX) is INVALID (§6.2) and must be
+     * rejected up front rather than driving an unbounded element-skip loop. */
+    {
+        const uint8_t bytes[] = {0x03, 0x80, 0x80, 0x80, 0x80, 0x08}; /* array id0, count = 2^31 */
+        sofab::IStreamObject<ScalarMsg> in;
+        auto r = in.feed(bytes, sizeof bytes);
+        CHECK(r.code() == sofab::Error::InvalidMessage, "malformed: array count above ARRAY_MAX rejected");
     }
 
     /* Skip an entire unread sub-sequence, then resync on the field after it. */
