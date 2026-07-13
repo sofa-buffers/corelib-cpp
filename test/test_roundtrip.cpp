@@ -251,6 +251,19 @@ static void malformedInput()
         CHECK(r.code() == sofab::Error::InvalidMessage, "malformed: overlong varint rejected");
     }
 
+    /* Overlong varint with NO terminating byte (all continuation, > 64 bits):
+     * still INVALID, not INCOMPLETE. The overflow is decided regardless of what
+     * follows, so the measure phase must reject it rather than mistake the
+     * unterminated tail for a truncated field (corelib-cpp#29). */
+    {
+        sofab::IStreamObject<ScalarMsg> in;
+        std::vector<uint8_t> bytes = {0x08}; /* id 1, unsigned */
+        for (int i = 0; i < 11; ++i) bytes.push_back(0x80); /* 11 continuation bytes, no terminator */
+        auto r = in.feed(bytes.data(), bytes.size());
+        CHECK(r.code() == sofab::Error::InvalidMessage,
+              "malformed: unterminated overlong varint is INVALID, not INCOMPLETE (#29)");
+    }
+
     /* Oversized fixlen length: the header claims far more payload than is
      * present. Held as INCOMPLETE, never read past the buffer. */
     {
