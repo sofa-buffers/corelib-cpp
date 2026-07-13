@@ -1312,6 +1312,19 @@ namespace sofab
             return Result{Error::Incomplete}; /* §7: a partial field is still buffered */
         }
 
+        /**
+         * @brief Mark the running decode INVALID from inside a deliver callback.
+         *
+         * Sets the sticky decode-error flag, so the surrounding @ref feed stops
+         * dispatching further fields and returns @ref Error::InvalidMessage
+         * (`INVALID`). For callers that detect malformed content the wire layer
+         * cannot judge on its own — e.g. a generated message rejecting an array
+         * whose wire element count exceeds its schema `count` capacity, which is
+         * INVALID per spec §3/§7 (generator#100). Idempotent; a no-op outside a
+         * @ref feed since every feed clears the flag on entry.
+         */
+        void invalidate() noexcept { error_ = true; }
+
     protected:
         /**
          * @brief Deliver every complete top-level field in `[p, end)`.

@@ -437,6 +437,68 @@ static void threeValuedOutcomes()
     }
 }
 
+/* --- invalidate(): a deliver callback rejects content the wire layer cannot
+ *     judge on its own — e.g. a generated message whose schema bounds a scalar
+ *     array's element count (a wire count above the schema capacity N is
+ *     INVALID per spec §3/§7, generator#100). --- */
+
+static void callbackInvalidate()
+{
+    struct BoundedArr : sofab::IStreamMessage
+    {
+        std::array<uint32_t, 4> u{};
+        int delivered = 0;
+        void deserialize(sofab::IStreamImpl &is, sofab::id id, size_t, size_t count) noexcept override
+        {
+            ++delivered;
+            if (id == 0)
+            {
+                if (count > 4) { is.invalidate(); return; } /* the generated guard */
+                is.read(u);
+            }
+        }
+    };
+
+    /* Control: count == capacity decodes COMPLETE. */
+    {
+        const uint8_t bytes[] = {0x03, 0x04, 1, 2, 3, 4};
+        sofab::IStreamObject<BoundedArr> in;
+        auto r = in.feed(bytes, sizeof bytes);
+        CHECK(r.code() == sofab::Error::None, "invalidate: count == capacity stays COMPLETE");
+        CHECK(((*in).u == std::array<uint32_t, 4>{1, 2, 3, 4}), "invalidate: control values decoded");
+    }
+
+    /* count > capacity: the callback invalidates; feed reports INVALID. */
+    {
+        const uint8_t bytes[] = {0x03, 0x05, 1, 2, 3, 4, 5};
+        sofab::IStreamObject<BoundedArr> in;
+        auto r = in.feed(bytes, sizeof bytes);
+        CHECK(r.code() == sofab::Error::InvalidMessage, "invalidate: over-count array is INVALID");
+        CHECK(r.invalid() && !r.complete() && !r.incomplete(), "invalidate: predicates report Invalid");
+        CHECK(r.status() == sofab::DecodeStatus::Invalid, "invalidate: status() is Invalid");
+    }
+
+    /* Dispatch stops at the invalidated field: nothing after it is delivered. */
+    {
+        const uint8_t bytes[] = {0x03, 0x05, 1, 2, 3, 4, 5, 0x08, 0x2a}; /* then id1 unsigned 42 */
+        sofab::IStreamObject<BoundedArr> in;
+        auto r = in.feed(bytes, sizeof bytes);
+        CHECK(r.code() == sofab::Error::InvalidMessage, "invalidate: INVALID with a trailing field");
+        CHECK((*in).delivered == 1, "invalidate: no field delivered past the invalidated one");
+    }
+
+    /* Buffered continuation path: the array completes on a later feed; the
+     * invalidate must surface through that feed's Result too. */
+    {
+        const uint8_t bytes[] = {0x03, 0x05, 1, 2, 3, 4, 5};
+        sofab::IStreamObject<BoundedArr> in;
+        auto r = in.feed(bytes, 3); /* header + count + 1 element: incomplete */
+        CHECK(r.code() == sofab::Error::Incomplete, "invalidate: split array first chunk is INCOMPLETE");
+        r = in.feed(bytes + 3, sizeof bytes - 3);
+        CHECK(r.code() == sofab::Error::InvalidMessage, "invalidate: completing chunk reports INVALID");
+    }
+}
+
 /* --- zero-length wire forms (§4.7–4.9): zero-count arrays and empty sequences --- */
 
 struct EmptyArrMsg : sofab::IStreamMessage
@@ -554,6 +616,7 @@ int main()
     skippingUnknownFields();
     malformedInput();
     threeValuedOutcomes();
+    callbackInvalidate();
     zeroLengthForms();
     maxDepth();
 
