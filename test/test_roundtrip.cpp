@@ -606,6 +606,123 @@ static void maxDepth()
     }
 }
 
+/* --- streaming buffer limit (issue #26): an opt-in cap on how large the
+ *     reassembly buffer may grow for a single incomplete top-level field.
+ *     Exceeding it fails feed() with Error::LimitExceeded — a receiver-side
+ *     *policy* code, deliberately distinct from InvalidMessage (wire
+ *     malformation) so a differential fuzzer never conflates the two. The
+ *     default (no Limits) is byte-for-byte the old unlimited behaviour. --- */
+
+static void appendVarint(std::vector<uint8_t> &v, uint64_t x)
+{
+    do { uint8_t b = x & 0x7f; x >>= 7; if (x) b |= 0x80; v.push_back(b); } while (x);
+}
+
+static void bufferLimits()
+{
+    const size_t cap = 64 * 1024; /* 64 KiB */
+
+    /* Claimed-oversize header: a fixlen string declaring a 1 MiB payload that
+     * never arrives. The cap is checked the instant the declared length is
+     * known, so feed() fails with LimitExceeded before acc_ grows to hold the
+     * promised bytes. This is the issue's acceptance case. */
+    {
+        std::vector<uint8_t> hdr = {0x2a}; /* id 5, fixlen */
+        appendVarint(hdr, (static_cast<uint64_t>(1u << 20) << 3) | 2u); /* string, len = 1 MiB */
+        sofab::IStreamObject<ScalarMsg> in(sofab::Limits{cap});
+        auto r = in.feed(hdr.data(), hdr.size()); /* header only, payload absent */
+        CHECK(r.code() == sofab::Error::LimitExceeded, "limit: claimed-oversize header fails immediately");
+        CHECK(r.limitExceeded() && !r.invalid() && !r.complete() && !r.incomplete(),
+              "limit: LimitExceeded predicates are distinct from invalid()");
+        CHECK((*in).s.empty(), "limit: no value delivered for the rejected field");
+    }
+
+    /* Chunk-independence: the SAME oversize field dribbled a byte at a time. The
+     * split length varint is held as INCOMPLETE until it completes, then the cap
+     * fires — the outcome does not depend on how the bytes were framed. */
+    {
+        std::vector<uint8_t> hdr = {0x2a};
+        appendVarint(hdr, (static_cast<uint64_t>(1u << 20) << 3) | 2u);
+        sofab::IStreamObject<ScalarMsg> in(sofab::Limits{cap});
+        sofab::Error last = sofab::Error::None;
+        bool sawIncomplete = false;
+        for (size_t i = 0; i < hdr.size(); ++i)
+        {
+            auto r = in.feed(hdr.data() + i, 1);
+            last = r.code();
+            if (r.code() == sofab::Error::Incomplete) sawIncomplete = true;
+            if (r.code() == sofab::Error::LimitExceeded) break;
+        }
+        CHECK(sawIncomplete, "limit: dribbled header is INCOMPLETE until the length word lands");
+        CHECK(last == sofab::Error::LimitExceeded, "limit: dribbled oversize still ends in LimitExceeded");
+    }
+
+    /* Many small fields inside one sequence: no single declared payload crosses
+     * the cap, yet their running total does. Fed in small chunks, feed() reports
+     * LimitExceeded once the buffered sequence outgrows the cap. */
+    {
+        const size_t smallCap = 128;
+        std::vector<uint8_t> seq = {0x0e};                                    /* id 1, sequence-start */
+        for (int i = 0; i < 200; ++i) { seq.push_back(0x00); seq.push_back(0x00); } /* id 0 unsigned = 0 */
+        seq.push_back(0x07);                                                  /* sequence-end */
+        sofab::IStreamObject<ScalarMsg> in(sofab::Limits{smallCap});
+        sofab::Error last = sofab::Error::None;
+        for (size_t i = 0; i < seq.size(); i += 8)
+        {
+            size_t n = seq.size() - i < 8 ? seq.size() - i : 8;
+            auto r = in.feed(seq.data() + i, n);
+            last = r.code();
+            if (r.code() == sofab::Error::LimitExceeded) break;
+        }
+        CHECK(last == sofab::Error::LimitExceeded, "limit: oversized sequence of small fields is capped");
+    }
+
+    /* No-limit pass-through (opt-in): the identical oversize header, with NO cap,
+     * is simply INCOMPLETE (awaiting payload) — never LimitExceeded. */
+    {
+        std::vector<uint8_t> hdr = {0x2a};
+        appendVarint(hdr, (static_cast<uint64_t>(1u << 20) << 3) | 2u);
+        sofab::IStreamObject<ScalarMsg> in; /* default: uncapped */
+        auto r = in.feed(hdr.data(), hdr.size());
+        CHECK(r.code() == sofab::Error::Incomplete, "limit: without a cap the oversize header stays INCOMPLETE");
+    }
+
+    /* No-limit pass-through, positive: a large field decodes normally to COMPLETE
+     * when no cap is configured. */
+    {
+        std::string big(4000, 'x');
+        sofab::OStreamInline<8192> os;
+        os.write(5, std::string_view{big});
+        sofab::IStreamObject<ScalarMsg> in; /* default: uncapped */
+        auto r = in.feed(os.data(), os.bytesUsed());
+        CHECK(r.code() == sofab::Error::None, "limit: default (no cap) decodes a large field COMPLETE");
+        CHECK((*in).s == big, "limit: uncapped large field round-trips");
+    }
+
+    /* The cap plumbs through IStreamInline too (not just IStreamObject). */
+    {
+        std::vector<uint8_t> hdr = {0x2a};
+        appendVarint(hdr, (static_cast<uint64_t>(1u << 20) << 3) | 2u);
+        bool delivered = false;
+        sofab::IStreamInline in([&](sofab::id, size_t, size_t) { delivered = true; }, sofab::Limits{cap});
+        auto r = in.feed(hdr.data(), hdr.size());
+        CHECK(r.code() == sofab::Error::LimitExceeded, "limit: IStreamInline honours the cap");
+        CHECK(!delivered, "limit: IStreamInline delivers no field for the rejected header");
+    }
+
+    /* A field under the cap decodes COMPLETE even with a cap set — the limit only
+     * rejects what exceeds it. */
+    {
+        std::string s(1000, 'y');
+        sofab::OStreamInline<4096> os;
+        os.write(5, std::string_view{s});
+        sofab::IStreamObject<ScalarMsg> in(sofab::Limits{cap}); /* 64 KiB cap, 1000-byte field */
+        auto r = in.feed(os.data(), os.bytesUsed());
+        CHECK(r.code() == sofab::Error::None, "limit: a field under the cap decodes COMPLETE");
+        CHECK((*in).s == s, "limit: under-cap field round-trips with a cap set");
+    }
+}
+
 int main()
 {
     encodeVectors();
@@ -619,6 +736,7 @@ int main()
     callbackInvalidate();
     zeroLengthForms();
     maxDepth();
+    bufferLimits();
 
     std::printf("\n%d checks, %d failures\n", g_checks, g_failures);
     return g_failures ? 1 : 0;

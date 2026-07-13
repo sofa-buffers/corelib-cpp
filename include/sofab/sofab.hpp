@@ -59,6 +59,30 @@ namespace sofab
     inline constexpr int MAX_DEPTH = 255;
 
     /**
+     * @brief Optional receiver-side decode limits for a streaming input stream.
+     *
+     * A *mechanism* only: the corelib enforces whatever cap it is handed but
+     * invents no default. The concrete values are configured in the sofabgen
+     * config, baked into generated code as constants, and passed to the istream
+     * constructors — see sofa-buffers/generator#102. The default leaves every
+     * limit disabled, so behaviour is byte-for-byte unchanged from an unlimited
+     * stream.
+     */
+    struct Limits
+    {
+        /**
+         * @brief Cap on how large the streaming reassembly buffer may grow for a
+         *        single incomplete top-level field, in bytes.
+         *
+         * A field whose declared or accumulated size exceeds this is rejected
+         * with @ref Error::LimitExceeded — the claimed size is checked the moment
+         * it is known, so an oversized header fails even if its payload never
+         * arrives. `SIZE_MAX` (the default) means no cap.
+         */
+        size_t max_buffered_field = SIZE_MAX;
+    };
+
+    /**
      * @brief Always-false trait used to trigger `static_assert` in the
      *        otherwise-unreachable branch of an `if constexpr` chain.
      *
@@ -84,6 +108,12 @@ namespace sofab
                              ///< or an open (unclosed) sequence (§4.9). This is `INCOMPLETE` (§7): **not**
                              ///< an error — the caller owns end-of-input and may feed more bytes. It is
                              ///< distinct from both @ref None (`COMPLETE`) and @ref InvalidMessage (`INVALID`).
+        LimitExceeded = 6,   ///< Decode-only: a single field would grow the streaming reassembly buffer
+                             ///< past the receiver-configured @ref Limits::max_buffered_field. This is
+                             ///< **policy**, not wire malformation — deliberately distinct from
+                             ///< @ref InvalidMessage so a differential fuzzer never reads a local buffering
+                             ///< limit as a conformance divergence. The bytes are never clamped or
+                             ///< truncated; the @ref IStreamImpl::feed simply fails with this code.
     };
 
     /**
@@ -873,7 +903,12 @@ namespace sofab
             [[nodiscard]] explicit operator bool() const noexcept { return ok(); }
             /// @return `true` only for `COMPLETE`; `false` for both @ref incomplete and @ref invalid.
             [[nodiscard]] bool ok() const noexcept { return error_ == Error::None; }
-            /// @return The three-valued outcome as a @ref DecodeStatus (§7).
+            /// @return The three-valued §7 outcome as a @ref DecodeStatus. A
+            ///         @ref Error::LimitExceeded result is a receiver-side policy
+            ///         failure, **not** one of the three wire outcomes — it maps to
+            ///         @ref DecodeStatus::Invalid here only as a coarse fallback;
+            ///         callers distinguishing policy from malformation must use
+            ///         @ref code / @ref limitExceeded / @ref invalid.
             [[nodiscard]] DecodeStatus status() const noexcept
             {
                 switch (error_)
@@ -887,9 +922,12 @@ namespace sofab
             [[nodiscard]] bool complete() const noexcept { return error_ == Error::None; }
             /// @return `true` if the bytes end mid-field / with an open sequence (`INCOMPLETE`). Not an error.
             [[nodiscard]] bool incomplete() const noexcept { return error_ == Error::Incomplete; }
-            /// @return `true` if the bytes are malformed (`INVALID`).
+            /// @return `true` if the bytes are malformed (`INVALID`). **False** for a
+            ///         @ref limitExceeded result — a policy cap is not wire malformation.
             [[nodiscard]] bool invalid() const noexcept { return error_ == Error::InvalidMessage; }
-            /// @return The status code (@ref Error::None, @ref Error::Incomplete or @ref Error::InvalidMessage).
+            /// @return `true` if a field exceeded @ref Limits::max_buffered_field. Distinct from @ref invalid.
+            [[nodiscard]] bool limitExceeded() const noexcept { return error_ == Error::LimitExceeded; }
+            /// @return The status code (@ref Error::None, @ref Error::Incomplete, @ref Error::InvalidMessage or @ref Error::LimitExceeded).
             [[nodiscard]] Error code() const noexcept { return error_; }
             /// @return `true` if the status code equals @p e.
             bool operator==(Error e) const noexcept { return error_ == e; }
@@ -910,12 +948,18 @@ namespace sofab
         size_t count_ = 0;             ///< Element count of the current array field.
         bool consumed_ = false;        ///< Set once the callback has read the current field's value.
         bool error_ = false;           ///< Sticky decode-error flag for the current @ref feed.
+        bool limitExceeded_ = false;   ///< Sticky flag: a field crossed @ref maxBufferedField_ this @ref feed.
         int seqDepth_ = 0;             ///< Current nested-sequence depth during dispatch (§4.9 @ref MAX_DEPTH).
+
+        /// Cap on the reassembly buffer's growth for one incomplete field (@ref Limits::max_buffered_field).
+        size_t maxBufferedField_ = SIZE_MAX;
 
         std::function<void(sofab::id, size_t, size_t)> topCallback_; ///< Delivers each top-level field.
 
         /// Construct an empty stream; a derived class installs @ref topCallback_.
         IStreamImpl() noexcept = default;
+        /// Construct with receiver-side @ref Limits; a derived class installs @ref topCallback_.
+        explicit IStreamImpl(Limits limits) noexcept : maxBufferedField_(limits.max_buffered_field) {}
 
         /**
          * @brief Read one base-128 varint, advancing the cursor (bounds-checked).
@@ -1087,8 +1131,28 @@ namespace sofab
             return false;
         }
 
-        bool measureField(const uint8_t *&p, const uint8_t *end, int depth = 0) noexcept
+        /**
+         * @brief Would buffering this field cross @ref maxBufferedField_?
+         *
+         * @param consumed Bytes of the current top-level field already spanned.
+         * @param need Further bytes the field is now known to require (a declared
+         *        payload length, array byte-span, or per-element lower bound).
+         * @return `true` if `consumed + need` exceeds the cap. Overflow-safe: the
+         *         addition is never formed, so a `SIZE_MAX` cap always answers `false`.
+         */
+        [[nodiscard]] bool exceedsBuffer(size_t consumed, uint64_t need) const noexcept
         {
+            if (consumed > maxBufferedField_) return true;
+            return need > static_cast<uint64_t>(maxBufferedField_ - consumed);
+        }
+
+        bool measureField(const uint8_t *&p, const uint8_t *end,
+                          const uint8_t *fieldStart, int depth = 0) noexcept
+        {
+            /* Policy cap (issue #26): once the bytes already spanned by this single
+             * top-level field exceed the reassembly-buffer limit, stop — before the
+             * caller grows acc_ any further. Distinct from a wire error. */
+            if (exceedsBuffer(static_cast<size_t>(p - fieldStart), 0)) { limitExceeded_ = true; return false; }
             uint64_t header;
             if (!measureVarint(p, end, header)) return false;
             auto type = static_cast<detail::Wire>(header & 0x7);
@@ -1104,6 +1168,9 @@ namespace sofab
                      * INVALID regardless of what follows — not a truncated field. */
                     if (!fixlenWordValid(sub)) { error_ = true; return false; }
                     size_t len = static_cast<size_t>(sub >> 3);
+                    /* #26: the declared payload size is known now — reject an oversize
+                     * claim before waiting for (or buffering) the bytes it promises. */
+                    if (exceedsBuffer(static_cast<size_t>(p - fieldStart), len)) { limitExceeded_ = true; return false; }
                     if (static_cast<size_t>(end - p) < len) return false;
                     p += len; return true;
                 }
@@ -1114,6 +1181,9 @@ namespace sofab
                     /* §6.2/§7: a count above ARRAY_MAX is INVALID (and guards the
                      * skip loop below from a malformed, unbounded element count). */
                     if (n > ARRAY_MAX) { error_ = true; return false; }
+                    /* #26: each element is at least one byte, so `n` is a lower bound
+                     * on the payload — a count past the cap can never fit. */
+                    if (exceedsBuffer(static_cast<size_t>(p - fieldStart), n)) { limitExceeded_ = true; return false; }
                     for (uint64_t i = 0; i < n; ++i) if (!measureSkipVarint(p, end)) return false;
                     return true;
                 }
@@ -1125,9 +1195,11 @@ namespace sofab
                     uint64_t sub; if (!measureVarint(p, end, sub)) return false;
                     if (!arrayFixlenWordValid(sub)) { error_ = true; return false; } /* §4.8/§7 */
                     size_t esize = static_cast<size_t>(sub >> 3);
-                    size_t bytes = static_cast<size_t>(n) * esize;
-                    if (static_cast<size_t>(end - p) < bytes) return false;
-                    p += bytes; return true;
+                    uint64_t bytes = n * static_cast<uint64_t>(esize);
+                    /* #26: whole element span is known — reject an oversize array up front. */
+                    if (exceedsBuffer(static_cast<size_t>(p - fieldStart), bytes)) { limitExceeded_ = true; return false; }
+                    if (static_cast<uint64_t>(end - p) < bytes) return false;
+                    p += static_cast<size_t>(bytes); return true;
                 }
                 case detail::Wire::SequenceStart:
                 {
@@ -1135,6 +1207,10 @@ namespace sofab
                     if (depth + 1 > MAX_DEPTH) { error_ = true; return false; }
                     for (;;)
                     {
+                        /* #26: a sequence's own bulk accrues field by field — bound it
+                         * as it grows, catching many-small-fields the per-payload
+                         * checks above never individually trip. */
+                        if (exceedsBuffer(static_cast<size_t>(p - fieldStart), 0)) { limitExceeded_ = true; return false; }
                         const uint8_t *save = p;
                         uint64_t peek;
                         const uint8_t *q = p;
@@ -1142,7 +1218,7 @@ namespace sofab
                         if (static_cast<detail::Wire>(peek & 0x7) == detail::Wire::SequenceEnd)
                         { p = q; return true; }
                         p = save;
-                        if (!measureField(p, end, depth + 1)) return false;
+                        if (!measureField(p, end, fieldStart, depth + 1)) return false;
                     }
                 }
                 case detail::Wire::SequenceEnd:
@@ -1288,7 +1364,12 @@ namespace sofab
             if (acc_.empty()) [[likely]]
             {
                 error_ = false;
+                limitExceeded_ = false;
                 const uint8_t *stop = parseTopLevel(buffer, buffer + buflen);
+                /* #26: a field over the buffering cap fails as policy — checked
+                 * before the incomplete tail is copied into acc_, so a claimed
+                 * oversize is rejected even though its payload never arrived. */
+                if (limitExceeded_) return Result{Error::LimitExceeded};
                 if (error_) return Result{Error::InvalidMessage};
                 if (stop != buffer + buflen)
                 {
@@ -1304,8 +1385,12 @@ namespace sofab
             /* Continuation path: append and resume from the buffered tail. */
             appendBytes(acc_, buffer, buflen);
             error_ = false;
+            limitExceeded_ = false;
             const uint8_t *base = acc_.data();
             const uint8_t *stop = parseTopLevel(base + topPos_, base + acc_.size());
+            /* #26: re-measured from the buffered tail, so the cap is chunk-independent —
+             * the same field crosses it whether fed whole or dribbled byte by byte. */
+            if (limitExceeded_) return Result{Error::LimitExceeded};
             if (error_) return Result{Error::InvalidMessage};
             topPos_ = static_cast<size_t>(stop - base);
             if (topPos_ == acc_.size()) { acc_.clear(); topPos_ = 0; return Result{Error::None}; } /* fully drained: COMPLETE */
@@ -1338,10 +1423,11 @@ namespace sofab
             while (p < end)
             {
                 const uint8_t *probe = p;
-                if (!measureField(probe, end))
+                if (!measureField(probe, end, /*fieldStart=*/p))
                 {
-                    if (error_) return p; /* malformed (e.g. nesting past MAX_DEPTH) */
-                    break;                /* need more bytes */
+                    if (limitExceeded_) return p; /* #26: field over the buffering cap (policy) */
+                    if (error_) return p;         /* malformed (e.g. nesting past MAX_DEPTH) */
+                    break;                        /* need more bytes */
                 }
                 p_ = p;
                 end_ = end;
@@ -1537,10 +1623,12 @@ namespace sofab
         using fieldCallback = std::function<void(sofab::id, size_t, size_t)>;
 
         /**
-         * @brief Construct with the per-field callback.
+         * @brief Construct with the per-field callback and optional decode limits.
          * @param callback Invoked for each complete top-level field.
+         * @param limits Receiver-side caps (see @ref Limits); default is uncapped.
          */
-        explicit IStreamInline(fieldCallback callback) noexcept
+        explicit IStreamInline(fieldCallback callback, Limits limits = {}) noexcept
+            : IStreamImpl(limits)
         {
             topCallback_ = std::move(callback);
         }
@@ -1590,7 +1678,9 @@ namespace sofab
 
     public:
         /// Construct and route each top-level field into the wrapped message.
-        IStreamObject() noexcept
+        /// @param limits Receiver-side caps (see @ref Limits); default is uncapped.
+        explicit IStreamObject(Limits limits = {}) noexcept
+            : IStreamImpl(limits)
         {
             topCallback_ = [this](sofab::id id, size_t size, size_t count) {
                 data_.deserialize(*this, id, size, count);
