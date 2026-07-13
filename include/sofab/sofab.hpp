@@ -74,11 +74,32 @@ namespace sofab
     /// Status codes returned by the encode/decode API; `None` signals success.
     enum class Error
     {
-        None = 0,            ///< Operation succeeded.
+        None = 0,            ///< Operation succeeded (decode: `COMPLETE`, §7).
         UsageError = 2,      ///< The API was used incorrectly (e.g. out-of-order calls).
         BufferFull = 3,      ///< The output buffer filled and no flush callback was set.
         InvalidArgument = 1, ///< An argument was out of range (e.g. a field id above the limit).
-        InvalidMessage = 4,  ///< The input bytes are malformed or truncated.
+        InvalidMessage = 4,  ///< The input bytes are malformed (decode: `INVALID`, §7).
+        Incomplete = 5,      ///< Decode-only: the fed bytes end **inside** a field — a partial
+                             ///< varint (§4.1), a fixlen/array payload shorter than declared (§4.6/§4.8),
+                             ///< or an open (unclosed) sequence (§4.9). This is `INCOMPLETE` (§7): **not**
+                             ///< an error — the caller owns end-of-input and may feed more bytes. It is
+                             ///< distinct from both @ref None (`COMPLETE`) and @ref InvalidMessage (`INVALID`).
+    };
+
+    /**
+     * @brief Three-valued decode outcome of a @ref sofab::IStreamImpl::feed call (spec §7).
+     *
+     * The decoder reports where the consumed bytes ended, with **no** separate
+     * `finish`/`finalize` step (§7.1): the same three outcomes apply to a one-shot
+     * buffer and to chunked streaming. Whether an @ref Incomplete result is
+     * acceptable is the caller's decision — a streaming caller reads it as "feed
+     * me the next chunk", a whole-message caller reads it as a truncated message.
+     */
+    enum class DecodeStatus
+    {
+        Complete = 0,   ///< Consumed bytes end **exactly** at a field boundary — a valid message.
+        Incomplete = 1, ///< Consumed bytes end **inside** a field or with an open sequence. Not an error.
+        Invalid = 2,    ///< Bytes are malformed **regardless of what follows**. Terminal.
     };
 
     /// Field identifier on the wire. Valid range is `[0, INT32_MAX]`.
@@ -832,18 +853,43 @@ namespace sofab
     class IStreamImpl
     {
     public:
-        /// Outcome of a @ref feed call.
+        /**
+         * @brief Three-valued outcome of a @ref feed call (spec §7).
+         *
+         * Carries one of @ref Error::None (`COMPLETE`), @ref Error::Incomplete
+         * (`INCOMPLETE`) or @ref Error::InvalidMessage (`INVALID`). Read it either
+         * as an @ref Error @ref code, as a @ref DecodeStatus via @ref status, or
+         * through the boolean predicates @ref complete / @ref incomplete /
+         * @ref invalid. @ref incomplete is **not** an error — the bytes merely end
+         * mid-field and more may follow.
+         */
         class Result
         {
             Error error_;
             friend class IStreamImpl;
             explicit Result(Error e) noexcept : error_(e) {}
         public:
-            /// @return `true` if decoding succeeded.
+            /// @return `true` only for `COMPLETE` — the bytes end exactly at a field boundary.
             [[nodiscard]] explicit operator bool() const noexcept { return ok(); }
-            /// @return `true` if decoding succeeded.
+            /// @return `true` only for `COMPLETE`; `false` for both @ref incomplete and @ref invalid.
             [[nodiscard]] bool ok() const noexcept { return error_ == Error::None; }
-            /// @return The status code (@ref Error::InvalidMessage on malformed input).
+            /// @return The three-valued outcome as a @ref DecodeStatus (§7).
+            [[nodiscard]] DecodeStatus status() const noexcept
+            {
+                switch (error_)
+                {
+                    case Error::None:        return DecodeStatus::Complete;
+                    case Error::Incomplete:  return DecodeStatus::Incomplete;
+                    default:                 return DecodeStatus::Invalid;
+                }
+            }
+            /// @return `true` if the consumed bytes end exactly at a field boundary (`COMPLETE`).
+            [[nodiscard]] bool complete() const noexcept { return error_ == Error::None; }
+            /// @return `true` if the bytes end mid-field / with an open sequence (`INCOMPLETE`). Not an error.
+            [[nodiscard]] bool incomplete() const noexcept { return error_ == Error::Incomplete; }
+            /// @return `true` if the bytes are malformed (`INVALID`).
+            [[nodiscard]] bool invalid() const noexcept { return error_ == Error::InvalidMessage; }
+            /// @return The status code (@ref Error::None, @ref Error::Incomplete or @ref Error::InvalidMessage).
             [[nodiscard]] Error code() const noexcept { return error_; }
             /// @return `true` if the status code equals @p e.
             bool operator==(Error e) const noexcept { return error_ == e; }
@@ -876,9 +922,13 @@ namespace sofab
          * @param[in,out] p Cursor; advanced past the varint on success.
          * @param end One past the last readable byte.
          * @param[out] out Decoded value.
-         * @return `true` on success, `false` if the buffer ends mid-varint or it overflows 64 bits.
+         * @return `true` on success, `false` if the buffer ends mid-varint or it
+         *         overflows 64 bits. On overflow (a varint > 64 bits, §4.1) `*overflow`
+         *         is set: that is INVALID regardless of what follows, and callers in
+         *         the measure phase must distinguish it from a merely-truncated tail.
          */
-        static bool getVarint(const uint8_t *&p, const uint8_t *end, uint64_t &out) noexcept
+        static bool getVarint(const uint8_t *&p, const uint8_t *end, uint64_t &out,
+                              bool *overflow = nullptr) noexcept
         {
             uint64_t v = 0; int shift = 0;
             while (p < end)
@@ -887,7 +937,7 @@ namespace sofab
                 v |= static_cast<uint64_t>(b & 0x7f) << shift;
                 if (!(b & 0x80)) { out = v; return true; }
                 shift += 7;
-                if (shift >= 64) return false;
+                if (shift >= 64) { if (overflow) *overflow = true; return false; }
             }
             return false;
         }
@@ -895,11 +945,21 @@ namespace sofab
          * @brief Advance the cursor past one varint without decoding it (bounds-checked).
          * @param[in,out] p Cursor; advanced past the varint on success.
          * @param end One past the last readable byte.
-         * @return `true` on success, `false` if the buffer ends mid-varint.
+         * @return `true` on success, `false` if the buffer ends mid-varint or it
+         *         overflows 64 bits. As with @ref getVarint, `*overflow` is set on a
+         *         > 64-bit varint (§4.1) so the measure phase can report INVALID
+         *         rather than mistaking an over-long varint for a truncated tail.
          */
-        static bool skipVarint(const uint8_t *&p, const uint8_t *end) noexcept
+        static bool skipVarint(const uint8_t *&p, const uint8_t *end,
+                               bool *overflow = nullptr) noexcept
         {
-            while (p < end) if (!(*p++ & 0x80)) return true;
+            int shift = 0;
+            while (p < end)
+            {
+                if (!(*p++ & 0x80)) return true;
+                shift += 7;
+                if (shift >= 64) { if (overflow) *overflow = true; return false; }
+            }
             return false;
         }
 
@@ -1009,19 +1069,37 @@ namespace sofab
          * @return `true` if a full field was spanned, `false` if the buffer ends
          *         mid-field or the error flag was set (check @ref error_ to tell them apart).
          */
+        /// @ref getVarint for the measure phase: a > 64-bit varint (overflow) is
+        /// INVALID (sets @ref error_), a mid-varint end is INCOMPLETE (leaves it clear).
+        bool measureVarint(const uint8_t *&p, const uint8_t *end, uint64_t &out) noexcept
+        {
+            bool overflow = false;
+            if (getVarint(p, end, out, &overflow)) return true;
+            if (overflow) error_ = true;
+            return false;
+        }
+        /// @ref skipVarint for the measure phase, with the same overflow → INVALID rule.
+        bool measureSkipVarint(const uint8_t *&p, const uint8_t *end) noexcept
+        {
+            bool overflow = false;
+            if (skipVarint(p, end, &overflow)) return true;
+            if (overflow) error_ = true;
+            return false;
+        }
+
         bool measureField(const uint8_t *&p, const uint8_t *end, int depth = 0) noexcept
         {
             uint64_t header;
-            if (!getVarint(p, end, header)) return false;
+            if (!measureVarint(p, end, header)) return false;
             auto type = static_cast<detail::Wire>(header & 0x7);
             switch (type)
             {
                 case detail::Wire::Unsigned:
                 case detail::Wire::Signed:
-                    return skipVarint(p, end);
+                    return measureSkipVarint(p, end);
                 case detail::Wire::Fixlen:
                 {
-                    uint64_t sub; if (!getVarint(p, end, sub)) return false;
+                    uint64_t sub; if (!measureVarint(p, end, sub)) return false;
                     /* §4.6/§7: a bad subtype or an fp length that isn't 4/8 is
                      * INVALID regardless of what follows — not a truncated field. */
                     if (!fixlenWordValid(sub)) { error_ = true; return false; }
@@ -1032,19 +1110,19 @@ namespace sofab
                 case detail::Wire::ArrayUnsigned:
                 case detail::Wire::ArraySigned:
                 {
-                    uint64_t n; if (!getVarint(p, end, n)) return false;
+                    uint64_t n; if (!measureVarint(p, end, n)) return false;
                     /* §6.2/§7: a count above ARRAY_MAX is INVALID (and guards the
                      * skip loop below from a malformed, unbounded element count). */
                     if (n > ARRAY_MAX) { error_ = true; return false; }
-                    for (uint64_t i = 0; i < n; ++i) if (!skipVarint(p, end)) return false;
+                    for (uint64_t i = 0; i < n; ++i) if (!measureSkipVarint(p, end)) return false;
                     return true;
                 }
                 case detail::Wire::ArrayFixlen:
                 {
-                    uint64_t n; if (!getVarint(p, end, n)) return false;
+                    uint64_t n; if (!measureVarint(p, end, n)) return false;
                     if (n > ARRAY_MAX) { error_ = true; return false; } /* §6.2/§7 */
                     /* §4.8: the fixlen_word is always present, even for a zero-count array. */
-                    uint64_t sub; if (!getVarint(p, end, sub)) return false;
+                    uint64_t sub; if (!measureVarint(p, end, sub)) return false;
                     if (!arrayFixlenWordValid(sub)) { error_ = true; return false; } /* §4.8/§7 */
                     size_t esize = static_cast<size_t>(sub >> 3);
                     size_t bytes = static_cast<size_t>(n) * esize;
@@ -1060,7 +1138,7 @@ namespace sofab
                         const uint8_t *save = p;
                         uint64_t peek;
                         const uint8_t *q = p;
-                        if (!getVarint(q, end, peek)) return false;
+                        if (!measureVarint(q, end, peek)) return false;
                         if (static_cast<detail::Wire>(peek & 0x7) == detail::Wire::SequenceEnd)
                         { p = q; return true; }
                         p = save;
@@ -1193,8 +1271,13 @@ namespace sofab
          *
          * @param buffer Bytes to decode.
          * @param buflen Number of bytes in @p buffer.
-         * @return A @ref Result carrying @ref Error::None, or @ref Error::InvalidMessage
-         *         if the bytes are malformed.
+         * @return A @ref Result carrying the three-valued §7 outcome:
+         *         @ref Error::None (`COMPLETE`) when the fed bytes end exactly at a
+         *         field boundary; @ref Error::Incomplete (`INCOMPLETE`) when they end
+         *         **inside** a field (partial varint, short fixlen/array payload) or
+         *         with an open sequence — the partial tail is buffered for the next
+         *         @ref feed and is **not** an error; or @ref Error::InvalidMessage
+         *         (`INVALID`) when the bytes are malformed regardless of what follows.
          */
         Result feed(const uint8_t *buffer, size_t buflen) noexcept
         {
@@ -1208,7 +1291,13 @@ namespace sofab
                 const uint8_t *stop = parseTopLevel(buffer, buffer + buflen);
                 if (error_) return Result{Error::InvalidMessage};
                 if (stop != buffer + buflen)
+                {
+                    /* §7: bytes remain that begin but do not finish a field (or an
+                     * open sequence). Retain the partial tail and report INCOMPLETE —
+                     * distinct from COMPLETE, and never folded into INVALID. */
                     appendBytes(acc_, stop, static_cast<size_t>(buffer + buflen - stop));
+                    return Result{Error::Incomplete};
+                }
                 return Result{Error::None};
             }
 
@@ -1219,8 +1308,8 @@ namespace sofab
             const uint8_t *stop = parseTopLevel(base + topPos_, base + acc_.size());
             if (error_) return Result{Error::InvalidMessage};
             topPos_ = static_cast<size_t>(stop - base);
-            if (topPos_ == acc_.size()) { acc_.clear(); topPos_ = 0; } /* fully drained */
-            return Result{Error::None};
+            if (topPos_ == acc_.size()) { acc_.clear(); topPos_ = 0; return Result{Error::None}; } /* fully drained: COMPLETE */
+            return Result{Error::Incomplete}; /* §7: a partial field is still buffered */
         }
 
     protected:

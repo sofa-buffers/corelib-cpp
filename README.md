@@ -169,6 +169,21 @@ for (uint8_t b : wire)                // feed whatever arrives — here one byte
 // (*in) is fully populated
 ```
 
+Each `feed()` returns a three-valued decode outcome (spec §7) — there is **no**
+separate `finish`/`finalize` step, and the same three results apply to a one-shot
+buffer and to chunked streaming:
+
+| `Result`                | `code()`                 | `status()`                    | meaning |
+|-------------------------|--------------------------|-------------------------------|---------|
+| `complete()` / `ok()`   | `Error::None`            | `DecodeStatus::Complete`      | the consumed bytes end **exactly** at a field boundary — a valid message |
+| `incomplete()`          | `Error::Incomplete`      | `DecodeStatus::Incomplete`    | the bytes end **inside** a field (a partial varint, a short fixlen/array payload) or with an open sequence; the partial tail is retained for the next `feed()` |
+| `invalid()`             | `Error::InvalidMessage`  | `DecodeStatus::Invalid`       | the bytes are malformed **regardless of what follows** (varint over 64 bits, bad subtype/length, count/id over max, nesting past `MAX_DEPTH`, dangling sequence-end, …) |
+
+`Incomplete` is **not** an error — it means "the message may continue": a streaming
+caller reads it as "feed me more bytes", while a caller that has delivered all its
+bytes and still sees `Incomplete` knows the message was truncated. A truncated tail
+is therefore never silently accepted as `Complete`, nor rejected as `Invalid`.
+
 ### Code generator
 
 The usual way to drive the library is through **generated object code**: a schema
@@ -257,9 +272,11 @@ ctest --test-dir build --output-on-failure
 
 Two suites run under CTest:
 
-- **`test_roundtrip`** — encode/decode/nested/chunked/skip checks plus
-  malformed-input handling (truncated/overlong varints, oversized lengths, stray
-  markers) and resync after a skipped sub-sequence.
+- **`test_roundtrip`** — encode/decode/nested/chunked/skip checks plus the
+  three-valued decode outcome (§7: COMPLETE / INCOMPLETE / INVALID), malformed-input
+  handling (truncated tails held as `Incomplete`; overlong varints, oversized
+  lengths and stray markers rejected as `InvalidMessage`) and resync after a
+  skipped sub-sequence.
 - **`test_vectors`** — replays the shared `assets/test_vectors.json` conformance
   suite (copied verbatim from `corelib-c-cpp`, the authoritative source) for
   encode, decode, and byte-at-a-time chunked streaming.
