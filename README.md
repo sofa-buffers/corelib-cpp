@@ -184,6 +184,27 @@ caller reads it as "feed me more bytes", while a caller that has delivered all i
 bytes and still sees `Incomplete` knows the message was truncated. A truncated tail
 is therefore never silently accepted as `Complete`, nor rejected as `Invalid`.
 
+#### Streaming buffer limit (opt-in)
+
+A never-completing or huge trailing field would otherwise grow the internal
+reassembly buffer without bound (a field may claim up to `FIXLEN_MAX`/`ARRAY_MAX`
+≈ 2 GB). To cap that, pass a `sofab::Limits` to the stream constructor:
+
+```cpp
+sofab::IStreamObject<Sensor> in{ sofab::Limits{ .max_buffered_field = 64 * 1024 } };
+```
+
+`max_buffered_field` bounds how large a *single* incomplete top-level field may
+grow the buffer. A field whose declared size exceeds it fails `feed()` with
+`Error::LimitExceeded` the moment the size is known — before the payload is
+buffered, so an oversized header is rejected even if its bytes never arrive. The
+check is **chunk-independent**: the same field is rejected whether fed whole or
+byte by byte. This is a receiver-side **policy** code, kept distinct from
+`invalid()` / `Error::InvalidMessage` — exceeding a local limit is not wire
+malformation. The default is **no cap** (`SIZE_MAX`), so streams are unbounded
+unless you opt in; generated code derives the value from the schema's configured
+`max_dyn_*` limits. Bytes are never clamped or truncated — the `feed()` simply fails.
+
 ### Code generator
 
 The usual way to drive the library is through **generated object code**: a schema
