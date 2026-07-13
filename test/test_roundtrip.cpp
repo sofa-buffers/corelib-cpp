@@ -222,19 +222,22 @@ static void skippingUnknownFields()
 }
 
 /* --- malformed input (architecture §7.2): the decoder must never crash or read
- *     out of bounds; corruption it can detect is surfaced as InvalidMessage, and
- *     anything it cannot yet judge is held as "needs more bytes". --- */
+ *     out of bounds. Per spec §7 the decode outcome is three-valued: corruption it
+ *     can detect is surfaced as InvalidMessage (INVALID); bytes that begin but do
+ *     not finish a field are surfaced as Incomplete (INCOMPLETE) — a first-class,
+ *     non-error result distinct from a complete message (None / COMPLETE). --- */
 
 static void malformedInput()
 {
     /* Truncated value varint (continuation bit set, then the buffer ends). A
      * streaming decoder treats this as an incomplete tail — no field delivered,
-     * no error, no crash. */
+     * no crash — and reports INCOMPLETE (distinct from COMPLETE), never INVALID. */
     {
         sofab::IStreamObject<ScalarMsg> in;
         const uint8_t bytes[] = {0x08, 0x80}; /* id 1, unsigned, dangling varint */
         auto r = in.feed(bytes, sizeof bytes);
-        CHECK(r.code() == sofab::Error::None, "malformed: truncated varint buffered, not errored");
+        CHECK(r.code() == sofab::Error::Incomplete, "malformed: truncated varint is INCOMPLETE, not COMPLETE/INVALID");
+        CHECK(r.incomplete() && !r.complete() && !r.invalid(), "malformed: truncated varint status is Incomplete");
         CHECK((*in).a == 0, "malformed: truncated varint yields no value");
     }
 
@@ -249,12 +252,12 @@ static void malformedInput()
     }
 
     /* Oversized fixlen length: the header claims far more payload than is
-     * present. Must be held as incomplete, never read past the buffer. */
+     * present. Held as INCOMPLETE, never read past the buffer. */
     {
         sofab::IStreamObject<ScalarMsg> in;
         const uint8_t bytes[] = {0x2a, static_cast<uint8_t>((200u << 3) | 2u), 'h', 'i'};
         auto r = in.feed(bytes, sizeof bytes); /* id 5, string, len=200 */
-        CHECK(r.code() == sofab::Error::None, "malformed: oversized fixlen buffered, no OOB read");
+        CHECK(r.code() == sofab::Error::Incomplete, "malformed: oversized fixlen is INCOMPLETE, no OOB read");
         CHECK((*in).s.empty(), "malformed: oversized fixlen yields no string");
     }
 
@@ -300,7 +303,7 @@ static void malformedInput()
         const uint8_t bytes[] = {0x2a, static_cast<uint8_t>((4u << 3) | 0u), 0x00, 0x00}; /* 2 of 4 bytes */
         sofab::IStreamObject<ScalarMsg> in;
         auto r = in.feed(bytes, sizeof bytes);
-        CHECK(r.code() == sofab::Error::None, "malformed: fp32 correct length but truncated payload is buffered");
+        CHECK(r.code() == sofab::Error::Incomplete, "malformed: fp32 correct length but truncated payload is INCOMPLETE");
     }
 
     /* Reserved fixlen subtype (0b100..0b111) is INVALID (§4.6). */
@@ -349,6 +352,75 @@ static void malformedInput()
         sofab::IStreamObject<Only2> in;
         in.feed(os.data(), os.bytesUsed());
         CHECK((*in).b == -222, "malformed/skip: resync after skipped sub-sequence");
+    }
+}
+
+/* --- three-valued decode outcome (spec §7): COMPLETE / INCOMPLETE / INVALID.
+ *     There is no finish/finalize step — the same call reports all three, and
+ *     INCOMPLETE is a first-class, non-error result, never folded into either
+ *     COMPLETE (silent-accept) or INVALID (over-strict rejection). --- */
+
+static void threeValuedOutcomes()
+{
+    /* COMPLETE: a whole, well-formed message consumed exactly to a field boundary. */
+    {
+        sofab::OStreamInline<64> os;
+        os.write(1, uint64_t{123456789}).write(2, int64_t{-987654321});
+        sofab::IStreamObject<ScalarMsg> in;
+        auto r = in.feed(os.data(), os.bytesUsed());
+        CHECK(r.code() == sofab::Error::None, "three-valued: complete message is COMPLETE");
+        CHECK(r.status() == sofab::DecodeStatus::Complete, "three-valued: complete status");
+        CHECK(r.complete() && !r.incomplete() && !r.invalid(), "three-valued: complete predicates");
+        CHECK(r.ok() && static_cast<bool>(r), "three-valued: complete is ok()/bool");
+        CHECK((*in).a == 123456789u && (*in).b == -987654321, "three-valued: complete values decoded");
+    }
+
+    /* INCOMPLETE: a lone dangling 0x80 — a well-formed *prefix* of a varint. More
+     * bytes could complete it, so it is INCOMPLETE, not INVALID (spec §7). */
+    {
+        sofab::IStreamObject<ScalarMsg> in;
+        const uint8_t bytes[] = {0x80};
+        auto r = in.feed(bytes, sizeof bytes);
+        CHECK(r.code() == sofab::Error::Incomplete, "three-valued: lone 0x80 is INCOMPLETE");
+        CHECK(r.status() == sofab::DecodeStatus::Incomplete, "three-valued: incomplete status");
+        CHECK(r.incomplete() && !r.complete() && !r.invalid(), "three-valued: incomplete predicates");
+        CHECK(!r.ok() && !static_cast<bool>(r), "three-valued: incomplete is not ok()/bool");
+    }
+
+    /* INCOMPLETE: an open (unclosed) sequence — a bare sequence-start with no
+     * matching end. Feeding the end would complete it, so it too is INCOMPLETE. */
+    {
+        sofab::IStreamObject<ScalarMsg> in;
+        const uint8_t bytes[] = {0x0e}; /* id 1, sequence-start, never closed */
+        auto r = in.feed(bytes, sizeof bytes);
+        CHECK(r.code() == sofab::Error::Incomplete, "three-valued: open sequence is INCOMPLETE");
+    }
+
+    /* INVALID: a varint that exceeds 64 bits is malformed regardless of what
+     * follows (spec §7) and must be terminal, never held as INCOMPLETE. */
+    {
+        sofab::IStreamObject<ScalarMsg> in;
+        std::vector<uint8_t> bytes = {0x08}; /* id 1, unsigned */
+        for (int i = 0; i < 12; ++i) bytes.push_back(0x80);
+        bytes.push_back(0x01);
+        auto r = in.feed(bytes.data(), bytes.size());
+        CHECK(r.code() == sofab::Error::InvalidMessage, "three-valued: >64-bit varint is INVALID");
+        CHECK(r.status() == sofab::DecodeStatus::Invalid, "three-valued: invalid status");
+        CHECK(r.invalid() && !r.complete() && !r.incomplete(), "three-valued: invalid predicates");
+    }
+
+    /* Streaming: an INCOMPLETE prefix completes to COMPLETE once the rest arrives —
+     * the split must never leak an error and must land exactly at COMPLETE. */
+    {
+        sofab::OStreamInline<64> os;
+        os.write(1, uint64_t{123456789});
+        sofab::IStreamObject<ScalarMsg> in;
+        size_t n = os.bytesUsed();
+        auto first = in.feed(os.data(), n - 1);
+        CHECK(first.code() == sofab::Error::Incomplete, "three-valued: split head is INCOMPLETE");
+        auto rest = in.feed(os.data() + n - 1, 1);
+        CHECK(rest.code() == sofab::Error::None, "three-valued: split tail completes to COMPLETE");
+        CHECK((*in).a == 123456789u, "three-valued: split message decodes");
     }
 }
 
@@ -468,6 +540,7 @@ int main()
     chunkedDecode();
     skippingUnknownFields();
     malformedInput();
+    threeValuedOutcomes();
     zeroLengthForms();
     maxDepth();
 

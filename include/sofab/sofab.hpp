@@ -74,11 +74,32 @@ namespace sofab
     /// Status codes returned by the encode/decode API; `None` signals success.
     enum class Error
     {
-        None = 0,            ///< Operation succeeded.
+        None = 0,            ///< Operation succeeded (decode: `COMPLETE`, §7).
         UsageError = 2,      ///< The API was used incorrectly (e.g. out-of-order calls).
         BufferFull = 3,      ///< The output buffer filled and no flush callback was set.
         InvalidArgument = 1, ///< An argument was out of range (e.g. a field id above the limit).
-        InvalidMessage = 4,  ///< The input bytes are malformed or truncated.
+        InvalidMessage = 4,  ///< The input bytes are malformed (decode: `INVALID`, §7).
+        Incomplete = 5,      ///< Decode-only: the fed bytes end **inside** a field — a partial
+                             ///< varint (§4.1), a fixlen/array payload shorter than declared (§4.6/§4.8),
+                             ///< or an open (unclosed) sequence (§4.9). This is `INCOMPLETE` (§7): **not**
+                             ///< an error — the caller owns end-of-input and may feed more bytes. It is
+                             ///< distinct from both @ref None (`COMPLETE`) and @ref InvalidMessage (`INVALID`).
+    };
+
+    /**
+     * @brief Three-valued decode outcome of a @ref sofab::IStreamImpl::feed call (spec §7).
+     *
+     * The decoder reports where the consumed bytes ended, with **no** separate
+     * `finish`/`finalize` step (§7.1): the same three outcomes apply to a one-shot
+     * buffer and to chunked streaming. Whether an @ref Incomplete result is
+     * acceptable is the caller's decision — a streaming caller reads it as "feed
+     * me the next chunk", a whole-message caller reads it as a truncated message.
+     */
+    enum class DecodeStatus
+    {
+        Complete = 0,   ///< Consumed bytes end **exactly** at a field boundary — a valid message.
+        Incomplete = 1, ///< Consumed bytes end **inside** a field or with an open sequence. Not an error.
+        Invalid = 2,    ///< Bytes are malformed **regardless of what follows**. Terminal.
     };
 
     /// Field identifier on the wire. Valid range is `[0, INT32_MAX]`.
@@ -832,18 +853,43 @@ namespace sofab
     class IStreamImpl
     {
     public:
-        /// Outcome of a @ref feed call.
+        /**
+         * @brief Three-valued outcome of a @ref feed call (spec §7).
+         *
+         * Carries one of @ref Error::None (`COMPLETE`), @ref Error::Incomplete
+         * (`INCOMPLETE`) or @ref Error::InvalidMessage (`INVALID`). Read it either
+         * as an @ref Error @ref code, as a @ref DecodeStatus via @ref status, or
+         * through the boolean predicates @ref complete / @ref incomplete /
+         * @ref invalid. @ref incomplete is **not** an error — the bytes merely end
+         * mid-field and more may follow.
+         */
         class Result
         {
             Error error_;
             friend class IStreamImpl;
             explicit Result(Error e) noexcept : error_(e) {}
         public:
-            /// @return `true` if decoding succeeded.
+            /// @return `true` only for `COMPLETE` — the bytes end exactly at a field boundary.
             [[nodiscard]] explicit operator bool() const noexcept { return ok(); }
-            /// @return `true` if decoding succeeded.
+            /// @return `true` only for `COMPLETE`; `false` for both @ref incomplete and @ref invalid.
             [[nodiscard]] bool ok() const noexcept { return error_ == Error::None; }
-            /// @return The status code (@ref Error::InvalidMessage on malformed input).
+            /// @return The three-valued outcome as a @ref DecodeStatus (§7).
+            [[nodiscard]] DecodeStatus status() const noexcept
+            {
+                switch (error_)
+                {
+                    case Error::None:        return DecodeStatus::Complete;
+                    case Error::Incomplete:  return DecodeStatus::Incomplete;
+                    default:                 return DecodeStatus::Invalid;
+                }
+            }
+            /// @return `true` if the consumed bytes end exactly at a field boundary (`COMPLETE`).
+            [[nodiscard]] bool complete() const noexcept { return error_ == Error::None; }
+            /// @return `true` if the bytes end mid-field / with an open sequence (`INCOMPLETE`). Not an error.
+            [[nodiscard]] bool incomplete() const noexcept { return error_ == Error::Incomplete; }
+            /// @return `true` if the bytes are malformed (`INVALID`).
+            [[nodiscard]] bool invalid() const noexcept { return error_ == Error::InvalidMessage; }
+            /// @return The status code (@ref Error::None, @ref Error::Incomplete or @ref Error::InvalidMessage).
             [[nodiscard]] Error code() const noexcept { return error_; }
             /// @return `true` if the status code equals @p e.
             bool operator==(Error e) const noexcept { return error_ == e; }
@@ -1193,8 +1239,13 @@ namespace sofab
          *
          * @param buffer Bytes to decode.
          * @param buflen Number of bytes in @p buffer.
-         * @return A @ref Result carrying @ref Error::None, or @ref Error::InvalidMessage
-         *         if the bytes are malformed.
+         * @return A @ref Result carrying the three-valued §7 outcome:
+         *         @ref Error::None (`COMPLETE`) when the fed bytes end exactly at a
+         *         field boundary; @ref Error::Incomplete (`INCOMPLETE`) when they end
+         *         **inside** a field (partial varint, short fixlen/array payload) or
+         *         with an open sequence — the partial tail is buffered for the next
+         *         @ref feed and is **not** an error; or @ref Error::InvalidMessage
+         *         (`INVALID`) when the bytes are malformed regardless of what follows.
          */
         Result feed(const uint8_t *buffer, size_t buflen) noexcept
         {
@@ -1208,7 +1259,13 @@ namespace sofab
                 const uint8_t *stop = parseTopLevel(buffer, buffer + buflen);
                 if (error_) return Result{Error::InvalidMessage};
                 if (stop != buffer + buflen)
+                {
+                    /* §7: bytes remain that begin but do not finish a field (or an
+                     * open sequence). Retain the partial tail and report INCOMPLETE —
+                     * distinct from COMPLETE, and never folded into INVALID. */
                     appendBytes(acc_, stop, static_cast<size_t>(buffer + buflen - stop));
+                    return Result{Error::Incomplete};
+                }
                 return Result{Error::None};
             }
 
@@ -1219,8 +1276,8 @@ namespace sofab
             const uint8_t *stop = parseTopLevel(base + topPos_, base + acc_.size());
             if (error_) return Result{Error::InvalidMessage};
             topPos_ = static_cast<size_t>(stop - base);
-            if (topPos_ == acc_.size()) { acc_.clear(); topPos_ = 0; } /* fully drained */
-            return Result{Error::None};
+            if (topPos_ == acc_.size()) { acc_.clear(); topPos_ = 0; return Result{Error::None}; } /* fully drained: COMPLETE */
+            return Result{Error::Incomplete}; /* §7: a partial field is still buffered */
         }
 
     protected:
