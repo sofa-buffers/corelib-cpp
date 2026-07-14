@@ -499,6 +499,58 @@ static void callbackInvalidate()
     }
 }
 
+/* --- exceedLimit(): a deliver callback enforces a receiver-side policy cap the
+ *     wire layer cannot know — e.g. a generated message rejecting an unbounded
+ *     array whose claimed count exceeds a configured decode limit
+ *     (generator#102). Distinct from invalidate(): well-formed bytes, policy
+ *     rejection, so the outcome is LimitExceeded, not InvalidMessage. --- */
+
+static void callbackExceedLimit()
+{
+    struct CappedArr : sofab::IStreamMessage
+    {
+        std::array<uint32_t, 8> u{};
+        int delivered = 0;
+        void deserialize(sofab::IStreamImpl &is, sofab::id id, size_t, size_t count) noexcept override
+        {
+            ++delivered;
+            if (id == 0)
+            {
+                if (count > 4) { is.exceedLimit(); return; } /* the generated #102 guard */
+                is.read(u);
+            }
+        }
+    };
+
+    /* Control: count within the cap decodes COMPLETE. */
+    {
+        const uint8_t bytes[] = {0x03, 0x04, 1, 2, 3, 4};
+        sofab::IStreamObject<CappedArr> in;
+        auto r = in.feed(bytes, sizeof bytes);
+        CHECK(r.code() == sofab::Error::None, "exceedLimit: count within cap stays COMPLETE");
+        CHECK(((*in).u == std::array<uint32_t, 8>{1, 2, 3, 4, 0, 0, 0, 0}), "exceedLimit: control values decoded");
+    }
+
+    /* count over the cap: the callback reports the policy violation; feed
+     * returns LimitExceeded — not InvalidMessage (the bytes are well-formed). */
+    {
+        const uint8_t bytes[] = {0x03, 0x05, 1, 2, 3, 4, 5};
+        sofab::IStreamObject<CappedArr> in;
+        auto r = in.feed(bytes, sizeof bytes);
+        CHECK(r.code() == sofab::Error::LimitExceeded, "exceedLimit: over-cap array is LimitExceeded");
+        CHECK(r.limitExceeded() && !r.invalid() && !r.complete() && !r.incomplete(), "exceedLimit: predicates report LimitExceeded");
+    }
+
+    /* Dispatch stops at the over-cap field: nothing after it is delivered. */
+    {
+        const uint8_t bytes[] = {0x03, 0x05, 1, 2, 3, 4, 5, 0x08, 0x2a}; /* then id1 unsigned 42 */
+        sofab::IStreamObject<CappedArr> in;
+        auto r = in.feed(bytes, sizeof bytes);
+        CHECK(r.code() == sofab::Error::LimitExceeded, "exceedLimit: LimitExceeded with a trailing field");
+        CHECK((*in).delivered == 1, "exceedLimit: no field delivered past the over-cap one");
+    }
+}
+
 /* --- zero-length wire forms (§4.7–4.9): zero-count arrays and empty sequences --- */
 
 struct EmptyArrMsg : sofab::IStreamMessage
@@ -734,6 +786,7 @@ int main()
     malformedInput();
     threeValuedOutcomes();
     callbackInvalidate();
+    callbackExceedLimit();
     zeroLengthForms();
     maxDepth();
     bufferLimits();

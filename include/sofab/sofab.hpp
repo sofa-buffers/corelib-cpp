@@ -1410,6 +1410,22 @@ namespace sofab
          */
         void invalidate() noexcept { error_ = true; }
 
+        /**
+         * @brief Report a receiver-side decode-limit violation from inside a
+         *        deliver callback.
+         *
+         * Sets the sticky limit flag, so the surrounding @ref feed stops
+         * dispatching further fields and returns @ref Error::LimitExceeded.
+         * For callers enforcing *policy* caps the wire layer cannot know —
+         * e.g. a generated message rejecting an unbounded (schema-bound-less)
+         * array/string/blob whose claimed count/length exceeds a configured
+         * decode limit (generator#102). Deliberately distinct from
+         * @ref invalidate: the bytes may be perfectly well-formed; rejecting
+         * them is receiver policy, not wire malformation (§7). Idempotent; a
+         * no-op outside a @ref feed since every feed clears the flag on entry.
+         */
+        void exceedLimit() noexcept { limitExceeded_ = true; }
+
     protected:
         /**
          * @brief Deliver every complete top-level field in `[p, end)`.
@@ -1432,6 +1448,7 @@ namespace sofab
                 p_ = p;
                 end_ = end;
                 dispatchOne(topCallback_);
+                if (limitExceeded_) return p; /* callback-reported policy cap (#102) */
                 if (error_) return p;
                 p = p_;
             }
