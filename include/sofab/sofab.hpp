@@ -1146,13 +1146,21 @@ namespace sofab
             return need > static_cast<uint64_t>(maxBufferedField_ - consumed);
         }
 
+        /* The cap checks are gated on a compile-time @p Capped flag: @ref feed
+         * instantiates `measureField<false>` when no @ref maxBufferedField_ is set
+         * (the default, hot path), so `if constexpr` strips every #26 cap check and
+         * the whole `fieldStart` bookkeeping — the uncapped measure walk is then
+         * byte-for-byte the pre-cap decoder. `measureField<true>` keeps the full
+         * policy enforcement for streams constructed with a @ref Limits cap. */
+        template <bool Capped>
         bool measureField(const uint8_t *&p, const uint8_t *end,
                           const uint8_t *fieldStart, int depth = 0) noexcept
         {
             /* Policy cap (issue #26): once the bytes already spanned by this single
              * top-level field exceed the reassembly-buffer limit, stop — before the
              * caller grows acc_ any further. Distinct from a wire error. */
-            if (exceedsBuffer(static_cast<size_t>(p - fieldStart), 0)) { limitExceeded_ = true; return false; }
+            if constexpr (Capped)
+                if (exceedsBuffer(static_cast<size_t>(p - fieldStart), 0)) { limitExceeded_ = true; return false; }
             uint64_t header;
             if (!measureVarint(p, end, header)) return false;
             auto type = static_cast<detail::Wire>(header & 0x7);
@@ -1170,7 +1178,8 @@ namespace sofab
                     size_t len = static_cast<size_t>(sub >> 3);
                     /* #26: the declared payload size is known now — reject an oversize
                      * claim before waiting for (or buffering) the bytes it promises. */
-                    if (exceedsBuffer(static_cast<size_t>(p - fieldStart), len)) { limitExceeded_ = true; return false; }
+                    if constexpr (Capped)
+                        if (exceedsBuffer(static_cast<size_t>(p - fieldStart), len)) { limitExceeded_ = true; return false; }
                     if (static_cast<size_t>(end - p) < len) return false;
                     p += len; return true;
                 }
@@ -1183,7 +1192,8 @@ namespace sofab
                     if (n > ARRAY_MAX) { error_ = true; return false; }
                     /* #26: each element is at least one byte, so `n` is a lower bound
                      * on the payload — a count past the cap can never fit. */
-                    if (exceedsBuffer(static_cast<size_t>(p - fieldStart), n)) { limitExceeded_ = true; return false; }
+                    if constexpr (Capped)
+                        if (exceedsBuffer(static_cast<size_t>(p - fieldStart), n)) { limitExceeded_ = true; return false; }
                     for (uint64_t i = 0; i < n; ++i) if (!measureSkipVarint(p, end)) return false;
                     return true;
                 }
@@ -1197,7 +1207,8 @@ namespace sofab
                     size_t esize = static_cast<size_t>(sub >> 3);
                     uint64_t bytes = n * static_cast<uint64_t>(esize);
                     /* #26: whole element span is known — reject an oversize array up front. */
-                    if (exceedsBuffer(static_cast<size_t>(p - fieldStart), bytes)) { limitExceeded_ = true; return false; }
+                    if constexpr (Capped)
+                        if (exceedsBuffer(static_cast<size_t>(p - fieldStart), bytes)) { limitExceeded_ = true; return false; }
                     if (static_cast<uint64_t>(end - p) < bytes) return false;
                     p += static_cast<size_t>(bytes); return true;
                 }
@@ -1210,7 +1221,8 @@ namespace sofab
                         /* #26: a sequence's own bulk accrues field by field — bound it
                          * as it grows, catching many-small-fields the per-payload
                          * checks above never individually trip. */
-                        if (exceedsBuffer(static_cast<size_t>(p - fieldStart), 0)) { limitExceeded_ = true; return false; }
+                        if constexpr (Capped)
+                            if (exceedsBuffer(static_cast<size_t>(p - fieldStart), 0)) { limitExceeded_ = true; return false; }
                         const uint8_t *save = p;
                         uint64_t peek;
                         const uint8_t *q = p;
@@ -1218,7 +1230,7 @@ namespace sofab
                         if (static_cast<detail::Wire>(peek & 0x7) == detail::Wire::SequenceEnd)
                         { p = q; return true; }
                         p = save;
-                        if (!measureField(p, end, fieldStart, depth + 1)) return false;
+                        if (!measureField<Capped>(p, end, fieldStart, depth + 1)) return false;
                     }
                 }
                 case detail::Wire::SequenceEnd:
@@ -1436,10 +1448,15 @@ namespace sofab
          */
         const uint8_t *parseTopLevel(const uint8_t *p, const uint8_t *end) noexcept
         {
+            /* Select the measure walk once per feed: the uncapped `measureField<false>`
+             * (the default) carries no #26 cap code at all, so the common decode path
+             * pays nothing for a feature it isn't using. */
+            const bool capped = maxBufferedField_ != SIZE_MAX;
             while (p < end)
             {
                 const uint8_t *probe = p;
-                if (!measureField(probe, end, /*fieldStart=*/p))
+                if (!(capped ? measureField<true>(probe, end, /*fieldStart=*/p)
+                             : measureField<false>(probe, end, /*fieldStart=*/p)))
                 {
                     if (limitExceeded_) return p; /* #26: field over the buffering cap (policy) */
                     if (error_) return p;         /* malformed (e.g. nesting past MAX_DEPTH) */
