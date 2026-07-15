@@ -392,14 +392,14 @@ porting between them is mostly mechanical.
 
 Machine-independent instruction counts from the shared benchmark tooling, this
 library against the C corelib and its C++ wrapper on identical workloads (lower
-is better):
+is better). All three are compiled at `-O3` so the comparison is like-for-like:
 
-| Workload | C (`-Os`) | C++ wrapper | this (pure C++20) |
+| Workload | C | C++ wrapper | this (pure C++20) |
 |---|--:|--:|--:|
-| encode: u64 array (1000) | 137 458 | 137 488 | **106 963** (−22 %) |
-| encode: typical message  |     796 |     826 | **233** (−71 %) |
-| decode: u64 array (1000) | 250 917 | 250 918 | **169 002** (−33 %) |
-| decode: typical message  |   1 771 |   1 773 | **1 432** (−19 %) |
+| encode: u64 array (1000) | 136 493 | 136 523 | **106 961** (−22 %) |
+| encode: typical message  |     981 |   1 011 | **244** (−75 %) |
+| decode: u64 array (1000) | 300 425 | 300 426 | **170 495** (−43 %) |
+| decode: typical message  |   2 153 |   2 154 | **1 367** (−37 %) |
 
 The pure-C++20 port wins on instructions across the board because it fuses
 header+value writes, bulk-copies arrays, and parses in place without the C port's
