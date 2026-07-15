@@ -209,8 +209,10 @@ unless you opt in; generated code derives the value from the schema's configured
 
 The usual way to drive the library is through **generated object code**: a schema
 compiled by `sofabgen` emits a struct per message deriving `OStreamMessage` /
-`IStreamMessage`, with `serialize` / `deserialize` bodies, a `_maxSize` bound, and
-`encode()` / `decode()` helpers. A hand-written stand-in, encoded then decoded:
+`IStreamMessage`, with `serialize` / `deserialize` bodies, a `_maxSize` bound,
+`encode()` / `decode()` helpers, and a `try_decode()` that surfaces the
+three-valued decode `Result` instead of assuming success. A hand-written
+stand-in, encoded then decoded:
 
 ```cpp
 #include "sofab/sofab.hpp"
@@ -241,6 +243,26 @@ Point got = Point::decode(wire.data(), wire.size());   // got.x == 3, got.y == 4
 
 Messages nest: passing a message deriving `OStreamMessage` to `write(id, msg)`
 encodes it as a sub-sequence, and `is.read(childMsg)` descends into it on decode.
+
+The same generated struct also streams — no whole-message buffer on either side.
+Its `serialize` targets any output stream, so a small flushing window works, and
+an `IStreamObject` accepts the wire bytes in arbitrary chunks:
+
+```cpp
+// encode: stream through a 16-byte window instead of a whole-message buffer
+std::vector<uint8_t> wire;
+sofab::OStreamInline<16> os(
+    [&](std::span<const uint8_t> chunk){ wire.insert(wire.end(), chunk.begin(), chunk.end()); });
+pt.serialize(os);
+os.flush();
+
+// decode: feed whatever arrives; poll the value once feed() reports complete()
+sofab::IStreamObject<Point> in;
+auto r = in.feed(wire.data(), 1);                          // first byte…
+for (size_t i = 1; i < wire.size(); ++i)
+    r = in.feed(wire.data() + i, 1);                       // …then the rest as it arrives
+if (r.complete()) { Point got = *in; }                     // got.x == 3, got.y == 4
+```
 
 ## Memory handling
 
@@ -330,11 +352,14 @@ cmake --build build --target run_bench   # sustained throughput (MB/s)
 
 `perf` reads a hardware cycle counter (x86 TSC / AArch64 `cntvct_el0`) for a
 machine-independent cost figure and reports throughput in MB/s; `bench` reports
-the throughput table. The same `bench` binary doubles as a Callgrind single-shot
-driver for machine-independent instruction counts:
+the throughput table. The third tool, `bench/run_callgrind.sh`, runs each
+workload once under Callgrind and prints an instructions-per-operation (Ir/op)
+table — deterministic and machine-independent, so the figures compare across
+hosts and against the other language ports:
 
 ```sh
-cmake --build build --target run_bench_callgrind  # needs valgrind
+bash bench/run_callgrind.sh                       # Ir/op table (needs valgrind)
+cmake --build build --target run_bench_callgrind  # same runs via CMake, raw callgrind.*.out files
 ```
 
 Those figures are the head-to-head data below.
@@ -378,9 +403,9 @@ is better):
 
 The pure-C++20 port wins on instructions across the board because it fuses
 header+value writes, bulk-copies arrays, and parses in place without the C port's
-per-field bookkeeping. In the multi-language arena it lands around a 434-byte
-wire size and roughly **1.5× the throughput of protobuf** for a comparable C++
-message.
+per-field bookkeeping. In the multi-language arena it lands at a 434-byte wire
+size (vs protobuf's 494 bytes) and roughly **1.3× the throughput of protobuf**
+for a comparable C++ message.
 
 **Rule of thumb:** reach for **`corelib-cpp`** for desktop/server throughput, and
 for **`corelib-c-cpp`** when you need a strictly minimal binary and tight RAM on a
