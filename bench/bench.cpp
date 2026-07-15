@@ -4,7 +4,7 @@
  *
  * Mirror of bench/c/bench.c and bench/cpp/bench.cpp: identical workloads, data,
  * field ids and values, driven through the pure-C++20 implementation
- * (cpp20/include/sofab/sofab.hpp — no C backend), so the figures are directly
+ * (include/sofab/sofab.hpp — no C backend), so the figures are directly
  * comparable to the C corelib and its C++ wrapper.
  *
  * Two modes:
