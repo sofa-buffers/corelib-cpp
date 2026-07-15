@@ -31,7 +31,7 @@ namespace {
 enum class K { U, S, B, F32, F64, Str, Blob, Arr, SeqB, SeqE };
 enum class E { U8, U16, U32, U64, I8, I16, I32, I64, F32, F64 };
 
-/* Optional library-feature capability tags (see assets/test_vectors_README.md).
+/* Optional library-feature capability tags (see assets/test_vectors_README.md upstream).
  * A vector's "requires" list names the features it needs; a build compiled
  * without a feature (a SOFAB_DISABLE_* flag) skips the vectors that need it, so
  * the same vector file drives every build configuration. This pure-C++20

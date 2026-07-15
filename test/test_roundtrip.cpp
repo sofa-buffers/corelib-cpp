@@ -7,7 +7,7 @@
  * round-trips, including nested sequences and arrays.
  *
  * Build & run:
- *   g++ -std=c++20 -I cpp20/include cpp20/test/test_roundtrip.cpp -o /tmp/t && /tmp/t
+ *   g++ -std=c++20 -Iinclude test/test_roundtrip.cpp -o /tmp/t && /tmp/t
  *
  * SPDX-License-Identifier: MIT
  */
