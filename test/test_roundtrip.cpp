@@ -264,6 +264,46 @@ static void malformedInput()
               "malformed: unterminated overlong varint is INVALID, not INCOMPLETE (#29)");
     }
 
+    /* Overlong varint that *terminates* on the 10th byte but sets bits beyond
+     * bit 63 (F-0016): a 64-bit value fits in 10 groups and the 10th byte may
+     * carry only its low bit, so any higher bit is a > 64-bit overflow that
+     * must be rejected — not silently wrapped/truncated (§4.1/§6.3, #39). Both
+     * `…02` (the 65th bit) and `…7f` (bits 64..69) are distinct malformed
+     * inputs that previously collapsed to distinct wrong values. */
+    {
+        /* id 1 (unsigned `a`) → getVarint path: 9×0xff then a high 10th byte. */
+        for (uint8_t last : {uint8_t{0x02}, uint8_t{0x7f}})
+        {
+            sofab::IStreamObject<ScalarMsg> in;
+            std::vector<uint8_t> bytes = {0x08};
+            for (int i = 0; i < 9; ++i) bytes.push_back(0xff);
+            bytes.push_back(last);
+            auto r = in.feed(bytes.data(), bytes.size());
+            CHECK(r.code() == sofab::Error::InvalidMessage,
+                  "malformed: overlong varint (10th byte high bits) rejected (F-0016/#39)");
+        }
+        /* id 9 (unknown) → skipVarint path: same overlong must also be INVALID. */
+        {
+            sofab::IStreamObject<ScalarMsg> in;
+            std::vector<uint8_t> bytes = {0x48}; /* id 9, unsigned, skipped */
+            for (int i = 0; i < 9; ++i) bytes.push_back(0xff);
+            bytes.push_back(0x7f);
+            auto r = in.feed(bytes.data(), bytes.size());
+            CHECK(r.code() == sofab::Error::InvalidMessage,
+                  "malformed: overlong varint on skipped field rejected (F-0016/#39)");
+        }
+        /* Control: 9×0xff then 0x01 is exactly 2^64-1 and must still decode. */
+        {
+            sofab::IStreamObject<ScalarMsg> in;
+            std::vector<uint8_t> bytes = {0x08};
+            for (int i = 0; i < 9; ++i) bytes.push_back(0xff);
+            bytes.push_back(0x01);
+            auto r = in.feed(bytes.data(), bytes.size());
+            CHECK(r.complete() && r.code() == sofab::Error::None, "control: 2^64-1 varint accepted (F-0016/#39)");
+            CHECK((*in).a == UINT64_MAX, "control: 2^64-1 varint decodes to max (F-0016/#39)");
+        }
+    }
+
     /* Oversized fixlen length: the header claims far more payload than is
      * present. Held as INCOMPLETE, never read past the buffer. */
     {

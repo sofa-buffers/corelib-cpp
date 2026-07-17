@@ -978,6 +978,11 @@ namespace sofab
             while (p < end)
             {
                 uint8_t b = *p++;
+                // Reject an overlong (> 64-bit) varint before it silently wraps
+                // (§4.1/§6.3): on the 10th byte only the low bit may be set, so
+                // any payload bit that would spill past bit 63 is INVALID.
+                const int room = 64 - shift;
+                if (room < 7 && (static_cast<uint8_t>(b & 0x7f) >> room) != 0) { if (overflow) *overflow = true; return false; }
                 v |= static_cast<uint64_t>(b & 0x7f) << shift;
                 if (!(b & 0x80)) { out = v; return true; }
                 shift += 7;
@@ -1000,7 +1005,12 @@ namespace sofab
             int shift = 0;
             while (p < end)
             {
-                if (!(*p++ & 0x80)) return true;
+                uint8_t b = *p++;
+                // Same overlong (> 64-bit) rejection as getVarint (§4.1/§6.3):
+                // a 10th byte with any bit above bit 0 set is INVALID.
+                const int room = 64 - shift;
+                if (room < 7 && (static_cast<uint8_t>(b & 0x7f) >> room) != 0) { if (overflow) *overflow = true; return false; }
+                if (!(b & 0x80)) return true;
                 shift += 7;
                 if (shift >= 64) { if (overflow) *overflow = true; return false; }
             }
