@@ -264,52 +264,58 @@ namespace sofab
          * @param len  Number of bytes to validate.
          * @return `true` iff every byte forms part of a well-formed UTF-8 sequence.
          */
+                /* Hoehrmann UTF-8 DFA: class table (0..255) + transition table.
+         * ACCEPT = 0, REJECT = 12. Used only for the multi-byte tail; the
+         * ASCII run is skipped 8 bytes at a time by the SWAR loop below. */
+        inline constexpr uint8_t utf8Dfa[] = {
+          0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0, 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
+          0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0, 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
+          0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0, 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
+          0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0, 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
+          1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1, 9,9,9,9,9,9,9,9,9,9,9,9,9,9,9,9,
+          7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7, 7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,
+          8,8,2,2,2,2,2,2,2,2,2,2,2,2,2,2, 2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,
+          10,3,3,3,3,3,3,3,3,3,3,3,3,4,3,3, 11,6,6,6,5,8,8,8,8,8,8,8,8,8,8,8,
+          0,12,24,36,60,96,84,12,12,12,48,72, 12,12,12,12,12,12,12,12,12,12,12,12,
+          12, 0,12,12,12,12,12, 0,12, 0,12,12, 12,24,12,12,12,12,12,24,12,24,12,12,
+          12,12,12,12,12,12,12,24,12,12,12,12, 12,24,12,12,12,12,12,12,12,24,12,12,
+          12,12,12,12,12,12,12,36,12,36,12,12, 12,36,12,12,12,12,12,36,12,36,12,12,
+          12,36,12,12,12,12,12,12,12,12,12,12,
+        };
+
         [[nodiscard]] constexpr bool utf8Valid(const char *data, size_t len) noexcept
         {
             size_t i = 0;
+            uint32_t state = 0;
             while (i < len)
             {
-                const unsigned char b0 = static_cast<unsigned char>(data[i]);
-                if (b0 < 0x80) { ++i; continue; } /* ASCII (incl. embedded NUL) */
-
-                size_t extra;              /* number of continuation bytes */
-                unsigned char lo = 0x80;   /* tightened range for the 1st continuation */
-                unsigned char hi = 0xBF;
-                if ((b0 & 0xE0) == 0xC0)
+                /* SWAR: skip runs of ASCII 8 bytes at a time. Payloads in
+                 * practice are overwhelmingly ASCII, and this is where the
+                 * time goes -- a per-byte DFA over the same run is slower. */
+                if (!std::is_constant_evaluated())
                 {
-                    extra = 1;
-                    if (b0 < 0xC2) return false;              /* C0/C1: overlong 2-byte */
+                    while (i + 8 <= len)
+                    {
+                        uint64_t w;
+                        __builtin_memcpy(&w, data + i, 8);
+                        if (w & 0x8080808080808080ULL) break;
+                        i += 8;
+                    }
+                    if (i >= len) break;
                 }
-                else if ((b0 & 0xF0) == 0xE0)
+                /* multi-byte (or stray ASCII tail): step the DFA until it is
+                 * back at ACCEPT, then hand control to the SWAR loop again. */
+                state = utf8Dfa[256u + state + utf8Dfa[static_cast<unsigned char>(data[i])]];
+                if (state == 12) return false;
+                ++i;
+                while (state != 0 && i < len)
                 {
-                    extra = 2;
-                    if (b0 == 0xE0) lo = 0xA0;                /* reject overlong E0 80..E0 9F */
-                    else if (b0 == 0xED) hi = 0x9F;           /* reject surrogates ED A0..ED BF */
+                    state = utf8Dfa[256u + state + utf8Dfa[static_cast<unsigned char>(data[i])]];
+                    if (state == 12) return false;
+                    ++i;
                 }
-                else if ((b0 & 0xF8) == 0xF0)
-                {
-                    extra = 3;
-                    if (b0 > 0xF4) return false;              /* > U+10FFFF (F5..F7 lead) */
-                    if (b0 == 0xF0) lo = 0x90;                /* reject overlong F0 80..F0 8F */
-                    else if (b0 == 0xF4) hi = 0x8F;           /* reject > U+10FFFF (F4 90..) */
-                }
-                else
-                {
-                    return false;                            /* bare continuation, or F8..FF */
-                }
-
-                if (len - i < extra + 1) return false;       /* truncated at end-of-payload */
-
-                const unsigned char c1 = static_cast<unsigned char>(data[i + 1]);
-                if (c1 < lo || c1 > hi) return false;
-                for (size_t k = 2; k <= extra; ++k)
-                {
-                    const unsigned char c = static_cast<unsigned char>(data[i + k]);
-                    if (c < 0x80 || c > 0xBF) return false;
-                }
-                i += extra + 1;
             }
-            return true;
+            return state == 0;
         }
     } // namespace detail
 
