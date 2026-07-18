@@ -815,6 +815,147 @@ static void bufferLimits()
     }
 }
 
+/* --- strict UTF-8 (spec MESSAGE_SPEC §8, CORELIB_PLAN §6.4). The validator
+ *     itself is always available (utf8_valid); the SOFAB_STRICT_UTF8 gate only
+ *     decides whether encode/decode invoke it. --- */
+
+/* Encode a single string/blob field (id 5) so it can be fed straight into ScalarMsg. */
+static std::vector<uint8_t> stringFieldWire(std::string_view payload, sofab::detail::Fix sub)
+{
+    std::vector<uint8_t> w;
+    w.push_back(static_cast<uint8_t>((5u << 3) | 2u)); /* id 5, Fixlen */
+    uint64_t word = (static_cast<uint64_t>(payload.size()) << 3) | static_cast<uint64_t>(sub);
+    do { uint8_t b = word & 0x7f; word >>= 7; if (word) b |= 0x80; w.push_back(b); } while (word);
+    for (char c : payload) w.push_back(static_cast<uint8_t>(c));
+    return w;
+}
+
+static void strictUtf8()
+{
+    using sofab::utf8_valid;
+
+    /* --- validator: accepts well-formed sequences (always compiled in). --- */
+    CHECK(utf8_valid(""), "utf8: empty is valid");
+    CHECK(utf8_valid("hello sofab"), "utf8: ASCII is valid");
+    CHECK(utf8_valid(std::string_view("a\0b", 3)), "utf8: embedded NUL is valid");
+    CHECK(utf8_valid("\xC2\xA9"), "utf8: U+00A9 (C2 A9) valid");
+    CHECK(utf8_valid("\xE2\x82\xAC"), "utf8: U+20AC euro (E2 82 AC) valid");
+    CHECK(utf8_valid("\xF0\x9F\x98\x80"), "utf8: U+1F600 emoji (F0 9F 98 80) valid");
+    CHECK(utf8_valid("\xED\x9F\xBF"), "utf8: U+D7FF (ED 9F BF) valid — just below surrogates");
+    CHECK(utf8_valid("\xEE\x80\x80"), "utf8: U+E000 (EE 80 80) valid — just above surrogates");
+    CHECK(utf8_valid("\xF4\x8F\xBF\xBF"), "utf8: U+10FFFF (F4 8F BF BF) valid — max code point");
+
+    /* --- validator: rejects malformed sequences (security surface). --- */
+    CHECK(!utf8_valid(std::string_view("\xC0\x80", 2)), "utf8: reject overlong C0 80 (Modified-UTF-8 NUL)");
+    CHECK(!utf8_valid("\xC1\xBF"), "utf8: reject overlong C1 BF");
+    CHECK(!utf8_valid("\xE0\x80\x80"), "utf8: reject overlong 3-byte E0 80 80");
+    CHECK(!utf8_valid("\xE0\x9F\xBF"), "utf8: reject overlong E0 9F BF");
+    CHECK(!utf8_valid(std::string_view("\xF0\x80\x80\x80", 4)), "utf8: reject overlong 4-byte F0 80 80 80");
+    CHECK(!utf8_valid("\xF0\x8F\xBF\xBF"), "utf8: reject overlong F0 8F BF BF");
+    CHECK(!utf8_valid("\xED\xA0\x80"), "utf8: reject surrogate U+D800 (ED A0 80)");
+    CHECK(!utf8_valid("\xED\xBF\xBF"), "utf8: reject surrogate U+DFFF (ED BF BF)");
+    CHECK(!utf8_valid("\xF4\x90\x80\x80"), "utf8: reject > U+10FFFF (F4 90 80 80)");
+    CHECK(!utf8_valid(std::string_view("\x80", 1)), "utf8: reject bare continuation 0x80");
+    CHECK(!utf8_valid(std::string_view("\xFF", 1)), "utf8: reject lone 0xFF");
+    CHECK(!utf8_valid(std::string_view("\xF5\x80\x80\x80", 4)), "utf8: reject F5 lead (> range)");
+    CHECK(!utf8_valid(std::string_view("\xC2", 1)), "utf8: reject truncated 2-byte C2");
+    CHECK(!utf8_valid("\xE2\x82"), "utf8: reject truncated 3-byte E2 82");
+    CHECK(!utf8_valid("\xE2\x28\xA1"), "utf8: reject bad continuation E2 28 A1");
+
+    /* --- valid data always round-trips byte-identically, in either build. --- */
+    {
+        const std::string s = "\xE2\x82\xAC\xF0\x9F\x98\x80 mixed \xC2\xA9"; /* euro emoji ascii copyright */
+        sofab::OStreamInline<64> os;
+        auto w = os.write(5, std::string_view{s});
+        CHECK(w.code() == sofab::Error::None, "utf8: valid multibyte string encodes");
+        sofab::IStreamObject<ScalarMsg> in;
+        auto r = in.feed(os.data(), os.bytesUsed());
+        CHECK(r.code() == sofab::Error::None, "utf8: valid multibyte string decodes COMPLETE");
+        CHECK((*in).s == s, "utf8: valid multibyte string round-trips identically");
+    }
+
+    /* --- embedded U+0000 is valid: encodes and round-trips (not truncated). --- */
+    {
+        const std::string s("a\0b\0", 4);
+        sofab::OStreamInline<64> os;
+        auto w = os.write(5, std::string_view{s});
+        CHECK(w.code() == sofab::Error::None, "utf8: embedded-NUL string encodes");
+        sofab::IStreamObject<ScalarMsg> in;
+        auto r = in.feed(os.data(), os.bytesUsed());
+        CHECK(r.code() == sofab::Error::None, "utf8: embedded-NUL string decodes COMPLETE");
+        CHECK((*in).s == s, "utf8: embedded-NUL string round-trips (4 bytes, no truncation)");
+    }
+
+    /* --- a valid multi-byte sequence split across feed() stays INCOMPLETE and
+     *     completes to COMPLETE — a chunk boundary never forces INVALID. --- */
+    {
+        auto w = stringFieldWire("\xE2\x82\xAC", sofab::detail::Fix::String); /* 5 bytes total */
+        sofab::IStreamObject<ScalarMsg> in;
+        auto r1 = in.feed(w.data(), w.size() - 1); /* split mid-sequence (E2 82 | AC) */
+        CHECK(r1.code() == sofab::Error::Incomplete, "utf8: cross-chunk split is INCOMPLETE, not INVALID");
+        auto r2 = in.feed(w.data() + w.size() - 1, 1);
+        CHECK(r2.code() == sofab::Error::None, "utf8: split multibyte completes to COMPLETE");
+        CHECK((*in).s == "\xE2\x82\xAC", "utf8: split multibyte decodes correctly");
+    }
+
+#if SOFAB_STRICT_UTF8
+    /* --- encode rejects invalid UTF-8 with InvalidArgument (strict build). --- */
+    {
+        sofab::OStreamInline<64> os;
+        auto w = os.write(5, std::string_view("\xC0\x80", 2)); /* overlong NUL */
+        CHECK(w.code() == sofab::Error::InvalidArgument, "utf8/strict: encode rejects C0 80 with InvalidArgument");
+    }
+    {
+        sofab::OStreamInline<64> os;
+        auto w = os.write(5, std::string_view("\xED\xA0\x80", 3)); /* surrogate */
+        CHECK(w.code() == sofab::Error::InvalidArgument, "utf8/strict: encode rejects surrogate with InvalidArgument");
+    }
+
+    /* --- decode rejects an invalid-UTF-8 materialised string as INVALID. --- */
+    {
+        auto w = stringFieldWire("\xC0\x80", sofab::detail::Fix::String);
+        sofab::IStreamObject<ScalarMsg> in;
+        auto r = in.feed(w.data(), w.size());
+        CHECK(r.code() == sofab::Error::InvalidMessage, "utf8/strict: decode rejects C0 80 string as INVALID");
+        CHECK(r.invalid() && r.status() == sofab::DecodeStatus::Invalid, "utf8/strict: decode reject maps to Invalid status");
+    }
+    {
+        /* truncated-at-end-of-payload (declared length reached mid-sequence) is INVALID. */
+        auto w = stringFieldWire("\xE2\x82", sofab::detail::Fix::String);
+        sofab::IStreamObject<ScalarMsg> in;
+        auto r = in.feed(w.data(), w.size());
+        CHECK(r.code() == sofab::Error::InvalidMessage, "utf8/strict: truncated-at-end string is INVALID");
+    }
+
+    /* --- a skipped string is never validated (spec §6.4 skip exemption). --- */
+    {
+        struct SkipAll : sofab::IStreamMessage {
+            void deserialize(sofab::IStreamImpl &, sofab::id, size_t, size_t) noexcept override {} /* read nothing */
+        };
+        auto w = stringFieldWire("\xC0\x80", sofab::detail::Fix::String);
+        sofab::IStreamObject<SkipAll> in;
+        auto r = in.feed(w.data(), w.size());
+        CHECK(r.code() == sofab::Error::None, "utf8/strict: a SKIPPED invalid-UTF-8 string is not validated (COMPLETE)");
+    }
+
+    /* --- blob is never validated: same bytes as a blob encode and decode fine. --- */
+    {
+        const uint8_t raw[] = {0xC0, 0x80};
+        sofab::OStreamInline<64> os;
+        auto w = os.write(5, raw, static_cast<int32_t>(sizeof raw)); /* blob overload */
+        CHECK(w.code() == sofab::Error::None, "utf8/strict: blob write of non-UTF-8 bytes is accepted");
+    }
+    {
+        /* a Blob-subtype fixlen read into a std::string is not validated. */
+        auto w = stringFieldWire("\xC0\x80", sofab::detail::Fix::Blob);
+        sofab::IStreamObject<ScalarMsg> in;
+        auto r = in.feed(w.data(), w.size());
+        CHECK(r.code() == sofab::Error::None, "utf8/strict: Blob-subtype payload is not UTF-8 validated");
+        CHECK((*in).s == std::string("\xC0\x80", 2), "utf8/strict: Blob payload stored verbatim");
+    }
+#endif
+}
+
 int main()
 {
     encodeVectors();
@@ -830,6 +971,7 @@ int main()
     zeroLengthForms();
     maxDepth();
     bufferLimits();
+    strictUtf8();
 
     std::printf("\n%d checks, %d failures\n", g_checks, g_failures);
     return g_failures ? 1 : 0;

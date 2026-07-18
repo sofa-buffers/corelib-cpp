@@ -253,6 +253,74 @@ bool loadVectors(const char *path, std::vector<Vector> &out, std::string &err)
     return true;
 }
 
+/* --- negative UTF-8 vectors (top-level "invalid_utf8" array; tracks
+ *     corelib-c-cpp#97). Each carries the raw `string_hex` payload (encode must
+ *     reject) and a whole `serialized_hex` wire message (decode must reject).
+ *     Exercised only under a strict (SOFAB_STRICT_UTF8) build. --- */
+
+struct NegVec
+{
+    std::string name;
+    std::vector<uint8_t> payload;    // string_hex: raw string bytes for the encode-reject check
+    std::vector<uint8_t> serialized; // serialized_hex: whole wire message for the decode-reject check
+    uint32_t id = 0;
+    uint32_t req = 0;
+};
+
+bool loadNegVectors(const char *path, std::vector<NegVec> &out, std::string &err)
+{
+    FILE *f = std::fopen(path, "rb");
+    if (!f) { err = "cannot open vector file"; return false; }
+    std::fseek(f, 0, SEEK_END);
+    long n = std::ftell(f);
+    std::fseek(f, 0, SEEK_SET);
+    std::string text(static_cast<size_t>(n), '\0');
+    size_t rd = std::fread(text.data(), 1, static_cast<size_t>(n), f);
+    std::fclose(f);
+    text.resize(rd);
+
+    char perr[128];
+    sofab_json_t *root = sofab_json_parse(text.data(), text.size(), perr, sizeof(perr));
+    if (!root) { err = std::string("json parse: ") + perr; return false; }
+
+    const sofab_json_t *arr = sofab_json_get(root, "invalid_utf8");
+    size_t nv = sofab_json_array_size(arr);
+    for (size_t i = 0; i < nv; i++)
+    {
+        const sofab_json_t *vj = sofab_json_array_at(arr, i);
+        NegVec v;
+        size_t nl; const char *nm = sofab_json_string(sofab_json_get(vj, "name"), &nl);
+        v.name.assign(nm ? nm : "", nm ? nl : 0);
+        const sofab_json_t *idn = sofab_json_get(vj, "id");
+        v.id = idn ? static_cast<uint32_t>(sofab_json_u64(idn)) : 0;
+        const sofab_json_t *req = sofab_json_get(vj, "requires");
+        size_t nr = sofab_json_array_size(req);
+        for (size_t k = 0; k < nr; k++)
+        {
+            size_t tl; const char *tn = sofab_json_string(sofab_json_array_at(req, k), &tl);
+            if (tn) v.req |= capFromName(tn);
+        }
+        size_t pl; const char *ph = sofab_json_string(sofab_json_get(vj, "string_hex"), &pl);
+        size_t sl; const char *sh = sofab_json_string(sofab_json_get(vj, "serialized_hex"), &sl);
+        if (!ph || !hex2bin(ph, pl, v.payload) || !sh || !hex2bin(sh, sl, v.serialized))
+        { err = v.name + ": bad hex"; sofab_json_free(root); return false; }
+        out.push_back(std::move(v));
+    }
+    sofab_json_free(root);
+    return true;
+}
+
+/* Reads the delivered field into a std::string, forcing UTF-8 validation on the
+ * materialised-read path (never on skip). */
+struct NegReadMsg : sofab::IStreamMessage
+{
+    void deserialize(sofab::IStreamImpl &is, sofab::id, size_t, size_t) noexcept override
+    {
+        std::string s;
+        is.read(s);
+    }
+};
+
 /* --- encode --- */
 
 template <typename Vec, typename Src>
@@ -473,8 +541,47 @@ int main()
         std::string d4; run(roundtrip(v, d4), v, "roundtrip", d4);
     }
 
+    /* Negative UTF-8 group (top-level "invalid_utf8"). Under a strict build each
+     * serialized_hex must decode to INVALID and each string_hex must be refused
+     * on encode with InvalidArgument (spec §6.4). A non-strict build skips them:
+     * with the check compiled out those bytes are accepted verbatim. */
+    std::vector<NegVec> negs;
+    if (!loadNegVectors(SOFAB_TEST_VECTORS_PATH, negs, err))
+    {
+        std::printf("neg load failed: %s\n", err.c_str());
+        return 2;
+    }
+    int negRun = 0, negSkipped = 0;
+    for (const NegVec &nv : negs)
+    {
+        if (nv.req & ~caps) { ++negSkipped; continue; }
+#if SOFAB_STRICT_UTF8
+        ++negRun;
+        /* decode: the whole wire message must be rejected as INVALID. */
+        {
+            sofab::IStreamObject<NegReadMsg> in;
+            auto r = in.feed(nv.serialized.data(), nv.serialized.size());
+            run(r.code() == sofab::Error::InvalidMessage && r.status() == sofab::DecodeStatus::Invalid,
+                Vector{nv.name, {}, {}, {}, 0}, "utf8-decode-invalid",
+                "expected INVALID, got code " + std::to_string(static_cast<int>(r.code())));
+        }
+        /* encode: writing the raw payload as a string field must be refused. */
+        {
+            sofab::OStream os(256);
+            std::string_view sv(reinterpret_cast<const char *>(nv.payload.data()), nv.payload.size());
+            auto w = os.write(nv.id, sv);
+            run(w.code() == sofab::Error::InvalidArgument,
+                Vector{nv.name, {}, {}, {}, 0}, "utf8-encode-invalid-argument",
+                "expected InvalidArgument, got code " + std::to_string(static_cast<int>(w.code())));
+        }
+#else
+        ++negSkipped;
+#endif
+    }
+
     std::printf("%zu vectors, %d run, %d skipped, %d checks, %d failures\n",
                 vectors.size(), static_cast<int>(vectors.size()) - skipped, skipped, checks, failures);
+    std::printf("%zu invalid_utf8 vectors, %d run, %d skipped\n", negs.size(), negRun, negSkipped);
     if (failures) std::printf("first failure: %s\n", first.c_str());
     return failures ? 1 : 0;
 }
