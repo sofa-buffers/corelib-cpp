@@ -32,3 +32,19 @@ jobs:
       - name: Run tests
         working-directory: build
         run: ctest --output-on-failure --verbose
+
+      # Guard the non-strict UTF-8 build (SOFAB_STRICT_UTF8=0): it must still
+      # compile, pass the positive vectors, and skip the invalid_utf8 group.
+      - name: Configure (strict UTF-8 OFF)
+        run: |
+          cmake -S . -B build-utf8-off \
+            -DCMAKE_BUILD_TYPE=Debug \
+            -DCMAKE_CXX_COMPILER=g++ \
+            -DCMAKE_CXX_FLAGS="-DSOFAB_STRICT_UTF8=0"
+
+      - name: Build project (strict UTF-8 OFF)
+        run: cmake --build build-utf8-off --parallel
+
+      - name: Run tests (strict UTF-8 OFF)
+        working-directory: build-utf8-off
+        run: ctest --output-on-failure --verbose

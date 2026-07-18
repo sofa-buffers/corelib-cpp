@@ -43,6 +43,33 @@
 #include <type_traits>
 #include <vector>
 
+/**
+ * @def SOFAB_STRICT_UTF8
+ * @brief Compile-time gate for strict UTF-8 validation of `string` payloads
+ *        (spec MESSAGE_SPEC §8, CORELIB_PLAN §6.4).
+ *
+ * SofaBuffers `string` fields carry UTF-8 text; `blob` is the type for opaque
+ * bytes. With the check **ON** (the default, `1`) an invalid-UTF-8 `string` is
+ * rejected **symmetrically**: on decode it is the `INVALID` outcome
+ * (@ref sofab::Error::InvalidMessage), on encode it is refused with
+ * @ref sofab::Error::InvalidArgument. `blob` is never validated in either
+ * direction, and a **skipped** `string` is never validated (only a materialised
+ * read is).
+ *
+ * The knob is compile-time because this header carries no runtime encode-side
+ * configuration object (an `OStream` is constructed from buffers only), so a
+ * single `#define` is the only way to gate encode and decode with one symmetric
+ * switch — the "compile-time (`#define`)" option §6.4 explicitly permits for
+ * C++. Define `SOFAB_STRICT_UTF8` to `0` before including this header for a
+ * documented **non-strict** build: the validation code then folds away entirely
+ * (zero `.text`/`.rodata` cost) and payloads are stored verbatim — raw, never
+ * lossy. Such a build is expected to still build and conformance-test the
+ * check-ON configuration (§6.4).
+ */
+#ifndef SOFAB_STRICT_UTF8
+#  define SOFAB_STRICT_UTF8 1
+#endif
+
 namespace sofab
 {
     /// Version of the SofaBuffers public API implemented by this header.
@@ -214,7 +241,94 @@ namespace sofab
         {
             return std::bit_cast<F>(bits);
         }
+
+        /**
+         * @brief Validate that `[data, data+len)` is well-formed UTF-8.
+         *
+         * A real UTF-8 validator, not a byte-range shortcut — this is a security
+         * surface (CORELIB_PLAN §6.4). It **rejects**:
+         *  - overlong encodings, including `C0 80` (Java "Modified UTF-8" NUL),
+         *    `C1`-lead 2-byte forms, and the overlong 3-/4-byte `E0 80..`,
+         *    `F0 80..` forms;
+         *  - UTF-16 surrogate code points `U+D800`–`U+DFFF` (`ED A0..ED BF`);
+         *  - code points above `U+10FFFF` (`F4 90..` and any `F5`–`FF` lead);
+         *  - bare continuation bytes and any sequence truncated before its
+         *    declared length ends (truncated-at-end is INVALID).
+         * It **accepts** an embedded `U+0000` (a single `00` byte): NUL is valid
+         * UTF-8 and representable in the length-framed payload (§6.4).
+         *
+         * `constexpr` and free of `reinterpret_cast`, so it can be evaluated at
+         * compile time and unit-tested directly.
+         *
+         * @param data Pointer to the candidate bytes (may be `nullptr` iff @p len is 0).
+         * @param len  Number of bytes to validate.
+         * @return `true` iff every byte forms part of a well-formed UTF-8 sequence.
+         */
+        [[nodiscard]] constexpr bool utf8Valid(const char *data, size_t len) noexcept
+        {
+            size_t i = 0;
+            while (i < len)
+            {
+                const unsigned char b0 = static_cast<unsigned char>(data[i]);
+                if (b0 < 0x80) { ++i; continue; } /* ASCII (incl. embedded NUL) */
+
+                size_t extra;              /* number of continuation bytes */
+                unsigned char lo = 0x80;   /* tightened range for the 1st continuation */
+                unsigned char hi = 0xBF;
+                if ((b0 & 0xE0) == 0xC0)
+                {
+                    extra = 1;
+                    if (b0 < 0xC2) return false;              /* C0/C1: overlong 2-byte */
+                }
+                else if ((b0 & 0xF0) == 0xE0)
+                {
+                    extra = 2;
+                    if (b0 == 0xE0) lo = 0xA0;                /* reject overlong E0 80..E0 9F */
+                    else if (b0 == 0xED) hi = 0x9F;           /* reject surrogates ED A0..ED BF */
+                }
+                else if ((b0 & 0xF8) == 0xF0)
+                {
+                    extra = 3;
+                    if (b0 > 0xF4) return false;              /* > U+10FFFF (F5..F7 lead) */
+                    if (b0 == 0xF0) lo = 0x90;                /* reject overlong F0 80..F0 8F */
+                    else if (b0 == 0xF4) hi = 0x8F;           /* reject > U+10FFFF (F4 90..) */
+                }
+                else
+                {
+                    return false;                            /* bare continuation, or F8..FF */
+                }
+
+                if (len - i < extra + 1) return false;       /* truncated at end-of-payload */
+
+                const unsigned char c1 = static_cast<unsigned char>(data[i + 1]);
+                if (c1 < lo || c1 > hi) return false;
+                for (size_t k = 2; k <= extra; ++k)
+                {
+                    const unsigned char c = static_cast<unsigned char>(data[i + k]);
+                    if (c < 0x80 || c > 0xBF) return false;
+                }
+                i += extra + 1;
+            }
+            return true;
+        }
     } // namespace detail
+
+    /**
+     * @brief Public UTF-8 validity primitive (spec CORELIB_PLAN §6.4).
+     *
+     * Returns `true` iff @p bytes is well-formed UTF-8 by @ref detail::utf8Valid
+     * (rejecting overlong forms, surrogates and out-of-range code points;
+     * accepting embedded NUL). Independent of @ref SOFAB_STRICT_UTF8 — this is the
+     * validator itself, always available; the compile-time flag only decides
+     * whether the encode/decode paths *invoke* it.
+     *
+     * @param bytes Candidate string payload.
+     * @return `true` iff @p bytes is valid UTF-8.
+     */
+    [[nodiscard]] constexpr bool utf8_valid(std::string_view bytes) noexcept
+    {
+        return detail::utf8Valid(bytes.data(), bytes.size());
+    }
 
     /* ---------------------------------------------------------------------- */
     /* OStream                                                                */
@@ -614,8 +728,17 @@ namespace sofab
             else if constexpr (std::is_convertible_v<T, std::string_view>)
             {
                 std::string_view sv{value};
-                err = writeFixlen(fieldId, detail::Fix::String,
-                                  reinterpret_cast<const uint8_t *>(sv.data()), sv.size());
+#if SOFAB_STRICT_UTF8
+                /* §6.4: a `string` value that is not valid UTF-8 is refused with
+                 * InvalidArgument — this is what enforces MESSAGE_SPEC §8's
+                 * producer-side MUST NOT. `blob` (the pointer+size overload) is
+                 * never validated. Folds away when the check is compiled out. */
+                if (!detail::utf8Valid(sv.data(), sv.size()))
+                    err = Error::InvalidArgument;
+                else
+#endif
+                    err = writeFixlen(fieldId, detail::Fix::String,
+                                      reinterpret_cast<const uint8_t *>(sv.data()), sv.size());
             }
             else if constexpr (std::is_base_of_v<OStreamMessage, T>)
             {
@@ -1528,6 +1651,19 @@ namespace sofab
                 /* zero-copy: the view points into the source buffer, valid as
                  * long as that buffer (or this stream's accumulator) lives. */
                 if (static_cast<size_t>(end_ - p_) < fixLen_) { error_ = true; return; }
+#if SOFAB_STRICT_UTF8
+                /* §6.4: a materialised `string` (fixlen subtype String) whose
+                 * complete payload is not valid UTF-8 is the INVALID outcome —
+                 * surfaced via the sticky decode-error flag (same channel as
+                 * @ref invalidate), never a throw. The whole payload is present
+                 * here (an incomplete field is buffered, not delivered), so a
+                 * cross-chunk split stays INCOMPLETE and only a truncated-at-end
+                 * or malformed payload reaches this check. `blob` is never
+                 * validated; a skipped field never reaches read(). */
+                if (fixType_ == detail::Fix::String &&
+                    !detail::utf8Valid(reinterpret_cast<const char *>(p_), fixLen_))
+                { error_ = true; return; }
+#endif
                 value = std::string_view(reinterpret_cast<const char *>(p_), fixLen_);
                 p_ += fixLen_;
                 consumed_ = true;
@@ -1535,6 +1671,15 @@ namespace sofab
             else if constexpr (std::is_same_v<T, std::string>)
             {
                 if (static_cast<size_t>(end_ - p_) < fixLen_) { error_ = true; return; }
+#if SOFAB_STRICT_UTF8
+                /* §6.4: reject an invalid-UTF-8 `string` payload as INVALID (see
+                 * the std::string_view branch above for the full rationale).
+                 * Gated on the wire subtype so a `blob` read into a std::string
+                 * is never validated. */
+                if (fixType_ == detail::Fix::String &&
+                    !detail::utf8Valid(reinterpret_cast<const char *>(p_), fixLen_))
+                { error_ = true; return; }
+#endif
                 value.assign(reinterpret_cast<const char *>(p_), fixLen_);
                 p_ += fixLen_;
                 consumed_ = true;

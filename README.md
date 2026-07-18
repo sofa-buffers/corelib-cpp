@@ -205,6 +205,35 @@ malformation. The default is **no cap** (`SIZE_MAX`), so streams are unbounded
 unless you opt in; generated code derives the value from the schema's configured
 `max_dyn_*` limits. Bytes are never clamped or truncated — the `feed()` simply fails.
 
+#### Strict UTF-8 validation (`SOFAB_STRICT_UTF8`, default ON)
+
+A SofaBuffers `string` carries UTF-8 text; `blob` is the type for opaque bytes
+(spec MESSAGE_SPEC §8, CORELIB_PLAN §6.4). With the compile-time flag
+`SOFAB_STRICT_UTF8` **ON** (the default) an invalid-UTF-8 `string` is rejected
+**symmetrically**:
+
+- **encode** — `write(id, string_view)` for a non-UTF-8 value returns
+  `Error::InvalidArgument` and emits nothing;
+- **decode** — a materialised (`read` into `std::string` / `std::string_view`)
+  `string` whose complete payload is not valid UTF-8 is the `INVALID` outcome
+  (`Error::InvalidMessage` / `DecodeStatus::Invalid`), surfaced through the same
+  sticky-error channel as `invalidate()`.
+
+The validator (`sofab::utf8_valid(std::string_view)`) is a real validator, not a
+byte-range shortcut: it rejects overlong forms (including `C0 80`), UTF-16
+surrogates `U+D800`–`U+DFFF`, and code points above `U+10FFFF`, and accepts an
+embedded `U+0000`. `blob` is **never** validated in either direction, and a
+**skipped** `string` is never validated — only a materialised read is.
+
+Because there is no runtime encode-side configuration object, the knob is a
+compile-time `#define` (the option §6.4 permits for C++), so it gates encode and
+decode with one symmetric switch. Define `SOFAB_STRICT_UTF8=0` before including
+`<sofab/sofab.hpp>` for a documented **non-strict** build: the validation code
+folds away entirely and payloads are stored **verbatim** — raw, never lossy. The
+option is a validation *policy*, never a wire-format switch, so peers with
+different settings interoperate on all valid data; conformance and the shared
+vectors run with it **ON**.
+
 ### Code generator
 
 The usual way to drive the library is through **generated object code**: a schema
@@ -298,12 +327,18 @@ yields `Error::BufferFull`.
 
 ## Feature flags
 
-**None.** This header-only C++20 port always compiles the full wire format —
-there is no `#ifdef` gating and nothing to configure. (The conformance harness
-recognises the family's `SOFAB_DISABLE_*` names only so it can skip the matching
-vectors when validating a feature-reduced profile; the defines do **not** change
-this library.) For a strictly minimal binary, use the C corelib
+**Almost none.** This header-only C++20 port always compiles the full wire
+format — there is no `#ifdef` gating of wire types and nothing to configure. (The
+conformance harness recognises the family's `SOFAB_DISABLE_*` names only so it can
+skip the matching vectors when validating a feature-reduced profile; the defines
+do **not** change this library.) For a strictly minimal binary, use the C corelib
 [`corelib-c-cpp`](https://github.com/sofa-buffers/corelib-c-cpp).
+
+The one compile-time knob is **`SOFAB_STRICT_UTF8`** (default `1`): the strict
+UTF-8 validation policy documented under
+[Strict UTF-8 validation](#strict-utf-8-validation-sofab_strict_utf8-default-on).
+Define it to `0` for a non-strict build that stores `string` payloads verbatim
+(raw, never lossy). It gates a validation policy only, never the wire format.
 
 ## Build & test
 
