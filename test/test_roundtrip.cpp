@@ -591,6 +591,156 @@ static void callbackExceedLimit()
     }
 }
 
+/* --- §7.3 wire-type guard (Crucible F-0020): a decoder must SKIP a field whose
+ *     header wire type is not the one its declared type maps to, rather than read
+ *     it under a mismatched interpretation. read() applies zig-zag on the
+ *     destination type's signedness, never on the wire type, so reading a Signed
+ *     field as unsigned silently yields the raw (un-zig-zagged) varint. The
+ *     IStreamImpl::wire / fixType accessors expose the delivered wire type so a
+ *     deliver callback can honour the read() precondition: on a mismatch it does
+ *     not call read(), and the field is skipped automatically. The full field-id ×
+ *     wire-type matrix lives in the differential fuzzer; this pins the mechanism. --- */
+
+static void wireTypeGuard()
+{
+    /* A message declaring field 0 as an unsigned integer. It reads only when the
+     * delivered wire type matches; otherwise it leaves the field for the skip.
+     * `read` records whether a value was actually pulled. */
+    struct GuardedU : sofab::IStreamMessage
+    {
+        uint32_t v = 0xABCD;
+        bool read = false;
+        void deserialize(sofab::IStreamImpl &is, sofab::id id, size_t, size_t) noexcept override
+        {
+            if (id != 0) return;
+            if (is.wire() != sofab::Wire::Unsigned) return; /* §7.3: skip on mismatch */
+            is.read(v);
+            read = true;
+        }
+    };
+
+    /* Correctly typed: id 0, Unsigned, value 6 -> read as 6. */
+    {
+        const uint8_t bytes[] = {0x00, 0x06};
+        sofab::IStreamObject<GuardedU> in;
+        auto r = in.feed(bytes, sizeof bytes);
+        CHECK(r.code() == sofab::Error::None, "wire-guard: correctly-typed field is COMPLETE");
+        CHECK((*in).read && (*in).v == 6, "wire-guard: matching wire type reads the value");
+    }
+
+    /* F-0020 reproducer `01 06`: id 0 declared unsigned but delivered with wire
+     * type Signed. zig-zag(6) = 3; read-as-unsigned would silently yield 6. The
+     * guard must skip it — no value read, field left at its default, decode still
+     * COMPLETE (a skip is not an error). */
+    {
+        const uint8_t bytes[] = {0x01, 0x06};
+        sofab::IStreamObject<GuardedU> in;
+        auto r = in.feed(bytes, sizeof bytes);
+        CHECK(r.code() == sofab::Error::None, "wire-guard: mismatched field skipped, still COMPLETE");
+        CHECK(!(*in).read && (*in).v == 0xABCD, "wire-guard: mismatched wire type is not read (no silent mis-decode)");
+    }
+
+    /* Control — the exact mis-decode §7.3 prevents: an unguarded reader pulls the
+     * raw varint and applies no zig-zag, yielding 6 where the Signed value is 3.
+     * This is the gap the accessor closes. */
+    {
+        struct UnguardedU : sofab::IStreamMessage
+        {
+            uint32_t v = 0;
+            void deserialize(sofab::IStreamImpl &is, sofab::id id, size_t, size_t) noexcept override
+            { if (id == 0) is.read(v); }
+        };
+        const uint8_t bytes[] = {0x01, 0x06}; /* Signed, zig-zag 6 = 3 */
+        sofab::IStreamObject<UnguardedU> in;
+        in.feed(bytes, sizeof bytes);
+        CHECK((*in).v == 6, "wire-guard: an unguarded read mis-decodes the Signed value (demonstrates the gap)");
+    }
+
+    /* Resync: a skipped (mismatched) field must leave the cursor at the next field
+     * so a following, correctly-typed field still decodes. id0 Signed (mismatch ->
+     * skip), then id1 Signed value -42 (0x09 = id1|Signed, 0x53 = zig-zag(-42)). */
+    {
+        struct TwoFields : sofab::IStreamMessage
+        {
+            uint32_t a = 0xABCD;
+            int32_t b = 0;
+            bool readA = false;
+            void deserialize(sofab::IStreamImpl &is, sofab::id id, size_t, size_t) noexcept override
+            {
+                if (id == 0) { if (is.wire() != sofab::Wire::Unsigned) return; is.read(a); readA = true; }
+                else if (id == 1) { if (is.wire() != sofab::Wire::Signed) return; is.read(b); }
+            }
+        };
+        const uint8_t bytes[] = {0x01, 0x06, 0x09, 0x53};
+        sofab::IStreamObject<TwoFields> in;
+        auto r = in.feed(bytes, sizeof bytes);
+        CHECK(r.code() == sofab::Error::None, "wire-guard: skip-then-resync is COMPLETE");
+        CHECK(!(*in).readA, "wire-guard: first (mismatched) field skipped");
+        CHECK((*in).b == -42, "wire-guard: following field resyncs and decodes");
+    }
+
+    /* Subtype guard (§7.3 nuance): fp32/fp64/string/blob all share the Fixlen wire
+     * type, so the check is bounded at wire type *plus* fixType. A field declared
+     * `string` but delivered as fp32 must be skipped even though both are Fixlen. */
+    {
+        struct GuardedStr : sofab::IStreamMessage
+        {
+            std::string s = "def";
+            bool read = false;
+            void deserialize(sofab::IStreamImpl &is, sofab::id id, size_t, size_t) noexcept override
+            {
+                if (id != 5) return;
+                if (is.wire() != sofab::Wire::Fixlen || is.fixType() != sofab::Fix::String) return;
+                is.read(s);
+                read = true;
+            }
+        };
+
+        /* delivered as fp32 (0x2a = id5|Fixlen, 0x20 = len4|Fp32, then 4 bytes) -> skip. */
+        {
+            const uint8_t bytes[] = {0x2a, 0x20, 0x00, 0x00, 0x00, 0x00};
+            sofab::IStreamObject<GuardedStr> in;
+            auto r = in.feed(bytes, sizeof bytes);
+            CHECK(r.code() == sofab::Error::None, "wire-guard: fp32-for-string skipped, still COMPLETE");
+            CHECK(!(*in).read && (*in).s == "def", "wire-guard: wrong fixlen subtype is not read");
+        }
+        /* delivered as string (0x12 = len2|String, "hi") -> read. */
+        {
+            const uint8_t bytes[] = {0x2a, 0x12, 'h', 'i'};
+            sofab::IStreamObject<GuardedStr> in;
+            auto r = in.feed(bytes, sizeof bytes);
+            CHECK(r.code() == sofab::Error::None, "wire-guard: matching fixlen subtype is COMPLETE");
+            CHECK((*in).read && (*in).s == "hi", "wire-guard: matching fixlen subtype reads the value");
+        }
+    }
+
+    /* Direct accessor readout: wire()/fixType() report the delivered form through
+     * the public sofab::Wire / sofab::Fix names (the promoted enums). */
+    {
+        sofab::OStreamInline<64> os;
+        os.write(0, uint32_t{7})            /* Unsigned */
+          .write(1, int32_t{-7})            /* Signed */
+          .write(2, 1.5f)                   /* Fixlen / Fp32 */
+          .write(3, std::string_view{"x"}); /* Fixlen / String */
+
+        struct Recorder : sofab::IStreamMessage
+        {
+            std::vector<sofab::Wire> w;
+            std::vector<sofab::Fix> f;
+            void deserialize(sofab::IStreamImpl &is, sofab::id, size_t, size_t) noexcept override
+            { w.push_back(is.wire()); f.push_back(is.fixType()); } /* no read(): fields auto-skip */
+        };
+        sofab::IStreamObject<Recorder> in;
+        auto r = in.feed(os.data(), os.bytesUsed());
+        CHECK(r.code() == sofab::Error::None, "accessor: readout message is COMPLETE");
+        CHECK((*in).w.size() == 4, "accessor: all four fields delivered");
+        CHECK((*in).w[0] == sofab::Wire::Unsigned, "accessor: field 0 wire is Unsigned");
+        CHECK((*in).w[1] == sofab::Wire::Signed, "accessor: field 1 wire is Signed");
+        CHECK((*in).w[2] == sofab::Wire::Fixlen && (*in).f[2] == sofab::Fix::Fp32, "accessor: field 2 is Fixlen/Fp32");
+        CHECK((*in).w[3] == sofab::Wire::Fixlen && (*in).f[3] == sofab::Fix::String, "accessor: field 3 is Fixlen/String");
+    }
+}
+
 /* --- zero-length wire forms (§4.7–4.9): zero-count arrays and empty sequences --- */
 
 struct EmptyArrMsg : sofab::IStreamMessage
@@ -820,7 +970,7 @@ static void bufferLimits()
  *     decides whether encode/decode invoke it. --- */
 
 /* Encode a single string/blob field (id 5) so it can be fed straight into ScalarMsg. */
-static std::vector<uint8_t> stringFieldWire(std::string_view payload, sofab::detail::Fix sub)
+static std::vector<uint8_t> stringFieldWire(std::string_view payload, sofab::Fix sub)
 {
     std::vector<uint8_t> w;
     w.push_back(static_cast<uint8_t>((5u << 3) | 2u)); /* id 5, Fixlen */
@@ -889,7 +1039,7 @@ static void strictUtf8()
     /* --- a valid multi-byte sequence split across feed() stays INCOMPLETE and
      *     completes to COMPLETE — a chunk boundary never forces INVALID. --- */
     {
-        auto w = stringFieldWire("\xE2\x82\xAC", sofab::detail::Fix::String); /* 5 bytes total */
+        auto w = stringFieldWire("\xE2\x82\xAC", sofab::Fix::String); /* 5 bytes total */
         sofab::IStreamObject<ScalarMsg> in;
         auto r1 = in.feed(w.data(), w.size() - 1); /* split mid-sequence (E2 82 | AC) */
         CHECK(r1.code() == sofab::Error::Incomplete, "utf8: cross-chunk split is INCOMPLETE, not INVALID");
@@ -913,7 +1063,7 @@ static void strictUtf8()
 
     /* --- decode rejects an invalid-UTF-8 materialised string as INVALID. --- */
     {
-        auto w = stringFieldWire("\xC0\x80", sofab::detail::Fix::String);
+        auto w = stringFieldWire("\xC0\x80", sofab::Fix::String);
         sofab::IStreamObject<ScalarMsg> in;
         auto r = in.feed(w.data(), w.size());
         CHECK(r.code() == sofab::Error::InvalidMessage, "utf8/strict: decode rejects C0 80 string as INVALID");
@@ -921,7 +1071,7 @@ static void strictUtf8()
     }
     {
         /* truncated-at-end-of-payload (declared length reached mid-sequence) is INVALID. */
-        auto w = stringFieldWire("\xE2\x82", sofab::detail::Fix::String);
+        auto w = stringFieldWire("\xE2\x82", sofab::Fix::String);
         sofab::IStreamObject<ScalarMsg> in;
         auto r = in.feed(w.data(), w.size());
         CHECK(r.code() == sofab::Error::InvalidMessage, "utf8/strict: truncated-at-end string is INVALID");
@@ -932,7 +1082,7 @@ static void strictUtf8()
         struct SkipAll : sofab::IStreamMessage {
             void deserialize(sofab::IStreamImpl &, sofab::id, size_t, size_t) noexcept override {} /* read nothing */
         };
-        auto w = stringFieldWire("\xC0\x80", sofab::detail::Fix::String);
+        auto w = stringFieldWire("\xC0\x80", sofab::Fix::String);
         sofab::IStreamObject<SkipAll> in;
         auto r = in.feed(w.data(), w.size());
         CHECK(r.code() == sofab::Error::None, "utf8/strict: a SKIPPED invalid-UTF-8 string is not validated (COMPLETE)");
@@ -947,7 +1097,7 @@ static void strictUtf8()
     }
     {
         /* a Blob-subtype fixlen read into a std::string is not validated. */
-        auto w = stringFieldWire("\xC0\x80", sofab::detail::Fix::Blob);
+        auto w = stringFieldWire("\xC0\x80", sofab::Fix::Blob);
         sofab::IStreamObject<ScalarMsg> in;
         auto r = in.feed(w.data(), w.size());
         CHECK(r.code() == sofab::Error::None, "utf8/strict: Blob-subtype payload is not UTF-8 validated");
@@ -968,6 +1118,7 @@ int main()
     threeValuedOutcomes();
     callbackInvalidate();
     callbackExceedLimit();
+    wireTypeGuard();
     zeroLengthForms();
     maxDepth();
     bufferLimits();
