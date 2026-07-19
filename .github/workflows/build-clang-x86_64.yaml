@@ -27,7 +27,7 @@ jobs:
             -DCMAKE_CXX_COMPILER=clang++
 
       - name: Build project
-        run: cmake --build build --parallel
+        run: cmake --build build --parallel "$(nproc)"
 
       - name: Run tests
         working-directory: build

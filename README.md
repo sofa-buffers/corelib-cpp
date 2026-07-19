@@ -344,9 +344,13 @@ Define it to `0` for a non-strict build that stores `string` payloads verbatim
 
 ```sh
 cmake -S . -B build
-cmake --build build --parallel
+cmake --build build --parallel "$(nproc)"
 ctest --test-dir build --output-on-failure
 ```
+
+Always give `--parallel` an explicit job count. Bare `--parallel` defers to the
+native build tool's default, and with the Unix Makefiles generator that is
+`make -j` with *no* limit — one compiler per translation unit, all at once.
 
 Two suites run under CTest:
 
@@ -364,7 +368,7 @@ Two suites run under CTest:
 ```sh
 # line/branch coverage of the header (needs gcovr)
 cmake -S . -B build -DSOFAB_ENABLE_COVERAGE=ON
-cmake --build build --parallel && ctest --test-dir build
+cmake --build build --parallel "$(nproc)" && ctest --test-dir build
 gcovr --root . --filter '^include/sofab/.*\.hpp$' --object-directory build --print-summary
 
 # Doxygen HTML (needs doxygen + graphviz)
@@ -380,7 +384,7 @@ are directly comparable across languages:
 
 ```sh
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
-cmake --build build --parallel
+cmake --build build --parallel "$(nproc)"
 cmake --build build --target run_perf    # per-op cost (cycles/op + MB/s)
 cmake --build build --target run_bench   # sustained throughput (MB/s)
 ```

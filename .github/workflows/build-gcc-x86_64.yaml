@@ -27,7 +27,7 @@ jobs:
             -DCMAKE_CXX_COMPILER=g++
 
       - name: Build project
-        run: cmake --build build --parallel
+        run: cmake --build build --parallel "$(nproc)"
 
       - name: Run tests
         working-directory: build
@@ -43,7 +43,7 @@ jobs:
             -DCMAKE_CXX_FLAGS="-DSOFAB_STRICT_UTF8=0"
 
       - name: Build project (strict UTF-8 OFF)
-        run: cmake --build build-utf8-off --parallel
+        run: cmake --build build-utf8-off --parallel "$(nproc)"
 
       - name: Run tests (strict UTF-8 OFF)
         working-directory: build-utf8-off
