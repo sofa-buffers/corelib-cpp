@@ -166,31 +166,40 @@ namespace sofab
     /* wire-format primitives                                                 */
     /* ---------------------------------------------------------------------- */
 
+    /// @brief Wire type stored in the low 3 bits of every field header.
+    ///
+    /// Part of the public API: returned by @ref IStreamImpl::wire so a deliver
+    /// callback can honour the @ref IStreamImpl::read precondition (§7.3) —
+    /// compare against the wire type its declared field maps to and skip on a
+    /// mismatch.
+    enum class Wire : uint8_t
+    {
+        Unsigned = 0,      ///< Unsigned integer encoded as a varint.
+        Signed = 1,        ///< Signed integer, zig-zag encoded as a varint.
+        Fixlen = 2,        ///< Length-prefixed payload (float, string or blob).
+        ArrayUnsigned = 3, ///< Count-prefixed array of unsigned varints.
+        ArraySigned = 4,   ///< Count-prefixed array of zig-zag varints.
+        ArrayFixlen = 5,   ///< Count-prefixed array of fixed-size elements.
+        SequenceStart = 6, ///< Opens a nested sub-message.
+        SequenceEnd = 7,   ///< Closes the most recently opened sub-message.
+    };
+
+    /// @brief Sub-type of a length-prefixed (`Fixlen`) payload, stored in the low 3 bits of its length word.
+    ///
+    /// Part of the public API: returned by @ref IStreamImpl::fixType. §7.3 bounds
+    /// the type check at wire type *plus* this subtype, since `fp32`/`fp64`/
+    /// `string`/`blob` all share the @ref Wire::Fixlen wire type.
+    enum class Fix : uint8_t
+    {
+        Fp32 = 0,   ///< 32-bit IEEE-754 float.
+        Fp64 = 1,   ///< 64-bit IEEE-754 double.
+        String = 2, ///< UTF-8 text.
+        Blob = 3,   ///< Opaque byte string.
+    };
+
     /// Implementation details of the wire format; not part of the public API.
     namespace detail
     {
-        /// Wire type stored in the low 3 bits of every field header.
-        enum class Wire : uint8_t
-        {
-            Unsigned = 0,      ///< Unsigned integer encoded as a varint.
-            Signed = 1,        ///< Signed integer, zig-zag encoded as a varint.
-            Fixlen = 2,        ///< Length-prefixed payload (float, string or blob).
-            ArrayUnsigned = 3, ///< Count-prefixed array of unsigned varints.
-            ArraySigned = 4,   ///< Count-prefixed array of zig-zag varints.
-            ArrayFixlen = 5,   ///< Count-prefixed array of fixed-size elements.
-            SequenceStart = 6, ///< Opens a nested sub-message.
-            SequenceEnd = 7,   ///< Closes the most recently opened sub-message.
-        };
-
-        /// Sub-type of a length-prefixed (`Fixlen`) payload, stored in the low 3 bits of its length word.
-        enum class Fix : uint8_t
-        {
-            Fp32 = 0,   ///< 32-bit IEEE-754 float.
-            Fp64 = 1,   ///< 64-bit IEEE-754 double.
-            String = 2, ///< UTF-8 text.
-            Blob = 3,   ///< Opaque byte string.
-        };
-
         /// Largest permitted field id (`INT32_MAX`); larger ids are rejected with @ref Error::InvalidArgument.
         inline constexpr uint32_t kIdMax = 0x7fffffffu; /* INT32_MAX */
 
@@ -461,7 +470,7 @@ namespace sofab
          * @return @ref Error::InvalidArgument if @p fieldId is too large,
          *         @ref Error::BufferFull on overflow, otherwise @ref Error::None.
          */
-        [[nodiscard]] Error putHeader(sofab::id fieldId, detail::Wire type) noexcept
+        [[nodiscard]] Error putHeader(sofab::id fieldId, Wire type) noexcept
         {
             if (fieldId > detail::kIdMax) return Error::InvalidArgument;
             return putVarint((static_cast<uint64_t>(fieldId) << 3) | static_cast<uint64_t>(type));
@@ -470,12 +479,12 @@ namespace sofab
         /**
          * @brief Write a scalar field: header varint plus one value varint, in a single bulk write.
          * @param fieldId Field identifier; must not exceed @ref detail::kIdMax.
-         * @param type Wire type (@ref detail::Wire::Unsigned or @ref detail::Wire::Signed).
+         * @param type Wire type (@ref Wire::Unsigned or @ref Wire::Signed).
          * @param value Already-encoded scalar value (zig-zagged for signed fields).
          * @return @ref Error::InvalidArgument if @p fieldId is too large,
          *         @ref Error::BufferFull on overflow, otherwise @ref Error::None.
          */
-        [[nodiscard]] Error writeScalar(sofab::id fieldId, detail::Wire type, uint64_t value) noexcept
+        [[nodiscard]] Error writeScalar(sofab::id fieldId, Wire type, uint64_t value) noexcept
         {
             if (fieldId > detail::kIdMax) return Error::InvalidArgument;
             uint8_t tmp[20];
@@ -487,17 +496,17 @@ namespace sofab
         /**
          * @brief Write a length-prefixed field (string, blob or other fixlen payload).
          * @param fieldId Field identifier; must not exceed @ref detail::kIdMax.
-         * @param ft Payload sub-type (@ref detail::Fix::String, @ref detail::Fix::Blob, ...).
+         * @param ft Payload sub-type (@ref Fix::String, @ref Fix::Blob, ...).
          * @param data Payload bytes.
          * @param len Payload length in bytes.
          * @return @ref Error::InvalidArgument if @p fieldId is too large,
          *         @ref Error::BufferFull on overflow, otherwise @ref Error::None.
          */
-        [[nodiscard]] Error writeFixlen(sofab::id fieldId, detail::Fix ft, const uint8_t *data, size_t len) noexcept
+        [[nodiscard]] Error writeFixlen(sofab::id fieldId, Fix ft, const uint8_t *data, size_t len) noexcept
         {
             if (fieldId > detail::kIdMax) return Error::InvalidArgument;
             uint8_t tmp[20];
-            size_t n = encodeVarint(tmp, (static_cast<uint64_t>(fieldId) << 3) | static_cast<uint64_t>(detail::Wire::Fixlen));
+            size_t n = encodeVarint(tmp, (static_cast<uint64_t>(fieldId) << 3) | static_cast<uint64_t>(Wire::Fixlen));
             n += encodeVarint(tmp + n, (static_cast<uint64_t>(len) << 3) | static_cast<uint64_t>(ft));
             if (Error e = pushBytes(tmp, n); e != Error::None) return e;
             return pushBytes(data, len);
@@ -514,11 +523,11 @@ namespace sofab
         template <std::floating_point F>
         [[nodiscard]] Error writeFloatScalar(sofab::id fieldId, F value) noexcept
         {
-            constexpr detail::Fix ft = (sizeof(F) == 4) ? detail::Fix::Fp32 : detail::Fix::Fp64;
+            constexpr Fix ft = (sizeof(F) == 4) ? Fix::Fp32 : Fix::Fp64;
             if (fieldId > detail::kIdMax) return Error::InvalidArgument;
             auto bits = detail::floatBits(value);
             uint8_t tmp[20];
-            size_t n = encodeVarint(tmp, (static_cast<uint64_t>(fieldId) << 3) | static_cast<uint64_t>(detail::Wire::Fixlen));
+            size_t n = encodeVarint(tmp, (static_cast<uint64_t>(fieldId) << 3) | static_cast<uint64_t>(Wire::Fixlen));
             n += encodeVarint(tmp + n, (static_cast<uint64_t>(sizeof(F)) << 3) | static_cast<uint64_t>(ft));
             for (size_t i = 0; i < sizeof(F); ++i) tmp[n++] = static_cast<uint8_t>((bits >> (8 * i)) & 0xff);
             return pushBytes(tmp, n);
@@ -543,7 +552,7 @@ namespace sofab
             if (fieldId > detail::kIdMax) return Error::InvalidArgument;
             uint8_t hdr[20];
             size_t hn = encodeVarint(hdr, (static_cast<uint64_t>(fieldId) << 3) |
-                        static_cast<uint64_t>(isSigned ? detail::Wire::ArraySigned : detail::Wire::ArrayUnsigned));
+                        static_cast<uint64_t>(isSigned ? Wire::ArraySigned : Wire::ArrayUnsigned));
             hn += encodeVarint(hdr + hn, elems.size());
             if (Error e = pushBytes(hdr, hn); e != Error::None) return e;
             for (E v : elems)
@@ -571,10 +580,10 @@ namespace sofab
         template <std::floating_point F>
         [[nodiscard]] Error writeFloatArray(sofab::id fieldId, std::span<const F> elems) noexcept
         {
-            constexpr detail::Fix ft = (sizeof(F) == 4) ? detail::Fix::Fp32 : detail::Fix::Fp64;
+            constexpr Fix ft = (sizeof(F) == 4) ? Fix::Fp32 : Fix::Fp64;
             if (fieldId > detail::kIdMax) return Error::InvalidArgument;
             uint8_t hdr[20];
-            size_t hn = encodeVarint(hdr, (static_cast<uint64_t>(fieldId) << 3) | static_cast<uint64_t>(detail::Wire::ArrayFixlen));
+            size_t hn = encodeVarint(hdr, (static_cast<uint64_t>(fieldId) << 3) | static_cast<uint64_t>(Wire::ArrayFixlen));
             hn += encodeVarint(hdr + hn, elems.size());
             /* §4.8: a fixlen array always carries its fixlen_word, even when empty
              * (count == 0), so an empty fp32 and fp64 array stay distinguishable. */
@@ -721,13 +730,13 @@ namespace sofab
             if constexpr (std::is_integral_v<T> && !std::is_same_v<T, bool>)
             {
                 if constexpr (std::is_unsigned_v<T>)
-                    err = writeScalar(fieldId, detail::Wire::Unsigned, static_cast<uint64_t>(value));
+                    err = writeScalar(fieldId, Wire::Unsigned, static_cast<uint64_t>(value));
                 else
-                    err = writeScalar(fieldId, detail::Wire::Signed, detail::zigzagEncode(static_cast<int64_t>(value)));
+                    err = writeScalar(fieldId, Wire::Signed, detail::zigzagEncode(static_cast<int64_t>(value)));
             }
             else if constexpr (std::is_same_v<T, bool>)
             {
-                err = writeScalar(fieldId, detail::Wire::Unsigned, value ? 1u : 0u);
+                err = writeScalar(fieldId, Wire::Unsigned, value ? 1u : 0u);
             }
             else if constexpr (std::is_same_v<T, float>)  { err = writeFloatScalar(fieldId, value); }
             else if constexpr (std::is_same_v<T, double>) { err = writeFloatScalar(fieldId, value); }
@@ -743,7 +752,7 @@ namespace sofab
                     err = Error::InvalidArgument;
                 else
 #endif
-                    err = writeFixlen(fieldId, detail::Fix::String,
+                    err = writeFixlen(fieldId, Fix::String,
                                       reinterpret_cast<const uint8_t *>(sv.data()), sv.size());
             }
             else if constexpr (std::is_base_of_v<OStreamMessage, T>)
@@ -780,7 +789,7 @@ namespace sofab
          */
         Result write(sofab::id fieldId, const void *value, int32_t size) noexcept
         {
-            return Result{*this, writeFixlen(fieldId, detail::Fix::Blob,
+            return Result{*this, writeFixlen(fieldId, Fix::Blob,
                           static_cast<const uint8_t *>(value), static_cast<size_t>(size))};
         }
 
@@ -812,7 +821,7 @@ namespace sofab
             /* §4.9/§6.2: never open more than MAX_DEPTH nested sequences. */
             if (seqDepth_ >= static_cast<size_t>(MAX_DEPTH))
                 return Result{*this, Error::InvalidArgument};
-            Result r{*this, putHeader(fieldId, detail::Wire::SequenceStart)};
+            Result r{*this, putHeader(fieldId, Wire::SequenceStart)};
             if (r.ok()) ++seqDepth_;
             return r;
         }
@@ -823,7 +832,7 @@ namespace sofab
         Result sequenceEnd() noexcept
         {
             if (seqDepth_ > 0) --seqDepth_;
-            return Result{*this, putHeader(0, detail::Wire::SequenceEnd)};
+            return Result{*this, putHeader(0, Wire::SequenceEnd)};
         }
     };
 
@@ -1071,8 +1080,8 @@ namespace sofab
         /* cursor + current-field metadata, valid during a deliver callback */
         const uint8_t *p_ = nullptr;   ///< Read cursor.
         const uint8_t *end_ = nullptr; ///< One past the last readable byte.
-        detail::Wire type_{};          ///< Wire type of the field being delivered.
-        detail::Fix fixType_{};        ///< Sub-type of the current fixlen field.
+        Wire type_{};          ///< Wire type of the field being delivered.
+        Fix fixType_{};        ///< Sub-type of the current fixlen field.
         size_t fixLen_ = 0;            ///< Payload length (fixlen) or element size (fixlen array), in bytes.
         size_t count_ = 0;             ///< Element count of the current array field.
         bool consumed_ = false;        ///< Set once the callback has read the current field's value.
@@ -1162,12 +1171,12 @@ namespace sofab
         static bool fixlenWordValid(uint64_t word) noexcept
         {
             uint64_t len = word >> 3;
-            switch (static_cast<detail::Fix>(word & 0x7))
+            switch (static_cast<Fix>(word & 0x7))
             {
-                case detail::Fix::Fp32:   return len == 4;
-                case detail::Fix::Fp64:   return len == 8;
-                case detail::Fix::String:
-                case detail::Fix::Blob:   return len <= FIXLEN_MAX;
+                case Fix::Fp32:   return len == 4;
+                case Fix::Fp64:   return len == 8;
+                case Fix::String:
+                case Fix::Blob:   return len <= FIXLEN_MAX;
                 default:                  return false; /* reserved subtype (§4.6) */
             }
         }
@@ -1186,10 +1195,10 @@ namespace sofab
         static bool arrayFixlenWordValid(uint64_t word) noexcept
         {
             uint64_t esize = word >> 3;
-            switch (static_cast<detail::Fix>(word & 0x7))
+            switch (static_cast<Fix>(word & 0x7))
             {
-                case detail::Fix::Fp32: return esize == 4;
-                case detail::Fix::Fp64: return esize == 8;
+                case Fix::Fp32: return esize == 4;
+                case Fix::Fp64: return esize == 8;
                 default:                return false; /* string/blob/reserved (§4.8) */
             }
         }
@@ -1302,13 +1311,13 @@ namespace sofab
                 if (exceedsBuffer(static_cast<size_t>(p - fieldStart), 0)) { limitExceeded_ = true; return false; }
             uint64_t header;
             if (!measureVarint(p, end, header)) return false;
-            auto type = static_cast<detail::Wire>(header & 0x7);
+            auto type = static_cast<Wire>(header & 0x7);
             switch (type)
             {
-                case detail::Wire::Unsigned:
-                case detail::Wire::Signed:
+                case Wire::Unsigned:
+                case Wire::Signed:
                     return measureSkipVarint(p, end);
-                case detail::Wire::Fixlen:
+                case Wire::Fixlen:
                 {
                     uint64_t sub; if (!measureVarint(p, end, sub)) return false;
                     /* §4.6/§7: a bad subtype or an fp length that isn't 4/8 is
@@ -1322,8 +1331,8 @@ namespace sofab
                     if (static_cast<size_t>(end - p) < len) return false;
                     p += len; return true;
                 }
-                case detail::Wire::ArrayUnsigned:
-                case detail::Wire::ArraySigned:
+                case Wire::ArrayUnsigned:
+                case Wire::ArraySigned:
                 {
                     uint64_t n; if (!measureVarint(p, end, n)) return false;
                     /* §6.2/§7: a count above ARRAY_MAX is INVALID (and guards the
@@ -1336,7 +1345,7 @@ namespace sofab
                     for (uint64_t i = 0; i < n; ++i) if (!measureSkipVarint(p, end)) return false;
                     return true;
                 }
-                case detail::Wire::ArrayFixlen:
+                case Wire::ArrayFixlen:
                 {
                     uint64_t n; if (!measureVarint(p, end, n)) return false;
                     if (n > ARRAY_MAX) { error_ = true; return false; } /* §6.2/§7 */
@@ -1351,7 +1360,7 @@ namespace sofab
                     if (static_cast<uint64_t>(end - p) < bytes) return false;
                     p += static_cast<size_t>(bytes); return true;
                 }
-                case detail::Wire::SequenceStart:
+                case Wire::SequenceStart:
                 {
                     /* §4.9: reject nesting past MAX_DEPTH instead of recursing unbounded. */
                     if (depth + 1 > MAX_DEPTH) { error_ = true; return false; }
@@ -1366,13 +1375,13 @@ namespace sofab
                         uint64_t peek;
                         const uint8_t *q = p;
                         if (!measureVarint(q, end, peek)) return false;
-                        if (static_cast<detail::Wire>(peek & 0x7) == detail::Wire::SequenceEnd)
+                        if (static_cast<Wire>(peek & 0x7) == Wire::SequenceEnd)
                         { p = q; return true; }
                         p = save;
                         if (!measureField<Capped>(p, end, fieldStart, depth + 1)) return false;
                     }
                 }
-                case detail::Wire::SequenceEnd:
+                case Wire::SequenceEnd:
                     /* §7: a sequence-end marker with no open sequence is INVALID.
                      * A properly-nested end is consumed by its parent's peek loop
                      * above, so reaching here means a dangling end at this level. */
@@ -1389,7 +1398,7 @@ namespace sofab
          * callback does not @ref read is skipped automatically.
          *
          * @param cb Callback invoked as `(fieldId, size, count)` per field.
-         * @param stopAtEnd If `true`, return at a @ref detail::Wire::SequenceEnd
+         * @param stopAtEnd If `true`, return at a @ref Wire::SequenceEnd
          *        marker (nested level); if `false`, such a marker is a decode error.
          */
         void dispatchLevel(const std::function<void(sofab::id, size_t, size_t)> &cb, bool stopAtEnd) noexcept
@@ -1399,9 +1408,9 @@ namespace sofab
                 uint64_t header;
                 if (!getVarint(p_, end_, header)) { error_ = true; return; }
                 auto fieldId = static_cast<sofab::id>(header >> 3);
-                type_ = static_cast<detail::Wire>(header & 0x7);
+                type_ = static_cast<Wire>(header & 0x7);
 
-                if (type_ == detail::Wire::SequenceEnd)
+                if (type_ == Wire::SequenceEnd)
                 {
                     if (stopAtEnd) return;
                     error_ = true; return;
@@ -1409,25 +1418,25 @@ namespace sofab
 
                 /* parse the metadata that precedes the payload */
                 fixLen_ = 0; count_ = 0;
-                if (type_ == detail::Wire::Fixlen)
+                if (type_ == Wire::Fixlen)
                 {
                     uint64_t sub; if (!getVarint(p_, end_, sub)) { error_ = true; return; }
                     fixLen_ = static_cast<size_t>(sub >> 3);
-                    fixType_ = static_cast<detail::Fix>(sub & 0x7);
+                    fixType_ = static_cast<Fix>(sub & 0x7);
                 }
-                else if (type_ == detail::Wire::ArrayUnsigned || type_ == detail::Wire::ArraySigned)
+                else if (type_ == Wire::ArrayUnsigned || type_ == Wire::ArraySigned)
                 {
                     uint64_t n; if (!getVarint(p_, end_, n)) { error_ = true; return; }
                     count_ = static_cast<size_t>(n);
                 }
-                else if (type_ == detail::Wire::ArrayFixlen)
+                else if (type_ == Wire::ArrayFixlen)
                 {
                     uint64_t n; if (!getVarint(p_, end_, n)) { error_ = true; return; }
                     count_ = static_cast<size_t>(n);
                     /* §4.8: the fixlen_word is always present, even for an empty array. */
                     uint64_t sub; if (!getVarint(p_, end_, sub)) { error_ = true; return; }
                     fixLen_ = static_cast<size_t>(sub >> 3); /* element size */
-                    fixType_ = static_cast<detail::Fix>(sub & 0x7);
+                    fixType_ = static_cast<Fix>(sub & 0x7);
                 }
 
                 consumed_ = false;
@@ -1452,32 +1461,32 @@ namespace sofab
         {
             switch (type_)
             {
-                case detail::Wire::Unsigned:
-                case detail::Wire::Signed:
+                case Wire::Unsigned:
+                case Wire::Signed:
                     if (!skipVarint(p_, end_)) error_ = true;
                     break;
-                case detail::Wire::Fixlen:
+                case Wire::Fixlen:
                     if (static_cast<size_t>(end_ - p_) < fixLen_) { error_ = true; break; }
                     p_ += fixLen_;
                     break;
-                case detail::Wire::ArrayUnsigned:
-                case detail::Wire::ArraySigned:
+                case Wire::ArrayUnsigned:
+                case Wire::ArraySigned:
                     for (size_t i = 0; i < count_; ++i) if (!skipVarint(p_, end_)) { error_ = true; break; }
                     break;
-                case detail::Wire::ArrayFixlen:
+                case Wire::ArrayFixlen:
                 {
                     size_t bytes = count_ * fixLen_;
                     if (static_cast<size_t>(end_ - p_) < bytes) { error_ = true; break; }
                     p_ += bytes;
                     break;
                 }
-                case detail::Wire::SequenceStart:
+                case Wire::SequenceStart:
                     if (seqDepth_ >= MAX_DEPTH) { error_ = true; break; } /* §4.9 */
                     ++seqDepth_;
                     dispatchLevel([](sofab::id, size_t, size_t) {}, /*stopAtEnd*/ true);
                     --seqDepth_;
                     break;
-                case detail::Wire::SequenceEnd:
+                case Wire::SequenceEnd:
                     break;
             }
         }
@@ -1666,7 +1675,7 @@ namespace sofab
                  * cross-chunk split stays INCOMPLETE and only a truncated-at-end
                  * or malformed payload reaches this check. `blob` is never
                  * validated; a skipped field never reaches read(). */
-                if (fixType_ == detail::Fix::String &&
+                if (fixType_ == Fix::String &&
                     !detail::utf8Valid(reinterpret_cast<const char *>(p_), fixLen_))
                 { error_ = true; return; }
 #endif
@@ -1682,7 +1691,7 @@ namespace sofab
                  * the std::string_view branch above for the full rationale).
                  * Gated on the wire subtype so a `blob` read into a std::string
                  * is never validated. */
-                if (fixType_ == detail::Fix::String &&
+                if (fixType_ == Fix::String &&
                     !detail::utf8Valid(reinterpret_cast<const char *>(p_), fixLen_))
                 { error_ = true; return; }
 #endif
@@ -1763,6 +1772,31 @@ namespace sofab
             return n;
         }
 
+        /**
+         * @brief Wire type of the field currently being delivered.
+         *
+         * Valid inside a deliver callback. Lets a caller honour the @ref read
+         * precondition (§7.3): compare against the wire type its declared field
+         * maps to and, on a mismatch, simply return without calling @ref read —
+         * the field is then skipped automatically. Reads no bytes and does not
+         * consume the field.
+         *
+         * @return The delivered field's @ref Wire.
+         */
+        [[nodiscard]] Wire wire() const noexcept { return type_; }
+
+        /**
+         * @brief Fixlen sub-type of the field currently being delivered.
+         *
+         * Only meaningful when @ref wire is @ref Wire::Fixlen or
+         * @ref Wire::ArrayFixlen; §7.3 bounds the type check at wire type
+         * *plus* this subtype, since `fp32`/`fp64`/`string`/`blob` share the
+         * fixlen wire type. Reads no bytes and does not consume the field.
+         *
+         * @return The delivered field's @ref Fix.
+         */
+        [[nodiscard]] Fix fixType() const noexcept { return fixType_; }
+
     private:
         /**
          * @brief Decode the field at the cursor, set its metadata and deliver it to @p cb.
@@ -1776,26 +1810,26 @@ namespace sofab
             uint64_t header;
             if (!getVarint(p_, end_, header)) { error_ = true; return; }
             auto fieldId = static_cast<sofab::id>(header >> 3);
-            type_ = static_cast<detail::Wire>(header & 0x7);
+            type_ = static_cast<Wire>(header & 0x7);
 
             fixLen_ = 0; count_ = 0;
-            if (type_ == detail::Wire::Fixlen)
+            if (type_ == Wire::Fixlen)
             {
                 uint64_t sub; if (!getVarint(p_, end_, sub)) { error_ = true; return; }
-                fixLen_ = static_cast<size_t>(sub >> 3); fixType_ = static_cast<detail::Fix>(sub & 0x7);
+                fixLen_ = static_cast<size_t>(sub >> 3); fixType_ = static_cast<Fix>(sub & 0x7);
             }
-            else if (type_ == detail::Wire::ArrayUnsigned || type_ == detail::Wire::ArraySigned)
+            else if (type_ == Wire::ArrayUnsigned || type_ == Wire::ArraySigned)
             {
                 uint64_t n; if (!getVarint(p_, end_, n)) { error_ = true; return; }
                 count_ = static_cast<size_t>(n);
             }
-            else if (type_ == detail::Wire::ArrayFixlen)
+            else if (type_ == Wire::ArrayFixlen)
             {
                 uint64_t n; if (!getVarint(p_, end_, n)) { error_ = true; return; }
                 count_ = static_cast<size_t>(n);
                 /* §4.8: the fixlen_word is always present, even for an empty array. */
                 uint64_t sub; if (!getVarint(p_, end_, sub)) { error_ = true; return; }
-                fixLen_ = static_cast<size_t>(sub >> 3); fixType_ = static_cast<detail::Fix>(sub & 0x7);
+                fixLen_ = static_cast<size_t>(sub >> 3); fixType_ = static_cast<Fix>(sub & 0x7);
             }
 
             consumed_ = false;
