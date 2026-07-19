@@ -32,7 +32,8 @@ fi
 if [ ! -x "$BIN" ]; then
     echo ">> building bench (-O3) ..." >&2
     cmake -S "$ROOT" -B "$BUILD" -DCMAKE_BUILD_TYPE=Release >/dev/null
-    cmake --build "$BUILD" --target bench >/dev/null
+    # Explicit job count: bare `--parallel` means an unlimited `make -j`.
+    cmake --build "$BUILD" --parallel "$(nproc)" --target bench >/dev/null
 fi
 
 OUT="$(mktemp -d)"
