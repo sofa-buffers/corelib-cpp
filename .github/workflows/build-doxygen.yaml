@@ -18,7 +18,7 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  build-documentation:
+  build:
     runs-on: ubuntu-latest
 
     steps:
@@ -47,7 +47,7 @@ jobs:
   # Publish only on pushes to main; pull requests just build the docs above to
   # verify they compile, without overwriting the live site.
   deploy:
-    needs: build-documentation
+    needs: build
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
 
