@@ -1,4 +1,4 @@
-name: GCC x86_64
+name: "Build: x86_64 (GCC)"
 
 on:
   push:

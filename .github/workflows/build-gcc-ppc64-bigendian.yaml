@@ -1,4 +1,4 @@
-name: GCC ppc64be
+name: "Build: PowerPC 64 (big endian)"
 
 # The wire format is little-endian. On a big-endian host the float encode/decode
 # paths take the byte-swapping `else` branch that x86_64 CI never reaches, so we
