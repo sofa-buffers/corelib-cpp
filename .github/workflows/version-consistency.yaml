@@ -1,4 +1,4 @@
-name: "Version consistency"
+name: Version consistency
 
 # The git tag is the source of truth for the version: every package manifest
 # and the CMake project() version must match it. Each config is checked in its
@@ -11,7 +11,7 @@ on:
     branches: [ main ]
 
 jobs:
-  check-versions:
+  check:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
