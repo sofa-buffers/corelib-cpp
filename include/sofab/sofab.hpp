@@ -998,6 +998,61 @@ namespace sofab
     };
 
     /* ---------------------------------------------------------------------- */
+    /* Measure-phase schema descriptors (§5.2 anti-folding, generator#216)     */
+    /* ---------------------------------------------------------------------- */
+
+    /**
+     * @brief Static per-message schema descriptors consulted during the
+     *        completeness measure walk (@ref IStreamImpl::measureField).
+     *
+     * corelib is a *measure-then-deliver* decoder: @ref IStreamImpl::feed
+     * measures a whole top-level field for completeness before delivering it to
+     * the generated `deserialize`, where the schema bound checks live. A field
+     * that is *both* over-bound (over-`count` / over-`maxlen` / over-index) and
+     * truncated therefore never reaches those checks and would be reported
+     * INCOMPLETE, where MESSAGE_SPEC §5.2 requires INVALID to dominate ("more
+     * bytes could never make it valid" — anti-folding). These descriptors let the
+     * measure walk reject at the deciding word (count varint / fixlen length word
+     * / element header) before truncation is surfaced.
+     *
+     * The tree is a compile-time constant the generator emits per message
+     * (sofa-buffers/generator#216) and installs with @ref IStreamImpl::setSchema.
+     * When no schema is installed the decoder never touches this type: the
+     * maxspeed measure walk is a distinct template instantiation carrying no
+     * schema code at all, byte-for-byte the pre-schema decoder.
+     */
+    namespace schema
+    {
+        struct SeqNode;
+
+        /// One field's schema bound at a given sequence level.
+        struct FieldBound
+        {
+            uint32_t       id;           ///< Field id this bound applies to.
+            sofab::Wire    wire;         ///< Expected wire type; the bound is enforced only on an exact match.
+            uint64_t       bound;        ///< count `N` (array) or maxlen `L` (string/blob); `0` = unbounded.
+            const SeqNode *child;        ///< Non-null for a nested struct/union/wrapper-array: the next level.
+            bool           wrapperArray; ///< `true` when an element's id IS its index → enforce over-INDEX, not over-count.
+        };
+
+        /// The bounded fields visible at one sequence level; looked up by field id.
+        struct SeqNode
+        {
+            const FieldBound *fields; ///< Bounded fields at this level (unlisted ids carry no bound).
+            uint32_t          n;      ///< Number of entries in @ref fields.
+
+            /// @return The bound for @p id, or `nullptr` when the id is unlisted
+            ///         (skipped/unknown field, §7.3 — no bound applies).
+            constexpr const FieldBound *find(uint32_t id) const noexcept
+            {
+                for (uint32_t i = 0; i < n; ++i)
+                    if (fields[i].id == id) return &fields[i];
+                return nullptr;
+            }
+        };
+    } // namespace schema
+
+    /* ---------------------------------------------------------------------- */
     /* IStream — protobuf-style cursor decoder                                */
     /* ---------------------------------------------------------------------- */
 
@@ -1091,6 +1146,9 @@ namespace sofab
 
         /// Cap on the reassembly buffer's growth for one incomplete field (@ref Limits::max_buffered_field).
         size_t maxBufferedField_ = SIZE_MAX;
+
+        /// Optional measure-phase schema for §5.2 bound enforcement; `nullptr` = none installed (@ref setSchema).
+        const schema::SeqNode *schema_ = nullptr;
 
         std::function<void(sofab::id, size_t, size_t)> topCallback_; ///< Delivers each top-level field.
 
@@ -1300,9 +1358,10 @@ namespace sofab
          * the whole `fieldStart` bookkeeping — the uncapped measure walk is then
          * byte-for-byte the pre-cap decoder. `measureField<true>` keeps the full
          * policy enforcement for streams constructed with a @ref Limits cap. */
-        template <bool Capped>
+        template <bool Capped, bool Schema = false>
         bool measureField(const uint8_t *&p, const uint8_t *end,
-                          const uint8_t *fieldStart, int depth = 0) noexcept
+                          const uint8_t *fieldStart,
+                          const schema::SeqNode *node = nullptr, int depth = 0) noexcept
         {
             /* Policy cap (issue #26): once the bytes already spanned by this single
              * top-level field exceed the reassembly-buffer limit, stop — before the
@@ -1312,6 +1371,12 @@ namespace sofab
             uint64_t header;
             if (!measureVarint(p, end, header)) return false;
             auto type = static_cast<Wire>(header & 0x7);
+            /* §5.2: consult the installed schema (if any) at the field's deciding
+             * word, so an over-bound field is rejected before truncation is
+             * surfaced. Compiled out entirely of the schema-free (maxspeed) walk. */
+            const schema::FieldBound *fb = nullptr;
+            if constexpr (Schema)
+                if (node) fb = node->find(static_cast<uint32_t>(header >> 3));
             switch (type)
             {
                 case Wire::Unsigned:
@@ -1324,6 +1389,10 @@ namespace sofab
                      * INVALID regardless of what follows — not a truncated field. */
                     if (!fixlenWordValid(sub)) { error_ = true; return false; }
                     size_t len = static_cast<size_t>(sub >> 3);
+                    /* §7.1/§5.2: a length past the schema `maxlen` is INVALID even when
+                     * the promised payload never arrives (anti-folding). */
+                    if constexpr (Schema)
+                        if (fb && fb->wire == Wire::Fixlen && fb->bound && len > fb->bound) { error_ = true; return false; }
                     /* #26: the declared payload size is known now — reject an oversize
                      * claim before waiting for (or buffering) the bytes it promises. */
                     if constexpr (Capped)
@@ -1338,6 +1407,10 @@ namespace sofab
                     /* §6.2/§7: a count above ARRAY_MAX is INVALID (and guards the
                      * skip loop below from a malformed, unbounded element count). */
                     if (n > ARRAY_MAX) { error_ = true; return false; }
+                    /* §6.2/§7/§5.2: a count past the schema `count` is INVALID even when
+                     * the elements are truncated (anti-folding). */
+                    if constexpr (Schema)
+                        if (fb && fb->wire == type && fb->bound && n > fb->bound) { error_ = true; return false; }
                     /* #26: each element is at least one byte, so `n` is a lower bound
                      * on the payload — a count past the cap can never fit. */
                     if constexpr (Capped)
@@ -1349,6 +1422,9 @@ namespace sofab
                 {
                     uint64_t n; if (!measureVarint(p, end, n)) return false;
                     if (n > ARRAY_MAX) { error_ = true; return false; } /* §6.2/§7 */
+                    /* §6.2/§7/§5.2: over the schema `count` is INVALID even if truncated. */
+                    if constexpr (Schema)
+                        if (fb && fb->wire == Wire::ArrayFixlen && fb->bound && n > fb->bound) { error_ = true; return false; }
                     /* §4.8: the fixlen_word is always present, even for a zero-count array. */
                     uint64_t sub; if (!measureVarint(p, end, sub)) return false;
                     if (!arrayFixlenWordValid(sub)) { error_ = true; return false; } /* §4.8/§7 */
@@ -1377,8 +1453,18 @@ namespace sofab
                         if (!measureVarint(q, end, peek)) return false;
                         if (static_cast<Wire>(peek & 0x7) == Wire::SequenceEnd)
                         { p = q; return true; }
+                        /* §5.1/§7/§5.2: in a wrapper-array the element id IS its index;
+                         * an index past `count` is INVALID even if the sequence is cut
+                         * before its SequenceEnd (anti-folding). Then descend into the
+                         * element/struct level with its own bounds. */
+                        const schema::SeqNode *childNode = nullptr;
+                        if constexpr (Schema)
+                        {
+                            if (fb && fb->wrapperArray && (peek >> 3) >= fb->bound) { error_ = true; return false; }
+                            childNode = fb ? fb->child : nullptr;
+                        }
                         p = save;
-                        if (!measureField<Capped>(p, end, fieldStart, depth + 1)) return false;
+                        if (!measureField<Capped, Schema>(p, end, fieldStart, childNode, depth + 1)) return false;
                     }
                 }
                 case Wire::SequenceEnd:
@@ -1587,6 +1673,24 @@ namespace sofab
          */
         void exceedLimit() noexcept { limitExceeded_ = true; }
 
+        /**
+         * @brief Install a measure-phase schema for §5.2 bound enforcement.
+         *
+         * With a schema installed, @ref measureField rejects an over-`count` /
+         * over-`maxlen` / over-index field at its deciding word (count varint /
+         * fixlen length word / element header) — so a field that is *both*
+         * over-bound and truncated is reported INVALID (dominating INCOMPLETE,
+         * §5.2 anti-folding) instead of waiting for bytes that could never make it
+         * valid. The @ref schema::SeqNode tree is a compile-time constant the
+         * generated code emits per message (sofa-buffers/generator#216).
+         *
+         * Purely additive: with no schema installed (the default) the measure walk
+         * is a distinct, schema-free template instantiation and pays nothing.
+         *
+         * @param root Top-level message descriptor, or `nullptr` to clear.
+         */
+        void setSchema(const schema::SeqNode *root) noexcept { schema_ = root; }
+
     protected:
         /**
          * @brief Deliver every complete top-level field in `[p, end)`.
@@ -1601,11 +1705,20 @@ namespace sofab
              * (the default) carries no #26 cap code at all, so the common decode path
              * pays nothing for a feature it isn't using. */
             const bool capped = maxBufferedField_ != SIZE_MAX;
+            const schema::SeqNode *root = schema_;
             while (p < end)
             {
                 const uint8_t *probe = p;
-                if (!(capped ? measureField<true>(probe, end, /*fieldStart=*/p)
-                             : measureField<false>(probe, end, /*fieldStart=*/p)))
+                /* Four measure-walk instantiations, selected at runtime: the
+                 * schema-free pair (root == nullptr) carries no §5.2 code and is the
+                 * maxspeed path — the uncapped, schema-free walk is byte-for-byte the
+                 * pre-schema decoder. */
+                const bool measured = root
+                    ? (capped ? measureField<true,  true >(probe, end, /*fieldStart=*/p, root)
+                              : measureField<false, true >(probe, end, /*fieldStart=*/p, root))
+                    : (capped ? measureField<true,  false>(probe, end, /*fieldStart=*/p)
+                              : measureField<false, false>(probe, end, /*fieldStart=*/p));
+                if (!measured)
                 {
                     if (limitExceeded_) return p; /* #26: field over the buffering cap (policy) */
                     if (error_) return p;         /* malformed (e.g. nesting past MAX_DEPTH) */
