@@ -391,6 +391,15 @@ static void malformedInput()
         CHECK(r.code() == sofab::Error::InvalidMessage, "malformed: array count above ARRAY_MAX rejected");
     }
 
+    /* A field id above ID_MAX (2^31-1) is INVALID (§6.2) — the decoder must
+     * reject it, not treat it as an unknown id and skip it (issue #47 / F-0028). */
+    {
+        const uint8_t bytes[] = {0x80, 0x80, 0x80, 0x80, 0x40, 0x05}; /* id = 2^31, unsigned, value 5 */
+        sofab::IStreamObject<ScalarMsg> in;
+        auto r = in.feed(bytes, sizeof bytes);
+        CHECK(r.code() == sofab::Error::InvalidMessage, "malformed: field id above ID_MAX rejected");
+    }
+
     /* Skip an entire unread sub-sequence, then resync on the field after it. */
     {
         sofab::OStreamInline<256> os;

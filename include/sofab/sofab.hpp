@@ -1407,6 +1407,7 @@ namespace sofab
             {
                 uint64_t header;
                 if (!getVarint(p_, end_, header)) { error_ = true; return; }
+                if ((header >> 3) > detail::kIdMax) { error_ = true; return; }
                 auto fieldId = static_cast<sofab::id>(header >> 3);
                 type_ = static_cast<Wire>(header & 0x7);
 
@@ -1809,6 +1810,7 @@ namespace sofab
         {
             uint64_t header;
             if (!getVarint(p_, end_, header)) { error_ = true; return; }
+            if ((header >> 3) > detail::kIdMax) { error_ = true; return; }
             auto fieldId = static_cast<sofab::id>(header >> 3);
             type_ = static_cast<Wire>(header & 0x7);
 
