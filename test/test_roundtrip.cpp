@@ -548,6 +548,125 @@ static void callbackInvalidate()
     }
 }
 
+/* --- setSchema(): a measure-phase schema hook (issue #49, MESSAGE_SPEC §5.2).
+ *
+ *     corelib is measure-then-deliver: it measures a whole top-level field for
+ *     completeness before running the generated deliver callback where the bound
+ *     checks live. A field that is BOTH over-bound (over-count / over-maxlen /
+ *     over-index) AND truncated therefore never reaches those checks and would
+ *     report INCOMPLETE, but §5.2 requires INVALID to dominate ("anti-folding":
+ *     more bytes could never make it valid). setSchema() installs a static
+ *     descriptor tree so measureField rejects at the deciding word (count varint
+ *     / fixlen length word / element header). With no schema installed the walk
+ *     is byte-for-byte the pre-schema decoder — the last case below pins that. --- */
+
+static void measurePhaseSchema()
+{
+    struct Quiet : sofab::IStreamMessage
+    {
+        /* Reads nothing and never invalidate()s: the measure phase alone must
+         * produce the verdict, so these tests isolate the corelib hook. */
+        void deserialize(sofab::IStreamImpl &, sofab::id, size_t, size_t) noexcept override {}
+    };
+    using sofab::schema::FieldBound;
+    using sofab::schema::SeqNode;
+
+    /* ---- over-count: array<u8>, count 4, id 15 (header 0x7b = 15<<3 | ArrayUnsigned). ---- */
+    {
+        static constexpr FieldBound f[] = {
+            {.id = 15, .wire = sofab::Wire::ArrayUnsigned, .bound = 4, .child = nullptr, .wrapperArray = false}};
+        static constexpr SeqNode root{f, 1};
+
+        {   /* count 5 (>4), complete */
+            const uint8_t bytes[] = {0x7b, 0x05, 1, 2, 3, 4, 5};
+            sofab::IStreamObject<Quiet> in; in.setSchema(&root);
+            CHECK(in.feed(bytes, sizeof bytes).code() == sofab::Error::InvalidMessage,
+                  "schema over-count: complete over-count is INVALID");
+        }
+        {   /* count 6 (>4) then EOF — over-count AND truncated */
+            const uint8_t bytes[] = {0x7b, 0x06, 1, 2};
+            sofab::IStreamObject<Quiet> in; in.setSchema(&root);
+            CHECK(in.feed(bytes, sizeof bytes).code() == sofab::Error::InvalidMessage,
+                  "schema over-count: truncated over-count is INVALID (anti-folding)");
+        }
+        {   /* count 4 (==bound) then EOF — clean truncation control */
+            const uint8_t bytes[] = {0x7b, 0x04, 1, 2};
+            sofab::IStreamObject<Quiet> in; in.setSchema(&root);
+            CHECK(in.feed(bytes, sizeof bytes).code() == sofab::Error::Incomplete,
+                  "schema over-count: clean truncation at the bound stays INCOMPLETE");
+        }
+        {   /* no schema installed: the same truncated over-count is unchanged */
+            const uint8_t bytes[] = {0x7b, 0x06, 1, 2};
+            sofab::IStreamObject<Quiet> in; /* deliberately no setSchema */
+            CHECK(in.feed(bytes, sizeof bytes).code() == sofab::Error::Incomplete,
+                  "no schema: truncated over-count unchanged (INCOMPLETE)");
+        }
+        {   /* buffered continuation: the count word arrives on a later feed */
+            const uint8_t bytes[] = {0x7b, 0x06, 1, 2};
+            sofab::IStreamObject<Quiet> in; in.setSchema(&root);
+            CHECK(in.feed(bytes, 1).code() == sofab::Error::Incomplete,
+                  "schema over-count: lone header buffers as INCOMPLETE");
+            CHECK(in.feed(bytes + 1, sizeof bytes - 1).code() == sofab::Error::InvalidMessage,
+                  "schema over-count: continuation reports INVALID at the count word");
+        }
+    }
+
+    /* ---- over-maxlen: string, maxlen 8, id 5 (header 0x2a = 5<<3 | Fixlen).
+     *      fixlen word = (len<<3) | String(2): 0x52 = len 10, 0x42 = len 8. ---- */
+    {
+        static constexpr FieldBound f[] = {
+            {.id = 5, .wire = sofab::Wire::Fixlen, .bound = 8, .child = nullptr, .wrapperArray = false}};
+        static constexpr SeqNode root{f, 1};
+
+        {   /* len 10 (>8), complete */
+            const uint8_t bytes[] = {0x2a, 0x52, 'A','B','C','D','E','F','G','H','I','J'};
+            sofab::IStreamObject<Quiet> in; in.setSchema(&root);
+            CHECK(in.feed(bytes, sizeof bytes).code() == sofab::Error::InvalidMessage,
+                  "schema over-maxlen: complete over-maxlen is INVALID");
+        }
+        {   /* len 10 (>8) then EOF after 2 payload bytes — over-maxlen AND truncated */
+            const uint8_t bytes[] = {0x2a, 0x52, 'A','B'};
+            sofab::IStreamObject<Quiet> in; in.setSchema(&root);
+            CHECK(in.feed(bytes, sizeof bytes).code() == sofab::Error::InvalidMessage,
+                  "schema over-maxlen: truncated over-maxlen is INVALID (anti-folding)");
+        }
+        {   /* len 8 (==maxlen) then EOF — clean truncation control */
+            const uint8_t bytes[] = {0x2a, 0x42, 'A','B'};
+            sofab::IStreamObject<Quiet> in; in.setSchema(&root);
+            CHECK(in.feed(bytes, sizeof bytes).code() == sofab::Error::Incomplete,
+                  "schema over-maxlen: clean truncation at the bound stays INCOMPLETE");
+        }
+    }
+
+    /* ---- over-index: wrapper-array id 3 (SequenceStart header 0x1e = 3<<3 | 6),
+     *      count 2. Each element carries its index as its field id; index >= 2 is
+     *      over-index. Elements here are unsigned scalars (header index<<3, value 42). ---- */
+    {
+        static constexpr FieldBound f[] = {
+            {.id = 3, .wire = sofab::Wire::SequenceStart, .bound = 2, .child = nullptr, .wrapperArray = true}};
+        static constexpr SeqNode root{f, 1};
+
+        {   /* elements 0,1 then element index 2 (>=2), complete (…07 = SequenceEnd) */
+            const uint8_t bytes[] = {0x1e, 0x00, 0x2a, 0x08, 0x2a, 0x10, 0x2a, 0x07};
+            sofab::IStreamObject<Quiet> in; in.setSchema(&root);
+            CHECK(in.feed(bytes, sizeof bytes).code() == sofab::Error::InvalidMessage,
+                  "schema over-index: complete over-index is INVALID");
+        }
+        {   /* elements 0,1 then element index 2 header, then EOF — over-index AND truncated */
+            const uint8_t bytes[] = {0x1e, 0x00, 0x2a, 0x08, 0x2a, 0x10};
+            sofab::IStreamObject<Quiet> in; in.setSchema(&root);
+            CHECK(in.feed(bytes, sizeof bytes).code() == sofab::Error::InvalidMessage,
+                  "schema over-index: truncated over-index is INVALID (anti-folding)");
+        }
+        {   /* element 0 then a truncated in-bounds element 1 (index 1 < 2) */
+            const uint8_t bytes[] = {0x1e, 0x00, 0x2a, 0x08};
+            sofab::IStreamObject<Quiet> in; in.setSchema(&root);
+            CHECK(in.feed(bytes, sizeof bytes).code() == sofab::Error::Incomplete,
+                  "schema over-index: in-bounds truncation stays INCOMPLETE");
+        }
+    }
+}
+
 /* --- exceedLimit(): a deliver callback enforces a receiver-side policy cap the
  *     wire layer cannot know — e.g. a generated message rejecting an unbounded
  *     array whose claimed count exceeds a configured decode limit
@@ -1126,6 +1245,7 @@ int main()
     malformedInput();
     threeValuedOutcomes();
     callbackInvalidate();
+    measurePhaseSchema();
     callbackExceedLimit();
     wireTypeGuard();
     zeroLengthForms();
