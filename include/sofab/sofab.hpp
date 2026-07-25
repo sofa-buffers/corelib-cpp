@@ -2230,6 +2230,139 @@ namespace sofab
         const MessageType &operator*() const noexcept { return data_; }
     };
 
+    /* ---------------------------------------------------------------------- */
+    /* Wrapper-sequence collectors and encode helpers                          */
+    /* ---------------------------------------------------------------------- */
+
+    /**
+     * @brief Collects the elements of a `string` wrapper-sequence array.
+     *
+     * MESSAGE_SPEC §5 lowers an array of strings to a sequence whose child ids are
+     * the element indices, so an element is *placed* at its id rather than
+     * appended: a default (empty) element is omitted on the wire (§2), and the gap
+     * it leaves is filled with the element default.
+     *
+     * @param capacity Schema `count` N, or -1 for an unbounded array. An element id
+     *                 at or past N is INVALID (§5.1/§7) — rejected before the
+     *                 container grows, which also bounds an over-index allocation.
+     * @param elemMax  Element `maxlen`, or -1. A longer element is INVALID (§7.1),
+     *                 never truncated.
+     *
+     * Both rejects hang off a *successful* @ref IStreamImpl::readString, so a
+     * mis-typed element is skipped under §7.3 instead of being measured against
+     * bounds that are not its own.
+     */
+    struct StringSeq : IStreamMessage
+    {
+        std::vector<std::string> &out;
+        long cap;
+        long emax;
+
+        explicit StringSeq(std::vector<std::string> &o, long capacity = -1, long elemMax = -1) noexcept
+            : out(o), cap(capacity), emax(elemMax) {}
+
+        /// §7.4: the sequence IS the array's value, so a repeated field id replaces
+        /// it whole. @ref IStreamImpl::read calls this once the SequenceStart tag
+        /// matched, so a §7.3-skipped occurrence cannot wipe a valid earlier one.
+        void prepare() noexcept { out.clear(); }
+
+        void deserialize(IStreamImpl &is, sofab::id id, size_t size, size_t) noexcept override
+        {
+            std::string s;
+            if (!is.readString(s)) return;
+            if (cap >= 0 && static_cast<size_t>(id) >= static_cast<size_t>(cap)) { is.invalidate(); return; }
+            if (emax >= 0 && size > static_cast<size_t>(emax)) { is.invalidate(); return; }
+            while (out.size() <= static_cast<size_t>(id)) out.emplace_back();
+            out[id] = std::move(s);
+        }
+    };
+
+    /// The `blob` counterpart of @ref StringSeq; see it for the placement and bound
+    /// rules.
+    struct BlobSeq : IStreamMessage
+    {
+        std::vector<std::vector<uint8_t>> &out;
+        long cap;
+        long emax;
+
+        explicit BlobSeq(std::vector<std::vector<uint8_t>> &o, long capacity = -1, long elemMax = -1) noexcept
+            : out(o), cap(capacity), emax(elemMax) {}
+
+        void prepare() noexcept { out.clear(); }
+
+        void deserialize(IStreamImpl &is, sofab::id id, size_t size, size_t) noexcept override
+        {
+            std::vector<uint8_t> b;
+            if (!is.readBlob(b)) return;
+            if (cap >= 0 && static_cast<size_t>(id) >= static_cast<size_t>(cap)) { is.invalidate(); return; }
+            if (emax >= 0 && size > static_cast<size_t>(emax)) { is.invalidate(); return; }
+            while (out.size() <= static_cast<size_t>(id)) out.emplace_back();
+            out[id] = std::move(b);
+        }
+    };
+
+    /**
+     * @brief Collects a struct/union or nested-array wrapper sequence into a
+     *        `std::vector<T>`.
+     *
+     * One element is emplaced and read per child: @ref IStreamImpl::read descends
+     * into a struct/union element's own sub-sequence, or reads a nested array row,
+     * exactly as it would for a scalar field.
+     *
+     * The target is held by pointer rather than a bound reference so one instance
+     * can serve several fields.
+     *
+     * @tparam T Element type — an @ref IStreamMessage, or a container for a
+     *           nested-array row.
+     */
+    template <typename T>
+    struct MessageSeq : IStreamMessage
+    {
+        std::vector<T> *out = nullptr;
+        long cap = -1;   ///< Schema `count` N, or -1; an id at or past N is INVALID (§5.1/§7).
+
+        void prepare() noexcept { if (out) out->clear(); } ///< §7.4 replace-whole; see @ref StringSeq.
+
+        void deserialize(IStreamImpl &is, sofab::id id, size_t, size_t count) noexcept override
+        {
+            if (cap >= 0 && static_cast<size_t>(id) >= static_cast<size_t>(cap)) { is.invalidate(); return; }
+            T &row = out->emplace_back();
+            /* A count-less native-array row is a std::vector the span read fills
+             * only up to its current size, so size it to the row's wire count
+             * first. Struct/union rows and fixed std::array rows have no resize(). */
+            if constexpr (requires { row.resize(count); } && !std::is_base_of_v<IStreamMessage, T>)
+                row.resize(count);
+            is.read(row);
+        }
+    };
+
+    /**
+     * @brief Narrow a fixed-count array to its non-default prefix, for encode.
+     *
+     * MESSAGE_SPEC §3: a `count: N` array's canonical encoding carries `M` = one
+     * past the last element that differs from the element default, and the decoder
+     * refills `[M, N)`. @ref OStreamImpl::write emits the whole container it is
+     * handed, so the value is narrowed to that prefix first. Only a declared
+     * `count: N` array is trimmed — a dynamic array has no N to refill from, so its
+     * trailing defaults are significant.
+     *
+     * The comparison is on the element's **byte image**, never `operator==`: a
+     * trailing `-0.0` compares equal to `0.0` but is not the default and must stay
+     * on the wire, and the same holds for any NaN payload.
+     *
+     * @param a Contiguous container of trivially-copyable elements.
+     * @return A span over `[0, M)`.
+     */
+    template <typename C>
+    std::span<const typename C::value_type> trimTail(const C &a) noexcept
+    {
+        using Elem = typename C::value_type;
+        const Elem zero{};
+        size_t n = a.size();
+        while (n > 0 && std::memcmp(&a[n - 1], &zero, sizeof(Elem)) == 0) --n;
+        return std::span<const Elem>(a.data(), n);
+    }
+
 } // namespace sofab
 
 /** @} */ // end of defgroup
