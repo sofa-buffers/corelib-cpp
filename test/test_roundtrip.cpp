@@ -867,12 +867,13 @@ static void wireTypeGuard()
      * contradicts is counted. No rule anywhere says "do not count unknown ids";
      * it falls out of where the check sits.
      *
-     * The last case is the one to watch: a callback that decides NOT to read is
-     * indistinguishable from one that is uninterested, so its skip is invisible.
-     * The generated array arms still work that way (they must guard, because they
-     * reset their destination before reading), which is why an array-typed
-     * mismatch is currently UNDER-counted. The counter therefore never reports a
-     * skip that did not happen, but does not yet see every one that did. */
+     * The last case is the residual limit: a callback that decides NOT to read is
+     * indistinguishable from one that is uninterested, so a hand-written guard
+     * hides its own skip. Generated code no longer does this anywhere — since
+     * readArray()/prepare() folded the array reset behind the tag match, every
+     * generated arm reaches a read — but a hand-written caller that guards by
+     * hand still opts itself out of the diagnostic. The counter therefore never
+     * reports a skip that did not happen. */
     {
         struct Watched : sofab::IStreamMessage
         {

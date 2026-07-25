@@ -1904,6 +1904,14 @@ namespace sofab
             else if constexpr (InputMessage<T>)
             {
                 if (!tagMatches(Wire::SequenceStart)) return false; /* §7.3 */
+                /* §7.4: a wrapper sequence IS the array's value, so a repeated field
+                 * id REPLACES it whole. The reset that implements that must run only
+                 * once the tag is known to match — an occurrence skipped under §7.3
+                 * is not an occurrence and must not wipe a valid earlier one. A
+                 * collector that needs the reset says so by declaring prepare();
+                 * plain struct/union targets do not and pay nothing, since this is a
+                 * template and the call disappears at compile time. */
+                if constexpr (requires { value.prepare(); }) value.prepare();
                 /* descend into a nested sequence */
                 if (seqDepth_ >= MAX_DEPTH) { error_ = true; return false; } /* §4.9 */
                 ++seqDepth_;
@@ -1998,6 +2006,53 @@ namespace sofab
             p_ += fixLen_;
             consumed_ = true;
             return true;
+        }
+
+        /**
+         * @brief Read a count-prefixed native array, applying every receiver-side
+         *        decision at the one word that decides it.
+         *
+         * Folds what a caller previously had to spell out in four steps — check the
+         * wire tag, check the schema `count`, check a configured policy cap, reset
+         * the destination — into one call, in the only order that is correct:
+         *
+         * 1. **Tag** (§7.3). A contradicting array kind is skipped like an unknown
+         *    id; nothing else runs, so neither bound below can be applied to a field
+         *    that is not this field's value.
+         * 2. **Schema `count`** (§7.1/§5.2) → `INVALID`. Malformed input.
+         * 3. **Policy cap** (@p dynCap, generator#102) → `LimitExceeded`. A
+         *    receiver-side policy, deliberately *not* INVALID: the bytes are fine.
+         * 4. **Reset, then fill.** The destination is resized (dynamic container) or
+         *    value-initialized (fixed extent) only now, so an occurrence skipped at
+         *    step 1 cannot wipe a valid earlier one (§7.4). A fixed array is refilled
+         *    from the element default past the wire count, which is what the
+         *    trailing-default-run rule expects (§3).
+         *
+         * @param[out] dst        Destination range (fixed extent or resizable).
+         * @param schemaCount     Declared `count: N`, or negative when unbounded.
+         * @param dynCap          Configured `max_dyn_array_count`, or negative.
+         * @return `true` when the array was read; `false` when it was skipped (§7.3)
+         *         or rejected, with the outcome already recorded on the stream.
+         */
+        template <typename T>
+        bool readArray(T &dst, long schemaCount = -1, long dynCap = -1) noexcept
+        {
+            using Elem = typename T::value_type;
+            if constexpr (std::is_same_v<Elem, float> || std::is_same_v<Elem, double>)
+            {
+                constexpr Fix want = std::is_same_v<Elem, float> ? Fix::Fp32 : Fix::Fp64;
+                if (!tagMatches(Wire::ArrayFixlen, want)) return false;
+            }
+            else
+            {
+                constexpr Wire want = std::is_unsigned_v<Elem> ? Wire::ArrayUnsigned : Wire::ArraySigned;
+                if (!tagMatches(want)) return false;
+            }
+            if (schemaCount >= 0 && count_ > static_cast<size_t>(schemaCount)) { error_ = true; return false; }
+            if (dynCap >= 0 && count_ > static_cast<size_t>(dynCap)) { limitExceeded_ = true; return false; }
+            if constexpr (requires { dst.resize(count_); }) dst.resize(count_);
+            else                                            dst = T{};
+            return read(dst);
         }
 
         /**
