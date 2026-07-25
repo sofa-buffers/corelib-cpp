@@ -1166,6 +1166,9 @@ namespace sofab
         bool limitExceeded_ = false;   ///< Sticky flag: a field crossed @ref maxBufferedField_ this @ref feed.
         int seqDepth_ = 0;             ///< Current nested-sequence depth during dispatch (§4.9 @ref MAX_DEPTH).
         size_t skipped_ = 0;           ///< §7.3 type-mismatch skips seen so far (@ref skipped).
+        bool incomplete_ = false;      ///< The field being delivered needs more bytes (§7 INCOMPLETE, not malformed).
+        sofab::id fieldId_ = 0;        ///< Id of the field being delivered.
+        const uint8_t *fieldStart_ = nullptr; ///< First byte of that field, for the #26 reassembly cap.
 
         /// Cap on the reassembly buffer's growth for one incomplete field (@ref Limits::max_buffered_field).
         size_t maxBufferedField_ = SIZE_MAX;
@@ -1551,10 +1554,16 @@ namespace sofab
          */
         void dispatchLevel(const std::function<void(sofab::id, size_t, size_t)> &cb, bool stopAtEnd) noexcept
         {
-            while (p_ < end_ && !error_)
+            while (p_ < end_ && !error_ && !incomplete_)
             {
-                uint64_t header;
-                if (!getVarint(p_, end_, header)) { error_ = true; return; }
+                /* #26: a sequence's own bulk accrues field by field — bound it as it
+                 * grows, catching many-small-fields that no single payload check
+                 * would trip. */
+                if (maxBufferedField_ != SIZE_MAX && fieldStart_ &&
+                    exceedsBuffer(static_cast<size_t>(p_ - fieldStart_), 0))
+                { limitExceeded_ = true; return; }
+                uint64_t header; bool ovf = false;
+                if (!getVarint(p_, end_, header, &ovf)) { (ovf ? error_ : incomplete_) = true; return; }
                 if ((header >> 3) > detail::kIdMax) { error_ = true; return; }
                 auto fieldId = static_cast<sofab::id>(header >> 3);
                 type_ = static_cast<Wire>(header & 0x7);
@@ -1569,21 +1578,24 @@ namespace sofab
                 fixLen_ = 0; count_ = 0;
                 if (type_ == Wire::Fixlen)
                 {
-                    uint64_t sub; if (!getVarint(p_, end_, sub)) { error_ = true; return; }
+                    uint64_t sub; if (!getVarint(p_, end_, sub, &ovf)) { (ovf ? error_ : incomplete_) = true; return; }
+                    if (!fixlenWordValid(sub)) { error_ = true; return; } /* §4.6/§7 */
                     fixLen_ = static_cast<size_t>(sub >> 3);
                     fixType_ = static_cast<Fix>(sub & 0x7);
                 }
                 else if (type_ == Wire::ArrayUnsigned || type_ == Wire::ArraySigned)
                 {
-                    uint64_t n; if (!getVarint(p_, end_, n)) { error_ = true; return; }
+                    uint64_t n; if (!getVarint(p_, end_, n, &ovf)) { (ovf ? error_ : incomplete_) = true; return; }
+                    if (n > ARRAY_MAX) { error_ = true; return; } /* §6.2/§7 */
                     count_ = static_cast<size_t>(n);
                 }
                 else if (type_ == Wire::ArrayFixlen)
                 {
-                    uint64_t n; if (!getVarint(p_, end_, n)) { error_ = true; return; }
+                    uint64_t n; if (!getVarint(p_, end_, n, &ovf)) { (ovf ? error_ : incomplete_) = true; return; }
                     count_ = static_cast<size_t>(n);
                     /* §4.8: the fixlen_word is always present, even for an empty array. */
-                    uint64_t sub; if (!getVarint(p_, end_, sub)) { error_ = true; return; }
+                    uint64_t sub; if (!getVarint(p_, end_, sub, &ovf)) { (ovf ? error_ : incomplete_) = true; return; }
+                    if (!arrayFixlenWordValid(sub)) { error_ = true; return; } /* §4.8/§7 */
                     fixLen_ = static_cast<size_t>(sub >> 3); /* element size */
                     fixType_ = static_cast<Fix>(sub & 0x7);
                 }
@@ -1598,6 +1610,9 @@ namespace sofab
                     skipPayload();
                 }
             }
+            /* §7: the bytes ran out with this sequence still open. The measure walk
+             * used to catch that before delivery; header-first discovers it here. */
+            if (stopAtEnd && !error_) incomplete_ = true;
         }
 
         /**
@@ -1612,20 +1627,27 @@ namespace sofab
             {
                 case Wire::Unsigned:
                 case Wire::Signed:
-                    if (!skipVarint(p_, end_)) error_ = true;
+                {
+                    bool ovf = false;
+                    if (!skipVarint(p_, end_, &ovf)) (ovf ? error_ : incomplete_) = true;
                     break;
+                }
                 case Wire::Fixlen:
-                    if (static_cast<size_t>(end_ - p_) < fixLen_) { error_ = true; break; }
+                    if (static_cast<size_t>(end_ - p_) < fixLen_) { incomplete_ = true; break; }
                     p_ += fixLen_;
                     break;
                 case Wire::ArrayUnsigned:
                 case Wire::ArraySigned:
-                    for (size_t i = 0; i < count_; ++i) if (!skipVarint(p_, end_)) { error_ = true; break; }
+                    for (size_t i = 0; i < count_; ++i)
+                    {
+                        bool ovf = false;
+                        if (!skipVarint(p_, end_, &ovf)) { (ovf ? error_ : incomplete_) = true; break; }
+                    }
                     break;
                 case Wire::ArrayFixlen:
                 {
                     size_t bytes = count_ * fixLen_;
-                    if (static_cast<size_t>(end_ - p_) < bytes) { error_ = true; break; }
+                    if (static_cast<size_t>(end_ - p_) < bytes) { incomplete_ = true; break; }
                     p_ += bytes;
                     break;
                 }
@@ -1763,37 +1785,115 @@ namespace sofab
          */
         const uint8_t *parseTopLevel(const uint8_t *p, const uint8_t *end) noexcept
         {
-            /* Select the measure walk once per feed: the uncapped `measureField<false>`
-             * (the default) carries no #26 cap code at all, so the common decode path
-             * pays nothing for a feature it isn't using. */
             const bool capped = maxBufferedField_ != SIZE_MAX;
-            const schema::SeqNode *root = schema_;
             while (p < end)
             {
-                const uint8_t *probe = p;
-                /* Four measure-walk instantiations, selected at runtime: the
-                 * schema-free pair (root == nullptr) carries no §5.2 code and is the
-                 * maxspeed path — the uncapped, schema-free walk is byte-for-byte the
-                 * pre-schema decoder. */
-                const bool measured = root
-                    ? (capped ? measureField<true,  true >(probe, end, /*fieldStart=*/p, root)
-                              : measureField<false, true >(probe, end, /*fieldStart=*/p, root))
-                    : (capped ? measureField<true,  false>(probe, end, /*fieldStart=*/p)
-                              : measureField<false, false>(probe, end, /*fieldStart=*/p));
-                if (!measured)
+                /* Header-first: parse the field's header and metadata, then deliver
+                 * immediately. The callback's typed read decides the tag (§7.3), the
+                 * schema bound (§7.1/§5.2) and finally whether the payload is here —
+                 * in that order, so a bound rejection wins over a truncation without
+                 * anyone having to know the schema up front. */
+                const uint8_t *fieldStart = p;
+                fieldStart_ = p;
+                p_ = p; end_ = end;
+                incomplete_ = false;
+                if (!parseFieldHeader()) return fieldStart; /* error_ or incomplete_ set */
+                if (capped && exceedsBufferAtHeader(fieldStart))
+                { limitExceeded_ = true; return fieldStart; }
+
+                consumed_ = false;
+                const uint8_t *payload = p_;
+                topCallback_(fieldId_, fixLen_, count_);
+                if (error_ || limitExceeded_) return fieldStart;
+                /* Not enough bytes yet: rewind to the field header and buffer it. The
+                 * whole field is delivered again once it is complete; every generated
+                 * destination is either reset wholesale (readArray, prepare()) or
+                 * assigned by id, so re-delivery is idempotent. */
+                if (incomplete_) return fieldStart;
+                if (!consumed_)
                 {
-                    if (limitExceeded_) return p; /* #26: field over the buffering cap (policy) */
-                    if (error_) return p;         /* malformed (e.g. nesting past MAX_DEPTH) */
-                    break;                        /* need more bytes */
+                    p_ = payload;
+                    skipPayload();
+                    if (error_ || incomplete_) return fieldStart;
                 }
-                p_ = p;
-                end_ = end;
-                dispatchOne(topCallback_);
-                if (limitExceeded_) return p; /* callback-reported policy cap (#102) */
-                if (error_) return p;
                 p = p_;
             }
             return p;
+        }
+
+        /** Parse one field header plus the metadata that precedes its payload. */
+        bool parseFieldHeader() noexcept
+        {
+            uint64_t header; bool ovf = false;
+            if (!getVarint(p_, end_, header, &ovf))
+            { if (ovf) error_ = true; else incomplete_ = true; return false; }
+            if ((header >> 3) > detail::kIdMax) { error_ = true; return false; }
+            fieldId_ = static_cast<sofab::id>(header >> 3);
+            type_ = static_cast<Wire>(header & 0x7);
+            fixLen_ = 0; count_ = 0;
+            switch (type_)
+            {
+                case Wire::Fixlen:
+                {
+                    uint64_t sub;
+                    if (!getVarint(p_, end_, sub, &ovf))
+                    { if (ovf) error_ = true; else incomplete_ = true; return false; }
+                    if (!fixlenWordValid(sub)) { error_ = true; return false; } /* §4.6/§7 */
+                    fixLen_ = static_cast<size_t>(sub >> 3);
+                    fixType_ = static_cast<Fix>(sub & 0x7);
+                    break;
+                }
+                case Wire::ArrayUnsigned:
+                case Wire::ArraySigned:
+                {
+                    uint64_t n;
+                    if (!getVarint(p_, end_, n, &ovf))
+                    { if (ovf) error_ = true; else incomplete_ = true; return false; }
+                    if (n > ARRAY_MAX) { error_ = true; return false; } /* §6.2/§7 */
+                    count_ = static_cast<size_t>(n);
+                    break;
+                }
+                case Wire::ArrayFixlen:
+                {
+                    uint64_t n;
+                    if (!getVarint(p_, end_, n, &ovf))
+                    { if (ovf) error_ = true; else incomplete_ = true; return false; }
+                    if (n > ARRAY_MAX) { error_ = true; return false; }
+                    count_ = static_cast<size_t>(n);
+                    /* §4.8: the fixlen_word is present even for an empty array. */
+                    uint64_t sub;
+                    if (!getVarint(p_, end_, sub, &ovf))
+                    { if (ovf) error_ = true; else incomplete_ = true; return false; }
+                    if (!arrayFixlenWordValid(sub)) { error_ = true; return false; } /* §4.8/§7 */
+                    fixLen_ = static_cast<size_t>(sub >> 3);
+                    fixType_ = static_cast<Fix>(sub & 0x7);
+                    break;
+                }
+                case Wire::SequenceEnd:
+                    error_ = true; return false; /* §7: dangling end at the root */
+                default:
+                    break;
+            }
+            return true;
+        }
+
+        /** #26: reject a field whose declared size crosses the reassembly cap before
+         *  its bytes are buffered. The header states the size for fixlen and fixlen
+         *  arrays exactly, and a varint array's count is a lower bound on its bytes;
+         *  a sequence accrues, so it is bounded by the buffered-tail check in feed. */
+        [[nodiscard]] bool exceedsBufferAtHeader(const uint8_t *fieldStart) noexcept
+        {
+            const size_t spanned = static_cast<size_t>(p_ - fieldStart);
+            uint64_t need = 0;
+            switch (type_)
+            {
+                case Wire::Fixlen:      need = fixLen_; break;
+                case Wire::ArrayFixlen: need = static_cast<uint64_t>(count_) * fixLen_; break;
+                case Wire::ArrayUnsigned:
+                case Wire::ArraySigned: need = count_; break;
+                default:                need = 0; break;
+            }
+            return exceedsBuffer(spanned, need);
         }
 
     public:
@@ -1834,8 +1934,8 @@ namespace sofab
             {
                 constexpr Wire want = std::is_unsigned_v<T> ? Wire::Unsigned : Wire::Signed;
                 if (!tagMatches(want)) return false; /* §7.3 */
-                uint64_t raw;
-                if (!getVarint(p_, end_, raw)) { error_ = true; return false; }
+                uint64_t raw; bool ovf = false;
+                if (!getVarint(p_, end_, raw, &ovf)) { (ovf ? error_ : incomplete_) = true; return false; }
                 if constexpr (std::is_unsigned_v<T>) value = static_cast<T>(raw);
                 else                                 value = static_cast<T>(detail::zigzagDecode(raw));
                 consumed_ = true;
@@ -1844,8 +1944,8 @@ namespace sofab
             {
                 /* §4.2: bool travels as an unsigned varint. */
                 if (!tagMatches(Wire::Unsigned)) return false; /* §7.3 */
-                uint64_t raw;
-                if (!getVarint(p_, end_, raw)) { error_ = true; return false; }
+                uint64_t raw; bool ovf = false;
+                if (!getVarint(p_, end_, raw, &ovf)) { (ovf ? error_ : incomplete_) = true; return false; }
                 value = (raw != 0);
                 consumed_ = true;
             }
@@ -1853,7 +1953,7 @@ namespace sofab
             {
                 constexpr Fix want = std::is_same_v<T, float> ? Fix::Fp32 : Fix::Fp64;
                 if (!tagMatches(Wire::Fixlen, want)) return false; /* §7.3 */
-                if (static_cast<size_t>(end_ - p_) < sizeof(T)) { error_ = true; return false; }
+                if (static_cast<size_t>(end_ - p_) < sizeof(T)) { incomplete_ = true; return false; }
                 value = loadFloat<T>(p_);
                 p_ += sizeof(T);
                 consumed_ = true;
@@ -1866,7 +1966,7 @@ namespace sofab
                 if (!tagMatches(Wire::Fixlen)) return false;
                 /* zero-copy: the view points into the source buffer, valid as
                  * long as that buffer (or this stream's accumulator) lives. */
-                if (static_cast<size_t>(end_ - p_) < fixLen_) { error_ = true; return false; }
+                if (static_cast<size_t>(end_ - p_) < fixLen_) { incomplete_ = true; return false; }
 #if SOFAB_STRICT_UTF8
                 /* §6.4: a materialised `string` (fixlen subtype String) whose
                  * complete payload is not valid UTF-8 is the INVALID outcome —
@@ -1887,7 +1987,7 @@ namespace sofab
             else if constexpr (std::is_same_v<T, std::string>)
             {
                 if (!tagMatches(Wire::Fixlen)) return false; /* §7.3, see the view branch */
-                if (static_cast<size_t>(end_ - p_) < fixLen_) { error_ = true; return false; }
+                if (static_cast<size_t>(end_ - p_) < fixLen_) { incomplete_ = true; return false; }
 #if SOFAB_STRICT_UTF8
                 /* §6.4: reject an invalid-UTF-8 `string` payload as INVALID (see
                  * the std::string_view branch above for the full rationale).
@@ -1934,8 +2034,8 @@ namespace sofab
                     if (!tagMatches(want)) return false;
                     for (size_t i = 0; i < count_; ++i)
                     {
-                        uint64_t raw;
-                        if (!getVarint(p_, end_, raw)) { error_ = true; return false; }
+                        uint64_t raw; bool ovf = false;
+                        if (!getVarint(p_, end_, raw, &ovf)) { (ovf ? error_ : incomplete_) = true; return false; }
                         if (i < n)
                         {
                             if constexpr (std::is_unsigned_v<Elem>) sp[i] = static_cast<Elem>(raw);
@@ -1949,7 +2049,7 @@ namespace sofab
                     constexpr Fix want = std::is_same_v<Elem, float> ? Fix::Fp32 : Fix::Fp64;
                     if (!tagMatches(Wire::ArrayFixlen, want)) return false; /* §7.3 */
                     size_t bytes = count_ * sizeof(Elem);
-                    if (static_cast<size_t>(end_ - p_) < bytes) { error_ = true; return false; }
+                    if (static_cast<size_t>(end_ - p_) < bytes) { incomplete_ = true; return false; }
                     if constexpr (std::endian::native == std::endian::little)
                         std::memcpy(sp.data(), p_, n * sizeof(Elem)); /* wire == native */
                     else
@@ -1982,9 +2082,11 @@ namespace sofab
          * @return `true` when the value was read; `false` when the field was left
          *         for the decoder to skip.
          */
-        bool readString(std::string &value) noexcept
+        bool readString(std::string &value, long bound = -1) noexcept
         {
-            if (!tagMatches(Wire::Fixlen, Fix::String)) return false;
+            if (!tagMatches(Wire::Fixlen, Fix::String)) return false;      /* §7.3 */
+            if (bound >= 0 && fixLen_ > static_cast<size_t>(bound))        /* §7.1/§5.2 */
+            { error_ = true; return false; }
             return read(value);
         }
 
@@ -1998,10 +2100,11 @@ namespace sofab
          * @return `true` when the value was read; `false` when the field was left
          *         for the decoder to skip.
          */
-        bool readBlob(std::vector<uint8_t> &value) noexcept
+        bool readBlob(std::vector<uint8_t> &value, long bound = -1) noexcept
         {
             if (!tagMatches(Wire::Fixlen, Fix::Blob)) return false;
-            if (static_cast<size_t>(end_ - p_) < fixLen_) { error_ = true; return false; }
+            if (bound >= 0 && fixLen_ > static_cast<size_t>(bound)) { error_ = true; return false; } /* §7.1 */
+            if (static_cast<size_t>(end_ - p_) < fixLen_) { incomplete_ = true; return false; }
             value.assign(p_, p_ + fixLen_);
             p_ += fixLen_;
             consumed_ = true;
