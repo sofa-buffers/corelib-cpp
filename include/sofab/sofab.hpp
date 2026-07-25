@@ -369,6 +369,7 @@ namespace sofab
         uint8_t *end_ = nullptr;      ///< One past the end of the buffer.
         flushCallback flushCallback_; ///< Invoked when the buffer fills; may be empty.
         size_t seqDepth_ = 0;         ///< Number of currently-open nested sequences (§4.9 @ref MAX_DEPTH).
+        bool failed_ = false;         ///< Sticky: a write has overflowed (see @ref ok).
 
         /// Construct an unattached stream; a derived class must call @ref initBuffer.
         OStreamImpl() noexcept = default;
@@ -414,7 +415,14 @@ namespace sofab
         {
             if (cursor_ == end_)
             {
-                if (!flushCallback_) return Error::BufferFull;
+                if (!flushCallback_)
+                {
+                    // Sticky, because a caller may issue writes one at a time and
+                    // discard each Result — generated serialize() bodies do — and
+                    // then nothing would record that the output was cut short.
+                    failed_ = true;
+                    return Error::BufferFull;
+                }
                 flushCallback_(std::span<const uint8_t>(buffer_, static_cast<size_t>(cursor_ - buffer_)));
                 cursor_ = buffer_;
             }
@@ -730,6 +738,25 @@ namespace sofab
         [[nodiscard]] const uint8_t *data() const noexcept { return buffer_; }
 
         /**
+         * @brief Whether every write on this stream has succeeded.
+         *
+         * Sticky and independent of how the writes were issued — chained, or one
+         * at a time with each Result discarded, which is what a generated
+         * `serialize()` does. The only way it turns false is an overflow with no
+         * flush callback set, so it is the verdict to check after encoding into a
+         * buffer that may be smaller than the message (@ref OStreamView).
+         *
+         * @return true while no write has overflowed.
+         */
+        [[nodiscard]] bool ok() const noexcept { return !failed_; }
+
+        /// @return @ref Error::BufferFull once a write has overflowed, else @ref Error::None.
+        [[nodiscard]] Error error() const noexcept
+        {
+            return failed_ ? Error::BufferFull : Error::None;
+        }
+
+        /**
          * @brief Write a field, dispatching on the value's type.
          *
          * Handles integers (signed values are zig-zag encoded), `bool`, `float`,
@@ -926,6 +953,46 @@ namespace sofab
      * @tparam N Buffer capacity in bytes; must be greater than zero.
      * @tparam Offset Number of leading bytes to reserve before the cursor; must be less than @p N.
      */
+    /**
+     * @brief Output stream over a buffer the caller already owns.
+     *
+     * Neither allocates nor copies: encoding writes straight into @p buffer. The
+     * counterpart to @ref OStreamInline (buffer inside the object) and @ref
+     * OStream (buffer held by a `shared_ptr`) — this is the one for a destination
+     * that already exists, such as the `dst` of a generated `encodeTo`.
+     *
+     * The buffer must outlive the stream, and it is **not** restored if encoding
+     * fails: overflow leaves the bytes written so far in place and @ref ok false.
+     */
+    class OStreamView : public OStreamImpl
+    {
+    public:
+        /**
+         * @brief Construct over caller storage.
+         * @param buffer Destination; must outlive this stream.
+         * @param buflen Capacity of @p buffer in bytes.
+         * @param offset Number of leading bytes to leave untouched before the cursor.
+         */
+        OStreamView(uint8_t *buffer, size_t buflen, size_t offset = 0) noexcept
+        {
+            initBuffer(buffer, buflen, offset);
+        }
+
+        /**
+         * @brief Construct over caller storage with a flush callback.
+         * @param callback Invoked with finished bytes whenever the buffer fills.
+         * @param buffer Destination; must outlive this stream.
+         * @param buflen Capacity of @p buffer in bytes.
+         * @param offset Number of leading bytes to leave untouched before the cursor.
+         */
+        OStreamView(flushCallback callback, uint8_t *buffer, size_t buflen,
+                    size_t offset = 0) noexcept
+        {
+            flushCallback_ = std::move(callback);
+            initBuffer(buffer, buflen, offset);
+        }
+    };
+
     template <size_t N, size_t Offset = 0>
     class OStreamInline : public OStreamImpl
     {
