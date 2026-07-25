@@ -435,10 +435,10 @@ is better). All three are compiled at `-O3` so the comparison is like-for-like:
 
 | Workload | C | C++ wrapper | this (pure C++20) |
 |---|--:|--:|--:|
-| encode: u64 array (1000) | 136 493 | 136 523 | **106 961** (−22 %) |
-| encode: typical message  |     981 |   1 011 | **244** (−75 %) |
-| decode: u64 array (1000) | 300 425 | 300 426 | **170 495** (−43 %) |
-| decode: typical message  |   2 153 |   2 154 | **1 367** (−37 %) |
+| encode: u64 array (1000) | 136 493 | 136 523 | **107 961** (−21 %) |
+| encode: typical message  |     981 |   1 011 | **285** (−71 %) |
+| decode: u64 array (1000) | 300 425 | 300 426 | **111 555** (−63 %) |
+| decode: typical message  |   2 153 |   2 154 | **1 304** (−39 %) |
 
 The pure-C++20 port wins on instructions across the board because it fuses
 header+value writes, bulk-copies arrays, and parses in place without the C port's
