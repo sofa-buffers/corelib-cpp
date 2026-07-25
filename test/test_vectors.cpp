@@ -411,13 +411,37 @@ struct GenericMsg : sofab::IStreamMessage
         const auto &ops = *cur->ops;
         while (cur->i < ops.size() && ops[cur->i].kind == K::SeqE) cur->i++;
         if (cur->i >= ops.size()) { cur->fail = true; cur->err = "extra field"; return; }
+        /* Header-first delivery: a field whose payload has not arrived yet is
+         * offered now (so its bounds can be judged) and delivered AGAIN once it is
+         * complete. Only advance the op cursor when a read actually took the
+         * field; otherwise rewind and expect the same field next time. */
+        const size_t opStart = cur->i;
         const Op &op = ops[cur->i++];
+        struct Rewind {
+            Cursor *c; size_t at; const sofab::IStreamImpl *is;
+            bool failWas; std::string errWas;
+            bool armed = true;   ///< cleared for a field skipped ON PURPOSE
+            ~Rewind()
+            {
+                if (!armed || is->consumed()) return;
+                /* The field was not taken: this delivery never happened as far as
+                 * verification goes. Rewind the op cursor and drop anything the
+                 * half-read values compared against -- the real check runs when the
+                 * field is delivered complete. */
+                c->i = at;
+                c->fail = failWas;
+                c->err = errWas;
+            }
+        } rewind{cur, opStart, &is, cur->fail, cur->err};
 
         /* skip-ids: leave the field unread so the decoder auto-skips its payload.
          * For a sequence, don't descend — the decoder skips the whole sub-tree —
          * and advance the op cursor past the matching SequenceEnd (any nesting). */
         if (cur->skipId(op.id))
         {
+            /* Deliberately unread: the corelib will not offer it again (it records
+             * the decline), so this delivery does count. */
+            rewind.armed = false;
             if (op.kind == K::SeqB)
             {
                 int depth = 1;
@@ -514,9 +538,10 @@ int main()
 
     int checks = 0, failures = 0;
     std::string first;
+    std::vector<std::string> allFailures;
     auto run = [&](bool ok, const Vector &v, const char *scenario, const std::string &detail) {
         ++checks;
-        if (!ok) { ++failures; if (first.empty()) first = v.name + "/" + scenario + ": " + detail; }
+        if (!ok) { ++failures; allFailures.push_back(v.name + "/" + scenario + ": " + detail); if (first.empty()) first = allFailures.back(); }
     };
 
     const uint32_t caps = buildCaps();
@@ -583,5 +608,7 @@ int main()
                 vectors.size(), static_cast<int>(vectors.size()) - skipped, skipped, checks, failures);
     std::printf("%zu invalid_utf8 vectors, %d run, %d skipped\n", negs.size(), negRun, negSkipped);
     if (failures) std::printf("first failure: %s\n", first.c_str());
+    if (const char *v = std::getenv("SOFAB_LIST_FAILURES"); v && *v)
+        for (const auto &f : allFailures) std::printf("  FAIL %s\n", f.c_str());
     return failures ? 1 : 0;
 }
