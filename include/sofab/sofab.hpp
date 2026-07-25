@@ -72,26 +72,31 @@
 
 namespace sofab
 {
-    /// Version of the SofaBuffers public API implemented by this header.
+    /** Version of the SofaBuffers public API implemented by this header. */
     inline constexpr int API_VERSION = 1;
 
     /* ---------------------------------------------------------------------- */
-    /* Wire-format limits                                                       */
-    /*                                                                          */
-    /* Fixed by MESSAGE_SPEC §6.2 and identical in every corelib. They are not   */
-    /* configurable and not a policy: exceeding one is malformed input, not a    */
-    /* local decision. Receiver-side caps a caller CHOOSES are @ref Limits.      */
+    /* Wire-format limits                                                     */
+    /*                                                                        */
+    /* Fixed by MESSAGE_SPEC §6.2 and identical in every corelib.             */
+    /* Not configurable and not a policy: exceeding one is malformed          */
+    /* input, not a local decision.                                           */
+    /* Receiver-side caps a caller CHOOSES are @ref Limits.                   */
     /* ---------------------------------------------------------------------- */
 
-    /// Largest valid field id (`INT32_MAX`). Encoding a larger id is
-    /// @ref Error::InvalidArgument; decoding one is @ref Error::InvalidMessage.
+    /**
+     * Largest valid field id (`INT32_MAX`). Encoding a larger id is
+     * @ref Error::InvalidArgument; decoding one is @ref Error::InvalidMessage.
+     */
     inline constexpr uint32_t ID_MAX = 0x7fffffffu;
-    /// Largest fixlen payload byte-length (`INT32_MAX`).
+    /** Largest fixlen payload byte-length (`INT32_MAX`). */
     inline constexpr uint32_t FIXLEN_MAX = 0x7fffffffu;
-    /// Largest array element count (`INT32_MAX`).
+    /** Largest array element count (`INT32_MAX`). */
     inline constexpr uint32_t ARRAY_MAX = 0x7fffffffu;
-    /// Maximum nested-sequence depth (§4.9). Deeper nesting is rejected
-    /// (encode: @ref Error::InvalidArgument; decode: @ref Error::InvalidMessage).
+    /**
+     * Maximum nested-sequence depth (§4.9). Deeper nesting is rejected
+     * (encode: @ref Error::InvalidArgument; decode: @ref Error::InvalidMessage).
+     */
     inline constexpr int MAX_DEPTH = 255;
 
 
@@ -108,13 +113,13 @@ namespace sofab
     template <typename>
     inline constexpr bool always_false_v = false;
 
-    /// Status codes returned by the encode/decode API; `None` signals success.
+    /** Status codes returned by the encode/decode API; `None` signals success. */
     enum class Error
     {
-        None = 0,            ///< Operation succeeded (decode: `COMPLETE`, §7).
-        BufferFull = 3,      ///< The output buffer filled and no flush callback was set.
-        InvalidArgument = 1, ///< An argument was out of range (e.g. a field id above the limit).
-        InvalidMessage = 4,  ///< The input bytes are malformed (decode: `INVALID`, §7).
+        None = 0,            /**< Operation succeeded (decode: `COMPLETE`, §7). */
+        BufferFull = 3,      /**< The output buffer filled and no flush callback was set. */
+        InvalidArgument = 1, /**< An argument was out of range (e.g. a field id above the limit). */
+        InvalidMessage = 4,  /**< The input bytes are malformed (decode: `INVALID`, §7). */
         /**
          * Decode-only: the fed bytes end **inside** a field — a partial varint
          * (§4.1), a fixlen/array payload shorter than declared (§4.6/§4.8), or an
@@ -148,12 +153,12 @@ namespace sofab
      */
     enum class DecodeStatus
     {
-        Complete = 0,   ///< Consumed bytes end **exactly** at a field boundary — a valid message.
-        Incomplete = 1, ///< Consumed bytes end **inside** a field or with an open sequence. Not an error.
-        Invalid = 2,    ///< Bytes are malformed **regardless of what follows**. Terminal.
+        Complete = 0,   /**< Consumed bytes end **exactly** at a field boundary — a valid message. */
+        Incomplete = 1, /**< Consumed bytes end **inside** a field or with an open sequence. Not an error. */
+        Invalid = 2,    /**< Bytes are malformed **regardless of what follows**. Terminal. */
     };
 
-    /// Field identifier on the wire. Valid range is `[0, INT32_MAX]`.
+    /** Field identifier on the wire. Valid range is `[0, INT32_MAX]`. */
     using id = uint32_t;
 
     /* ---------------------------------------------------------------------- */
@@ -161,35 +166,39 @@ namespace sofab
     /* ---------------------------------------------------------------------- */
 
 
-    /// Implementation details of the wire format; not part of the public API.
+    /** Implementation details of the wire format; not part of the public API. */
     namespace detail
     {
-        /// @brief Wire type stored in the low 3 bits of every field header.
-        ///
-        /// Internal. The typed reads compare it themselves (§7.3), so neither generated
-        /// nor hand-written code has to name it.
+        /**
+         * @brief Wire type stored in the low 3 bits of every field header.
+         *
+         * Internal. The typed reads compare it themselves (§7.3), so neither generated
+         * nor hand-written code has to name it.
+         */
         enum class Wire : uint8_t
         {
-            Unsigned = 0,      ///< Unsigned integer encoded as a varint.
-            Signed = 1,        ///< Signed integer, zig-zag encoded as a varint.
-            Fixlen = 2,        ///< Length-prefixed payload (float, string or blob).
-            ArrayUnsigned = 3, ///< Count-prefixed array of unsigned varints.
-            ArraySigned = 4,   ///< Count-prefixed array of zig-zag varints.
-            ArrayFixlen = 5,   ///< Count-prefixed array of fixed-size elements.
-            SequenceStart = 6, ///< Opens a nested sub-message.
-            SequenceEnd = 7,   ///< Closes the most recently opened sub-message.
+            Unsigned = 0,      /**< Unsigned integer encoded as a varint. */
+            Signed = 1,        /**< Signed integer, zig-zag encoded as a varint. */
+            Fixlen = 2,        /**< Length-prefixed payload (float, string or blob). */
+            ArrayUnsigned = 3, /**< Count-prefixed array of unsigned varints. */
+            ArraySigned = 4,   /**< Count-prefixed array of zig-zag varints. */
+            ArrayFixlen = 5,   /**< Count-prefixed array of fixed-size elements. */
+            SequenceStart = 6, /**< Opens a nested sub-message. */
+            SequenceEnd = 7,   /**< Closes the most recently opened sub-message. */
         };
 
-        /// @brief Sub-type of a length-prefixed (`Fixlen`) payload, stored in the low 3 bits of its length word.
-        ///
-        /// Internal, like @ref Wire. §7.3 bounds the type check at wire type *plus* this
-        /// subtype, since `fp32`/`fp64`/`string`/`blob` share @ref Wire::Fixlen.
+        /**
+         * @brief Sub-type of a length-prefixed (`Fixlen`) payload, stored in the low 3 bits of its length word.
+         *
+         * Internal, like @ref Wire. §7.3 bounds the type check at wire type *plus* this
+         * subtype, since `fp32`/`fp64`/`string`/`blob` share @ref Wire::Fixlen.
+         */
         enum class Fix : uint8_t
         {
-            Fp32 = 0,   ///< 32-bit IEEE-754 float.
-            Fp64 = 1,   ///< 64-bit IEEE-754 double.
-            String = 2, ///< UTF-8 text.
-            Blob = 3,   ///< Opaque byte string.
+            Fp32 = 0,   /**< 32-bit IEEE-754 float. */
+            Fp64 = 1,   /**< 64-bit IEEE-754 double. */
+            String = 2, /**< UTF-8 text. */
+            Blob = 3,   /**< Opaque byte string. */
         };
 
 
@@ -360,18 +369,18 @@ namespace sofab
         using Fix = detail::Fix;
 
     public:
-        /// Callback invoked with a span of finished bytes whenever the buffer flushes.
+        /** Callback invoked with a span of finished bytes whenever the buffer flushes. */
         using flushCallback = std::function<void(std::span<const uint8_t>)>;
 
     protected:
-        uint8_t *buffer_ = nullptr;   ///< Start of the active buffer.
-        uint8_t *cursor_ = nullptr;   ///< Current write position.
-        uint8_t *end_ = nullptr;      ///< One past the end of the buffer.
-        flushCallback flushCallback_; ///< Invoked when the buffer fills; may be empty.
-        size_t seqDepth_ = 0;         ///< Number of currently-open nested sequences (§4.9 @ref MAX_DEPTH).
-        bool failed_ = false;         ///< Sticky: a write has overflowed (see @ref ok).
+        uint8_t *buffer_ = nullptr;   /**< Start of the active buffer. */
+        uint8_t *cursor_ = nullptr;   /**< Current write position. */
+        uint8_t *end_ = nullptr;      /**< One past the end of the buffer. */
+        flushCallback flushCallback_; /**< Invoked when the buffer fills; may be empty. */
+        size_t seqDepth_ = 0;         /**< Number of currently-open nested sequences (§4.9 @ref MAX_DEPTH). */
+        bool failed_ = false;         /**< Sticky: a write has overflowed (see @ref ok). */
 
-        /// Construct an unattached stream; a derived class must call @ref initBuffer.
+        /** Construct an unattached stream; a derived class must call @ref initBuffer. */
         OStreamImpl() noexcept = default;
 
         /**
@@ -700,15 +709,15 @@ namespace sofab
                 if (error_ == Error::None) error_ = os_.sequenceEnd().error_;
                 return *this;
             }
-            /// @return `true` if no error has been latched.
+            /** @return `true` if no error has been latched. */
             [[nodiscard]] explicit operator bool() const noexcept { return ok(); }
-            /// @return `true` if no error has been latched.
+            /** @return `true` if no error has been latched. */
             [[nodiscard]] bool ok() const noexcept { return error_ == Error::None; }
-            /// @return The latched status code (@ref Error::None if all writes succeeded).
+            /** @return The latched status code (@ref Error::None if all writes succeeded). */
             [[nodiscard]] Error code() const noexcept { return error_; }
-            /// @return `true` if the latched code equals @p e.
+            /** @return `true` if the latched code equals @p e. */
             bool operator==(Error e) const noexcept { return error_ == e; }
-            /// @return `true` if the latched code differs from @p e.
+            /** @return `true` if the latched code differs from @p e. */
             bool operator!=(Error e) const noexcept { return error_ != e; }
         };
 
@@ -716,7 +725,7 @@ namespace sofab
         OStreamImpl &operator=(const OStreamImpl &) = delete;
         OStreamImpl(OStreamImpl &&) noexcept = default;
         OStreamImpl &operator=(OStreamImpl &&) noexcept = default;
-        /// Flushes any buffered bytes through the callback before destruction.
+        /** Flushes any buffered bytes through the callback before destruction. */
         virtual ~OStreamImpl() noexcept { flush(); }
 
         /**
@@ -732,9 +741,9 @@ namespace sofab
             return used;
         }
 
-        /// @return Number of bytes written into the buffer since the last flush.
+        /** @return Number of bytes written into the buffer since the last flush. */
         [[nodiscard]] size_t bytesUsed() const noexcept { return static_cast<size_t>(cursor_ - buffer_); }
-        /// @return Pointer to the start of the buffer; the first @ref bytesUsed bytes are valid.
+        /** @return Pointer to the start of the buffer; the first @ref bytesUsed bytes are valid. */
         [[nodiscard]] const uint8_t *data() const noexcept { return buffer_; }
 
         /**
@@ -750,7 +759,7 @@ namespace sofab
          */
         [[nodiscard]] bool ok() const noexcept { return !failed_; }
 
-        /// @return @ref Error::BufferFull once a write has overflowed, else @ref Error::None.
+        /** @return @ref Error::BufferFull once a write has overflowed, else @ref Error::None. */
         [[nodiscard]] Error error() const noexcept
         {
             return failed_ ? Error::BufferFull : Error::None;
@@ -894,8 +903,8 @@ namespace sofab
     class OStream : public OStreamImpl
     {
     protected:
-        std::shared_ptr<uint8_t[]> bufferOwner_; ///< Owned backing storage.
-        /// Construct without a buffer; one must be set via @ref setBuffer.
+        std::shared_ptr<uint8_t[]> bufferOwner_; /**< Owned backing storage. */
+        /** Construct without a buffer; one must be set via @ref setBuffer. */
         OStream() noexcept = default;
 
     public:
@@ -944,7 +953,7 @@ namespace sofab
             bufferOwner_ = std::move(buffer);
             initBuffer(bufferOwner_.get(), buflen, offset);
         }
-        /// @return A shared handle to the backing buffer.
+        /** @return A shared handle to the backing buffer. */
         [[nodiscard]] std::shared_ptr<uint8_t[]> getBuffer() noexcept { return bufferOwner_; }
     };
 
@@ -998,10 +1007,10 @@ namespace sofab
     {
         static_assert(N > 0, "Buffer size N must be greater than zero");
         static_assert(Offset < N, "Offset must be less than buffer size N");
-        std::array<uint8_t, N> bufferOwner_{}; ///< Inline backing storage.
+        std::array<uint8_t, N> bufferOwner_{}; /**< Inline backing storage. */
 
     public:
-        /// Construct with no flush callback; overflow returns @ref Error::BufferFull.
+        /** Construct with no flush callback; overflow returns @ref Error::BufferFull. */
         OStreamInline() noexcept { initBuffer(bufferOwner_.data(), N, Offset); }
         /**
          * @brief Construct with a flush callback.
@@ -1061,7 +1070,7 @@ namespace sofab
         MessageType message_;
 
     public:
-        /// Construct with no flush callback.
+        /** Construct with no flush callback. */
         OStreamObject() noexcept = default;
         /**
          * @brief Construct with a flush callback.
@@ -1070,7 +1079,7 @@ namespace sofab
         explicit OStreamObject(typename OStreamImpl::flushCallback callback) noexcept
             : OStreamInline<N + Offset, Offset>{std::move(callback)} {}
 
-        /// @return The wrapped message, so its fields can be populated via `obj->field`.
+        /** @return The wrapped message, so its fields can be populated via `obj->field`. */
         MessageType &operator->() noexcept { return message_; }
 
         /**
@@ -1099,11 +1108,12 @@ namespace sofab
     concept InputMessage = std::derived_from<T, IStreamMessage>;
 
     /* ---------------------------------------------------------------------- */
-    /* Receiver-side policy                                                     */
-    /*                                                                          */
-    /* Unlike the wire-format limits above, these are a LOCAL choice: the bytes  */
-    /* are well-formed, this receiver just declines to buffer that much. Hence   */
-    /* the separate outcome @ref Error::LimitExceeded, which is not INVALID.     */
+    /* Receiver-side policy                                                   */
+    /*                                                                        */
+    /* Unlike the wire-format limits above, these are a LOCAL choice:         */
+    /* the bytes are well-formed, this receiver just declines to buffer       */
+    /* that much. Hence the separate outcome @ref Error::LimitExceeded,       */
+    /* which is not INVALID.                                                  */
     /* ---------------------------------------------------------------------- */
 
     /**
@@ -1163,22 +1173,26 @@ namespace sofab
             friend class IStreamImpl;
             explicit Result(Error e, size_t skipped = 0) noexcept : error_(e), skipped_(skipped) {}
         public:
-            /// @return Fields skipped because their wire tag contradicted the type
-            ///         the callback asked for (MESSAGE_SPEC §7.3) — see
-            ///         @ref IStreamImpl::skipped. A diagnostic: a non-zero count on
-            ///         a `COMPLETE` result means the message was valid but did not
-            ///         match this schema everywhere.
+            /**
+             * @return Fields skipped because their wire tag contradicted the type
+             *         the callback asked for (MESSAGE_SPEC §7.3) — see
+             *         @ref IStreamImpl::skipped. A diagnostic: a non-zero count on
+             *         a `COMPLETE` result means the message was valid but did not
+             *         match this schema everywhere.
+             */
             [[nodiscard]] size_t skipped() const noexcept { return skipped_; }
-            /// @return `true` only for `COMPLETE` — the bytes end exactly at a field boundary.
+            /** @return `true` only for `COMPLETE` — the bytes end exactly at a field boundary. */
             [[nodiscard]] explicit operator bool() const noexcept { return ok(); }
-            /// @return `true` only for `COMPLETE`; `false` for both @ref incomplete and @ref invalid.
+            /** @return `true` only for `COMPLETE`; `false` for both @ref incomplete and @ref invalid. */
             [[nodiscard]] bool ok() const noexcept { return error_ == Error::None; }
-            /// @return The three-valued §7 outcome as a @ref DecodeStatus. A
-            ///         @ref Error::LimitExceeded result is a receiver-side policy
-            ///         failure, **not** one of the three wire outcomes — it maps to
-            ///         @ref DecodeStatus::Invalid here only as a coarse fallback;
-            ///         callers distinguishing policy from malformation must use
-            ///         @ref code / @ref limitExceeded / @ref invalid.
+            /**
+             * @return The three-valued §7 outcome as a @ref DecodeStatus. A
+             *         @ref Error::LimitExceeded result is a receiver-side policy
+             *         failure, **not** one of the three wire outcomes — it maps to
+             *         @ref DecodeStatus::Invalid here only as a coarse fallback;
+             *         callers distinguishing policy from malformation must use
+             *         @ref code / @ref limitExceeded / @ref invalid.
+             */
             [[nodiscard]] DecodeStatus status() const noexcept
             {
                 switch (error_)
@@ -1188,54 +1202,56 @@ namespace sofab
                     default:                 return DecodeStatus::Invalid;
                 }
             }
-            /// @return `true` if the consumed bytes end exactly at a field boundary (`COMPLETE`).
+            /** @return `true` if the consumed bytes end exactly at a field boundary (`COMPLETE`). */
             [[nodiscard]] bool complete() const noexcept { return error_ == Error::None; }
-            /// @return `true` if the bytes end mid-field / with an open sequence (`INCOMPLETE`). Not an error.
+            /** @return `true` if the bytes end mid-field / with an open sequence (`INCOMPLETE`). Not an error. */
             [[nodiscard]] bool incomplete() const noexcept { return error_ == Error::Incomplete; }
-            /// @return `true` if the bytes are malformed (`INVALID`). **False** for a
-            ///         @ref limitExceeded result — a policy cap is not wire malformation.
+            /**
+             * @return `true` if the bytes are malformed (`INVALID`). **False** for a
+             *         @ref limitExceeded result — a policy cap is not wire malformation.
+             */
             [[nodiscard]] bool invalid() const noexcept { return error_ == Error::InvalidMessage; }
-            /// @return `true` if a field exceeded @ref Limits::max_buffered_field. Distinct from @ref invalid.
+            /** @return `true` if a field exceeded @ref Limits::max_buffered_field. Distinct from @ref invalid. */
             [[nodiscard]] bool limitExceeded() const noexcept { return error_ == Error::LimitExceeded; }
-            /// @return The status code (@ref Error::None, @ref Error::Incomplete, @ref Error::InvalidMessage or @ref Error::LimitExceeded).
+            /** @return The status code (@ref Error::None, @ref Error::Incomplete, @ref Error::InvalidMessage or @ref Error::LimitExceeded). */
             [[nodiscard]] Error code() const noexcept { return error_; }
-            /// @return `true` if the status code equals @p e.
+            /** @return `true` if the status code equals @p e. */
             bool operator==(Error e) const noexcept { return error_ == e; }
-            /// @return `true` if the status code differs from @p e.
+            /** @return `true` if the status code differs from @p e. */
             bool operator!=(Error e) const noexcept { return error_ != e; }
         };
 
     protected:
-        std::vector<uint8_t> acc_; ///< Buffered bytes spanning @ref feed calls (incomplete trailing field).
-        size_t topPos_ = 0;        ///< Parse offset into @ref acc_ of the next unconsumed top-level field.
+        std::vector<uint8_t> acc_; /**< Buffered bytes spanning @ref feed calls (incomplete trailing field). */
+        size_t topPos_ = 0;        /**< Parse offset into @ref acc_ of the next unconsumed top-level field. */
 
         /* cursor + current-field metadata, valid during a deliver callback */
-        const uint8_t *p_ = nullptr;   ///< Read cursor.
-        const uint8_t *end_ = nullptr; ///< One past the last readable byte.
-        Wire type_{};          ///< Wire type of the field being delivered.
-        Fix fixType_{};        ///< Sub-type of the current fixlen field.
-        size_t fixLen_ = 0;            ///< Payload length (fixlen) or element size (fixlen array), in bytes.
-        size_t count_ = 0;             ///< Element count of the current array field.
-        bool consumed_ = false;        ///< Set once the callback has read the current field's value.
-        bool error_ = false;           ///< Sticky decode-error flag for the current @ref feed.
-        bool limitExceeded_ = false;   ///< Sticky flag: a field crossed @ref maxBufferedField_ this @ref feed.
-        int seqDepth_ = 0;             ///< Current nested-sequence depth during dispatch (§4.9 @ref MAX_DEPTH).
-        size_t skipped_ = 0;           ///< §7.3 type-mismatch skips seen so far (@ref skipped).
-        bool incomplete_ = false;      ///< The field being delivered needs more bytes (§7 INCOMPLETE, not malformed).
-        bool declined_ = false;        ///< The buffered field was already offered and not read: skip it, do not deliver again.
-        long elemBound_ = -1;          ///< Element-index bound of the wrapper sequence being read (§5.1); -1 = none.
-        sofab::id fieldId_ = 0;        ///< Id of the field being delivered.
-        const uint8_t *fieldStart_ = nullptr; ///< First byte of that field, for the #26 reassembly cap.
+        const uint8_t *p_ = nullptr;   /**< Read cursor. */
+        const uint8_t *end_ = nullptr; /**< One past the last readable byte. */
+        Wire type_{};          /**< Wire type of the field being delivered. */
+        Fix fixType_{};        /**< Sub-type of the current fixlen field. */
+        size_t fixLen_ = 0;            /**< Payload length (fixlen) or element size (fixlen array), in bytes. */
+        size_t count_ = 0;             /**< Element count of the current array field. */
+        bool consumed_ = false;        /**< Set once the callback has read the current field's value. */
+        bool error_ = false;           /**< Sticky decode-error flag for the current @ref feed. */
+        bool limitExceeded_ = false;   /**< Sticky flag: a field crossed @ref maxBufferedField_ this @ref feed. */
+        int seqDepth_ = 0;             /**< Current nested-sequence depth during dispatch (§4.9 @ref MAX_DEPTH). */
+        size_t skipped_ = 0;           /**< §7.3 type-mismatch skips seen so far (@ref skipped). */
+        bool incomplete_ = false;      /**< The field being delivered needs more bytes (§7 INCOMPLETE, not malformed). */
+        bool declined_ = false;        /**< The buffered field was already offered and not read: skip it, do not deliver again. */
+        long elemBound_ = -1;          /**< Element-index bound of the wrapper sequence being read (§5.1); -1 = none. */
+        sofab::id fieldId_ = 0;        /**< Id of the field being delivered. */
+        const uint8_t *fieldStart_ = nullptr; /**< First byte of that field, for the #26 reassembly cap. */
 
-        /// Cap on the reassembly buffer's growth for one incomplete field (@ref Limits::max_buffered_field).
+        /** Cap on the reassembly buffer's growth for one incomplete field (@ref Limits::max_buffered_field). */
         size_t maxBufferedField_ = SIZE_MAX;
 
 
-        std::function<void(sofab::id, size_t, size_t)> topCallback_; ///< Delivers each top-level field.
+        std::function<void(sofab::id, size_t, size_t)> topCallback_; /**< Delivers each top-level field. */
 
-        /// Construct an empty stream; a derived class installs @ref topCallback_.
+        /** Construct an empty stream; a derived class installs @ref topCallback_. */
         IStreamImpl() noexcept = default;
-        /// Construct with receiver-side @ref Limits; a derived class installs @ref topCallback_.
+        /** Construct with receiver-side @ref Limits; a derived class installs @ref topCallback_. */
         explicit IStreamImpl(Limits limits) noexcept : maxBufferedField_(limits.max_buffered_field) {}
 
         /**
@@ -2306,9 +2322,11 @@ namespace sofab
          *
          * @return The delivered field's @ref Wire.
          */
-        /// @return `true` when a read in this delivery consumed the field. `false`
-        ///         means the field was declined (skipped) or its payload has not
-        ///         arrived yet, in which case it is delivered again later.
+        /**
+         * @return `true` when a read in this delivery consumed the field. `false`
+         *         means the field was declined (skipped) or its payload has not
+         *         arrived yet, in which case it is delivered again later.
+         */
         [[nodiscard]] bool consumed() const noexcept { return consumed_; }
 
         [[nodiscard]] Wire wire() const noexcept { return type_; }
@@ -2408,7 +2426,7 @@ namespace sofab
     class IStreamInline : public IStreamImpl
     {
     public:
-        /// Callback type invoked per top-level field as `(fieldId, size, count)`.
+        /** Callback type invoked per top-level field as `(fieldId, size, count)`. */
         using fieldCallback = std::function<void(sofab::id, size_t, size_t)>;
 
         /**
@@ -2490,8 +2508,10 @@ namespace sofab
         MessageType data_;
 
     public:
-        /// Construct and route each top-level field into the wrapped message.
-        /// @param limits Receiver-side caps (see @ref Limits); default is uncapped.
+        /**
+         * Construct and route each top-level field into the wrapped message.
+         * @param limits Receiver-side caps (see @ref Limits); default is uncapped.
+         */
         explicit IStreamObject(Limits limits = {}) noexcept
             : IStreamImpl(limits)
         {
@@ -2500,18 +2520,18 @@ namespace sofab
             };
         }
 
-        /// @return The wrapped message (mutable access).
+        /** @return The wrapped message (mutable access). */
         MessageType &operator->() noexcept { return data_; }
-        /// @return The wrapped message (const access).
+        /** @return The wrapped message (const access). */
         const MessageType &operator->() const noexcept { return data_; }
-        /// @return Reference to the wrapped message (mutable access).
+        /** @return Reference to the wrapped message (mutable access). */
         MessageType &operator*() noexcept { return data_; }
-        /// @return Reference to the wrapped message (const access).
+        /** @return Reference to the wrapped message (const access). */
         const MessageType &operator*() const noexcept { return data_; }
     };
 
     /* ---------------------------------------------------------------------- */
-    /* Wrapper-sequence collectors and encode helpers                          */
+    /* Wrapper-sequence collectors and encode helpers                         */
     /* ---------------------------------------------------------------------- */
 
     /**
@@ -2544,9 +2564,11 @@ namespace sofab
         explicit StringSeq(std::vector<std::string> &o, long capacity = -1, long elemMax = -1) noexcept
             : out(o), cap(capacity), emax(elemMax) {}
 
-        /// §7.4: the sequence IS the array's value, so a repeated field id replaces
-        /// it whole. @ref IStreamImpl::read calls this once the SequenceStart tag
-        /// matched, so a §7.3-skipped occurrence cannot wipe a valid earlier one.
+        /**
+         * §7.4: the sequence IS the array's value, so a repeated field id replaces
+         * it whole. @ref IStreamImpl::read calls this once the SequenceStart tag
+         * matched, so a §7.3-skipped occurrence cannot wipe a valid earlier one.
+         */
         void prepare() noexcept { out.clear(); }
 
         void deserialize(IStreamImpl &is, sofab::id id, size_t size, size_t) noexcept override
@@ -2564,15 +2586,17 @@ namespace sofab
         }
     };
 
-    /// The `blob` counterpart of @ref StringSeq; see it for the placement and bound
-    /// rules.
+    /**
+     * The `blob` counterpart of @ref StringSeq; see it for the placement and bound
+     * rules.
+     */
     struct BlobSeq : IStreamMessage
     {
         std::vector<std::vector<uint8_t>> &out;
         long cap;
         long emax;
 
-        /// @copydoc StringSeq::StringSeq
+        /** @copydoc StringSeq::StringSeq */
         explicit BlobSeq(std::vector<std::vector<uint8_t>> &o, long capacity = -1, long elemMax = -1) noexcept
             : out(o), cap(capacity), emax(elemMax) {}
 
@@ -2606,9 +2630,9 @@ namespace sofab
     struct MessageSeq : IStreamMessage
     {
         std::vector<T> *out = nullptr;
-        long cap = -1;   ///< Schema `count` N, or -1; an id at or past N is INVALID (§5.1/§7).
+        long cap = -1;   /**< Schema `count` N, or -1; an id at or past N is INVALID (§5.1/§7). */
 
-        void prepare() noexcept { if (out) out->clear(); } ///< §7.4 replace-whole; see @ref StringSeq.
+        void prepare() noexcept { if (out) out->clear(); } /**< §7.4 replace-whole; see @ref StringSeq. */
 
         void deserialize(IStreamImpl &is, sofab::id id, size_t, size_t count) noexcept override
         {
