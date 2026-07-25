@@ -858,6 +858,57 @@ static void wireTypeGuard()
         CHECK((*in).a == 0 && (*in).b == 0, "read-seam: neither mismatched field was read");
     }
 
+    /* WHAT THE COUNTER COUNTS — the whole point of the diagnostic is that it
+     * reports a schema DISAGREEMENT and stays quiet about the routine skips.
+     *
+     * A field the callback never reads cannot be counted: the count lives in the
+     * read itself. That draws the line for free — an id the callback does not
+     * know never reaches a read, so it is silent, while a known id whose tag
+     * contradicts is counted. No rule anywhere says "do not count unknown ids";
+     * it falls out of where the check sits.
+     *
+     * The last case is the one to watch: a callback that decides NOT to read is
+     * indistinguishable from one that is uninterested, so its skip is invisible.
+     * The generated array arms still work that way (they must guard, because they
+     * reset their destination before reading), which is why an array-typed
+     * mismatch is currently UNDER-counted. The counter therefore never reports a
+     * skip that did not happen, but does not yet see every one that did. */
+    {
+        struct Watched : sofab::IStreamMessage
+        {
+            uint32_t known = 0;   /* id 0, declared unsigned */
+            uint32_t guarded = 0; /* id 1, declared unsigned, read behind a hand guard */
+            void deserialize(sofab::IStreamImpl &is, sofab::id id, size_t, size_t) noexcept override
+            {
+                if (id == 0) is.read(known);
+                else if (id == 1)
+                {
+                    if (is.wire() != sofab::Wire::Unsigned) return; /* the generated array-arm shape */
+                    is.read(guarded);
+                }
+                /* every other id: not ours, never read */
+            }
+        };
+        struct Case { const char *what; const uint8_t *bytes; size_t n; size_t want; };
+        const uint8_t unknownId[]  = {0x38, 0x2a};       /* id 7, unsigned — no arm */
+        const uint8_t knownOk[]    = {0x00, 0x09};       /* id 0, unsigned — matches */
+        const uint8_t knownWrong[] = {0x01, 0x06};       /* id 0, SIGNED — contradicts */
+        const uint8_t guardedBad[] = {0x09, 0x06};       /* id 1, SIGNED — guard returns before read */
+        const Case cases[] = {
+            {"unknown id is not a disagreement",              unknownId,  sizeof unknownId,  0},
+            {"a matching field is not a disagreement",        knownOk,    sizeof knownOk,    0},
+            {"a known id with a contradicting tag counts",    knownWrong, sizeof knownWrong, 1},
+            {"a guarded arm's skip is invisible (known gap)", guardedBad, sizeof guardedBad, 0},
+        };
+        for (const auto &c : cases)
+        {
+            sofab::IStreamObject<Watched> in;
+            auto r = in.feed(c.bytes, c.n);
+            CHECK(r.code() == sofab::Error::None, "skip-count: the probe message decodes COMPLETE");
+            CHECK(r.skipped() == c.want, c.what);
+        }
+    }
+
     /* Resync: a skipped (mismatched) field must leave the cursor at the next field
      * so a following, correctly-typed field still decodes. id0 Signed (mismatch ->
      * skip), then id1 Signed value -42 (0x09 = id1|Signed, 0x53 = zig-zag(-42)). */
