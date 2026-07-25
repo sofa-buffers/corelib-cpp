@@ -166,40 +166,38 @@ namespace sofab
     /* wire-format primitives                                                 */
     /* ---------------------------------------------------------------------- */
 
-    /// @brief Wire type stored in the low 3 bits of every field header.
-    ///
-    /// Part of the public API: returned by @ref IStreamImpl::wire so a deliver
-    /// callback can honour the @ref IStreamImpl::read precondition (§7.3) —
-    /// compare against the wire type its declared field maps to and skip on a
-    /// mismatch.
-    enum class Wire : uint8_t
-    {
-        Unsigned = 0,      ///< Unsigned integer encoded as a varint.
-        Signed = 1,        ///< Signed integer, zig-zag encoded as a varint.
-        Fixlen = 2,        ///< Length-prefixed payload (float, string or blob).
-        ArrayUnsigned = 3, ///< Count-prefixed array of unsigned varints.
-        ArraySigned = 4,   ///< Count-prefixed array of zig-zag varints.
-        ArrayFixlen = 5,   ///< Count-prefixed array of fixed-size elements.
-        SequenceStart = 6, ///< Opens a nested sub-message.
-        SequenceEnd = 7,   ///< Closes the most recently opened sub-message.
-    };
-
-    /// @brief Sub-type of a length-prefixed (`Fixlen`) payload, stored in the low 3 bits of its length word.
-    ///
-    /// Part of the public API: returned by @ref IStreamImpl::fixType. §7.3 bounds
-    /// the type check at wire type *plus* this subtype, since `fp32`/`fp64`/
-    /// `string`/`blob` all share the @ref Wire::Fixlen wire type.
-    enum class Fix : uint8_t
-    {
-        Fp32 = 0,   ///< 32-bit IEEE-754 float.
-        Fp64 = 1,   ///< 64-bit IEEE-754 double.
-        String = 2, ///< UTF-8 text.
-        Blob = 3,   ///< Opaque byte string.
-    };
 
     /// Implementation details of the wire format; not part of the public API.
     namespace detail
     {
+        /// @brief Wire type stored in the low 3 bits of every field header.
+        ///
+        /// Internal. The typed reads compare it themselves (§7.3), so neither generated
+        /// nor hand-written code has to name it.
+        enum class Wire : uint8_t
+        {
+            Unsigned = 0,      ///< Unsigned integer encoded as a varint.
+            Signed = 1,        ///< Signed integer, zig-zag encoded as a varint.
+            Fixlen = 2,        ///< Length-prefixed payload (float, string or blob).
+            ArrayUnsigned = 3, ///< Count-prefixed array of unsigned varints.
+            ArraySigned = 4,   ///< Count-prefixed array of zig-zag varints.
+            ArrayFixlen = 5,   ///< Count-prefixed array of fixed-size elements.
+            SequenceStart = 6, ///< Opens a nested sub-message.
+            SequenceEnd = 7,   ///< Closes the most recently opened sub-message.
+        };
+
+        /// @brief Sub-type of a length-prefixed (`Fixlen`) payload, stored in the low 3 bits of its length word.
+        ///
+        /// Internal, like @ref Wire. §7.3 bounds the type check at wire type *plus* this
+        /// subtype, since `fp32`/`fp64`/`string`/`blob` share @ref Wire::Fixlen.
+        enum class Fix : uint8_t
+        {
+            Fp32 = 0,   ///< 32-bit IEEE-754 float.
+            Fp64 = 1,   ///< 64-bit IEEE-754 double.
+            String = 2, ///< UTF-8 text.
+            Blob = 3,   ///< Opaque byte string.
+        };
+
         /// Largest permitted field id (`INT32_MAX`); larger ids are rejected with @ref Error::InvalidArgument.
         inline constexpr uint32_t kIdMax = 0x7fffffffu; /* INT32_MAX */
 
@@ -364,6 +362,11 @@ namespace sofab
      */
     class OStreamImpl
     {
+        /* The wire tag types are implementation detail (sofab::detail); these
+         * aliases keep this class terse without re-exporting the names. */
+        using Wire = detail::Wire;
+        using Fix = detail::Fix;
+
     public:
         /// Callback invoked with a span of finished bytes whenever the buffer flushes.
         using flushCallback = std::function<void(std::span<const uint8_t>)>;
@@ -1021,6 +1024,11 @@ namespace sofab
      */
     class IStreamImpl
     {
+        /* The wire tag types are implementation detail (sofab::detail); these
+         * aliases keep this class terse without re-exporting the names. */
+        using Wire = detail::Wire;
+        using Fix = detail::Fix;
+
     public:
         /**
          * @brief Three-valued outcome of a @ref feed call (spec §7).
@@ -1992,11 +2000,12 @@ namespace sofab
         /**
          * @brief Wire type of the field currently being delivered.
          *
-         * Valid inside a deliver callback. Lets a caller honour the @ref read
-         * precondition (§7.3): compare against the wire type its declared field
-         * maps to and, on a mismatch, simply return without calling @ref read —
-         * the field is then skipped automatically. Reads no bytes and does not
-         * consume the field.
+         * Valid inside a deliver callback. Introspection only: the typed reads
+         * compare the tag themselves and skip a contradicting field (§7.3), so a
+         * caller does not need this to be correct — it is here for diagnostics and
+         * for code that wants to branch on the delivered form. The type it returns
+         * lives in @ref sofab::detail. Reads no bytes and does not consume the
+         * field.
          *
          * @return The delivered field's @ref Wire.
          */
@@ -2010,10 +2019,9 @@ namespace sofab
         /**
          * @brief Fixlen sub-type of the field currently being delivered.
          *
-         * Only meaningful when @ref wire is @ref Wire::Fixlen or
-         * @ref Wire::ArrayFixlen; §7.3 bounds the type check at wire type
-         * *plus* this subtype, since `fp32`/`fp64`/`string`/`blob` share the
-         * fixlen wire type. Reads no bytes and does not consume the field.
+         * Only meaningful when @ref wire is a fixlen kind. Introspection only,
+         * like @ref wire: `readString` / `readBlob` state the declared subtype and
+         * the stream compares it. Reads no bytes and does not consume the field.
          *
          * @return The delivered field's @ref Fix.
          */
@@ -2211,15 +2219,14 @@ namespace sofab
 
         void deserialize(IStreamImpl &is, sofab::id id, size_t size, size_t) noexcept override
         {
-            /* Decided from the header, so they hold even when the element is
-             * truncated (§5.2): §7.3 first -- a mis-typed element is not this
-             * array's and carries none of its bounds -- then the over-index reject
-             * (§5.1/§7) and the element maxlen (§7.1). */
-            if (is.wire() != Wire::Fixlen || is.fixType() != Fix::String) return;
-            if (cap >= 0 && static_cast<size_t>(id) >= static_cast<size_t>(cap)) { is.invalidate(); return; }
-            if (emax >= 0 && size > static_cast<size_t>(emax)) { is.invalidate(); return; }
+            /* readString decides both, in the order §5.2 needs and before the
+             * payload: the declared subtype (§7.3 -- a mis-typed element is not
+             * this array's) and then the element maxlen (§7.1). The over-index
+             * reject (§5.1) is enforced by the stream at the element header, from
+             * `cap` below, since a truncated element would outrun a check here. */
+            (void)size;
             std::string s;
-            if (!is.readString(s)) return;
+            if (!is.readString(s, emax)) return;
             while (out.size() <= static_cast<size_t>(id)) out.emplace_back();
             out[id] = std::move(s);
         }
@@ -2240,11 +2247,9 @@ namespace sofab
 
         void deserialize(IStreamImpl &is, sofab::id id, size_t size, size_t) noexcept override
         {
-            if (is.wire() != Wire::Fixlen || is.fixType() != Fix::Blob) return; /* §7.3, see StringSeq */
-            if (cap >= 0 && static_cast<size_t>(id) >= static_cast<size_t>(cap)) { is.invalidate(); return; }
-            if (emax >= 0 && size > static_cast<size_t>(emax)) { is.invalidate(); return; }
+            (void)size;
             std::vector<uint8_t> b;
-            if (!is.readBlob(b)) return;
+            if (!is.readBlob(b, emax)) return; /* §7.3 + §7.1, see StringSeq */
             while (out.size() <= static_cast<size_t>(id)) out.emplace_back();
             out[id] = std::move(b);
         }

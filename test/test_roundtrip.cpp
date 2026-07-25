@@ -769,7 +769,7 @@ static void wireTypeGuard()
         void deserialize(sofab::IStreamImpl &is, sofab::id id, size_t, size_t) noexcept override
         {
             if (id != 0) return;
-            if (is.wire() != sofab::Wire::Unsigned) return; /* §7.3: skip on mismatch */
+            if (is.wire() != sofab::detail::Wire::Unsigned) return; /* §7.3: skip on mismatch */
             is.read(v);
             read = true;
         }
@@ -865,7 +865,7 @@ static void wireTypeGuard()
                 if (id == 0) is.read(known);
                 else if (id == 1)
                 {
-                    if (is.wire() != sofab::Wire::Unsigned) return; /* the generated array-arm shape */
+                    if (is.wire() != sofab::detail::Wire::Unsigned) return; /* the generated array-arm shape */
                     is.read(guarded);
                 }
                 /* every other id: not ours, never read */
@@ -902,8 +902,8 @@ static void wireTypeGuard()
             bool readA = false;
             void deserialize(sofab::IStreamImpl &is, sofab::id id, size_t, size_t) noexcept override
             {
-                if (id == 0) { if (is.wire() != sofab::Wire::Unsigned) return; is.read(a); readA = true; }
-                else if (id == 1) { if (is.wire() != sofab::Wire::Signed) return; is.read(b); }
+                if (id == 0) { if (is.wire() != sofab::detail::Wire::Unsigned) return; is.read(a); readA = true; }
+                else if (id == 1) { if (is.wire() != sofab::detail::Wire::Signed) return; is.read(b); }
             }
         };
         const uint8_t bytes[] = {0x01, 0x06, 0x09, 0x53};
@@ -925,7 +925,7 @@ static void wireTypeGuard()
             void deserialize(sofab::IStreamImpl &is, sofab::id id, size_t, size_t) noexcept override
             {
                 if (id != 5) return;
-                if (is.wire() != sofab::Wire::Fixlen || is.fixType() != sofab::Fix::String) return;
+                if (is.wire() != sofab::detail::Wire::Fixlen || is.fixType() != sofab::detail::Fix::String) return;
                 is.read(s);
                 read = true;
             }
@@ -960,8 +960,8 @@ static void wireTypeGuard()
 
         struct Recorder : sofab::IStreamMessage
         {
-            std::vector<sofab::Wire> w;
-            std::vector<sofab::Fix> f;
+            std::vector<sofab::detail::Wire> w;
+            std::vector<sofab::detail::Fix> f;
             void deserialize(sofab::IStreamImpl &is, sofab::id, size_t, size_t) noexcept override
             { w.push_back(is.wire()); f.push_back(is.fixType()); } /* no read(): fields auto-skip */
         };
@@ -969,10 +969,10 @@ static void wireTypeGuard()
         auto r = in.feed(os.data(), os.bytesUsed());
         CHECK(r.code() == sofab::Error::None, "accessor: readout message is COMPLETE");
         CHECK((*in).w.size() == 4, "accessor: all four fields delivered");
-        CHECK((*in).w[0] == sofab::Wire::Unsigned, "accessor: field 0 wire is Unsigned");
-        CHECK((*in).w[1] == sofab::Wire::Signed, "accessor: field 1 wire is Signed");
-        CHECK((*in).w[2] == sofab::Wire::Fixlen && (*in).f[2] == sofab::Fix::Fp32, "accessor: field 2 is Fixlen/Fp32");
-        CHECK((*in).w[3] == sofab::Wire::Fixlen && (*in).f[3] == sofab::Fix::String, "accessor: field 3 is Fixlen/String");
+        CHECK((*in).w[0] == sofab::detail::Wire::Unsigned, "accessor: field 0 wire is Unsigned");
+        CHECK((*in).w[1] == sofab::detail::Wire::Signed, "accessor: field 1 wire is Signed");
+        CHECK((*in).w[2] == sofab::detail::Wire::Fixlen && (*in).f[2] == sofab::detail::Fix::Fp32, "accessor: field 2 is Fixlen/Fp32");
+        CHECK((*in).w[3] == sofab::detail::Wire::Fixlen && (*in).f[3] == sofab::detail::Fix::String, "accessor: field 3 is Fixlen/String");
     }
 }
 
@@ -1205,7 +1205,7 @@ static void bufferLimits()
  *     decides whether encode/decode invoke it. --- */
 
 /* Encode a single string/blob field (id 5) so it can be fed straight into ScalarMsg. */
-static std::vector<uint8_t> stringFieldWire(std::string_view payload, sofab::Fix sub)
+static std::vector<uint8_t> stringFieldWire(std::string_view payload, sofab::detail::Fix sub)
 {
     std::vector<uint8_t> w;
     w.push_back(static_cast<uint8_t>((5u << 3) | 2u)); /* id 5, Fixlen */
@@ -1274,7 +1274,7 @@ static void strictUtf8()
     /* --- a valid multi-byte sequence split across feed() stays INCOMPLETE and
      *     completes to COMPLETE — a chunk boundary never forces INVALID. --- */
     {
-        auto w = stringFieldWire("\xE2\x82\xAC", sofab::Fix::String); /* 5 bytes total */
+        auto w = stringFieldWire("\xE2\x82\xAC", sofab::detail::Fix::String); /* 5 bytes total */
         sofab::IStreamObject<ScalarMsg> in;
         auto r1 = in.feed(w.data(), w.size() - 1); /* split mid-sequence (E2 82 | AC) */
         CHECK(r1.code() == sofab::Error::Incomplete, "utf8: cross-chunk split is INCOMPLETE, not INVALID");
@@ -1298,7 +1298,7 @@ static void strictUtf8()
 
     /* --- decode rejects an invalid-UTF-8 materialised string as INVALID. --- */
     {
-        auto w = stringFieldWire("\xC0\x80", sofab::Fix::String);
+        auto w = stringFieldWire("\xC0\x80", sofab::detail::Fix::String);
         sofab::IStreamObject<ScalarMsg> in;
         auto r = in.feed(w.data(), w.size());
         CHECK(r.code() == sofab::Error::InvalidMessage, "utf8/strict: decode rejects C0 80 string as INVALID");
@@ -1306,7 +1306,7 @@ static void strictUtf8()
     }
     {
         /* truncated-at-end-of-payload (declared length reached mid-sequence) is INVALID. */
-        auto w = stringFieldWire("\xE2\x82", sofab::Fix::String);
+        auto w = stringFieldWire("\xE2\x82", sofab::detail::Fix::String);
         sofab::IStreamObject<ScalarMsg> in;
         auto r = in.feed(w.data(), w.size());
         CHECK(r.code() == sofab::Error::InvalidMessage, "utf8/strict: truncated-at-end string is INVALID");
@@ -1317,7 +1317,7 @@ static void strictUtf8()
         struct SkipAll : sofab::IStreamMessage {
             void deserialize(sofab::IStreamImpl &, sofab::id, size_t, size_t) noexcept override {} /* read nothing */
         };
-        auto w = stringFieldWire("\xC0\x80", sofab::Fix::String);
+        auto w = stringFieldWire("\xC0\x80", sofab::detail::Fix::String);
         sofab::IStreamObject<SkipAll> in;
         auto r = in.feed(w.data(), w.size());
         CHECK(r.code() == sofab::Error::None, "utf8/strict: a SKIPPED invalid-UTF-8 string is not validated (COMPLETE)");
@@ -1332,7 +1332,7 @@ static void strictUtf8()
     }
     {
         /* a Blob-subtype fixlen read into a std::string is not validated. */
-        auto w = stringFieldWire("\xC0\x80", sofab::Fix::Blob);
+        auto w = stringFieldWire("\xC0\x80", sofab::detail::Fix::Blob);
         sofab::IStreamObject<ScalarMsg> in;
         auto r = in.feed(w.data(), w.size());
         CHECK(r.code() == sofab::Error::None, "utf8/strict: Blob-subtype payload is not UTF-8 validated");
