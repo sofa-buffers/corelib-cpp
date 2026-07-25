@@ -1168,6 +1168,7 @@ namespace sofab
         size_t skipped_ = 0;           ///< §7.3 type-mismatch skips seen so far (@ref skipped).
         bool incomplete_ = false;      ///< The field being delivered needs more bytes (§7 INCOMPLETE, not malformed).
         bool declined_ = false;        ///< The buffered field was already offered and not read: skip it, do not deliver again.
+        long elemBound_ = -1;          ///< Element-index bound of the wrapper sequence being read (§5.1); -1 = none.
         sofab::id fieldId_ = 0;        ///< Id of the field being delivered.
         const uint8_t *fieldStart_ = nullptr; ///< First byte of that field, for the #26 reassembly cap.
 
@@ -1568,6 +1569,11 @@ namespace sofab
                 if ((header >> 3) > detail::kIdMax) { error_ = true; return; }
                 auto fieldId = static_cast<sofab::id>(header >> 3);
                 type_ = static_cast<Wire>(header & 0x7);
+                /* §5.1/§7: an element index at or past the declared count is INVALID,
+                 * decided on the id alone so a truncated element cannot outrun it. */
+                if (elemBound_ >= 0 && type_ != Wire::SequenceEnd &&
+                    static_cast<long>(fieldId) >= elemBound_)
+                { error_ = true; return; }
 
                 if (type_ == Wire::SequenceEnd)
                 {
@@ -2017,12 +2023,21 @@ namespace sofab
                  * plain struct/union targets do not and pay nothing, since this is a
                  * template and the call disappears at compile time. */
                 if constexpr (requires { value.prepare(); }) value.prepare();
+                /* §5.1: in a wrapper sequence the element id IS its index, so the
+                 * bound is decidable from the header alone -- before the element's
+                 * metadata word, which may not have arrived. A collector declares
+                 * it by carrying `cap`; the check then lives here rather than in
+                 * the collector, where a truncated element would outrun it. */
+                const long outerBound = elemBound_;
+                if constexpr (requires { value.cap; }) elemBound_ = value.cap;
+                else                                   elemBound_ = -1;
                 /* descend into a nested sequence */
                 if (seqDepth_ >= MAX_DEPTH) { error_ = true; return false; } /* §4.9 */
                 ++seqDepth_;
                 dispatchLevel([this, &value](sofab::id i, size_t s, size_t c) {
                     value.deserialize(*this, i, s, c);
                 }, /*stopAtEnd*/ true);
+                elemBound_ = outerBound;
                 --seqDepth_;
                 /* A sequence cut short is NOT consumed: the whole field is
                  * delivered again once its remaining bytes arrive. */
