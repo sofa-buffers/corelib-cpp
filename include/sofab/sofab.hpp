@@ -311,8 +311,14 @@ namespace sofab
                     }
                     if (i >= len) break;
                 }
-                /* multi-byte (or stray ASCII tail): step the DFA until it is
-                 * back at ACCEPT, then hand control to the SWAR loop again. */
+                /* Stray ASCII tail: a run shorter than 8 bytes never enters the
+                 * SWAR skip, so a mostly-ASCII short payload would otherwise pay
+                 * the DFA's two-lookups-per-byte for plain ASCII. Advance ASCII
+                 * with one branch, exactly as the pre-DFA scalar loop did; only a
+                 * genuine multi-byte lead falls through to the DFA below. */
+                if (static_cast<unsigned char>(data[i]) < 0x80) { ++i; continue; }
+                /* multi-byte: step the DFA until it is back at ACCEPT, then hand
+                 * control to the SWAR loop again. */
                 state = utf8Dfa[256u + state + utf8Dfa[static_cast<unsigned char>(data[i])]];
                 if (state == 12) return false;
                 ++i;
