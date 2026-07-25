@@ -1158,6 +1158,7 @@ namespace sofab
         bool error_ = false;           ///< Sticky decode-error flag for the current @ref feed.
         bool limitExceeded_ = false;   ///< Sticky flag: a field crossed @ref maxBufferedField_ this @ref feed.
         int seqDepth_ = 0;             ///< Current nested-sequence depth during dispatch (§4.9 @ref MAX_DEPTH).
+        size_t skipped_ = 0;           ///< §7.3 type-mismatch skips seen so far (@ref skipped).
 
         /// Cap on the reassembly buffer's growth for one incomplete field (@ref Limits::max_buffered_field).
         size_t maxBufferedField_ = SIZE_MAX;
@@ -1349,6 +1350,39 @@ namespace sofab
             bool overflow = false;
             if (skipVarint(p, end, &overflow)) return true;
             if (overflow) error_ = true;
+            return false;
+        }
+
+        /**
+         * @brief The §7.3 seam: does the delivered field's wire tag match the one
+         *        the caller's read declares?
+         *
+         * A field's *tag* is its wire type plus, for the fixlen kinds, the subtype
+         * — the two are only meaningful together, since `fp32`, `fp64`, `string`
+         * and `blob` all share @ref Wire::Fixlen. Every typed @ref read compares
+         * the whole tag here, so half a comparison cannot be written.
+         *
+         * On a mismatch the field is left unconsumed: @ref dispatchOne then skips
+         * it exactly like an unknown id, which is what MESSAGE_SPEC §7.3 requires
+         * — this is **not** an error, and never affects the decode outcome. The
+         * skip is counted in @ref skipped_ as a diagnostic.
+         *
+         * @param wantWire Wire type the read declares.
+         * @param wantFix  Fixlen subtype it declares; ignored unless @p wantWire is
+         *                 a fixlen kind and the caller separates the subtypes.
+         * @return `true` when the caller may consume the field.
+         */
+        [[nodiscard]] bool tagMatches(Wire wantWire) noexcept
+        {
+            if (type_ == wantWire) return true;
+            ++skipped_;
+            return false;
+        }
+
+        [[nodiscard]] bool tagMatches(Wire wantWire, Fix wantFix) noexcept
+        {
+            if (type_ == wantWire && fixType_ == wantFix) return true;
+            ++skipped_;
             return false;
         }
 
@@ -1758,10 +1792,21 @@ namespace sofab
     public:
 
         /**
+         * @brief Number of fields skipped this stream because their wire tag
+         *        contradicted the type the callback asked for (MESSAGE_SPEC §7.3).
+         *
+         * A diagnostic only — it never influences the decode outcome. A non-zero
+         * count on an otherwise `COMPLETE` message means the peer's schema and
+         * this one disagree about a field's type (or a hand-written callback
+         * asked for the wrong one). Reset per @ref feed sequence, i.e. it
+         * accumulates over the chunks of one message.
+         */
+        [[nodiscard]] size_t skipped() const noexcept { return skipped_; }
+
+        /**
          * @brief Read the current field's value, dispatching on @p value's type.
          *
-         * Call from inside a deliver callback. The requested type must match the
-         * field's wire type. Handles integers (signed values are un-zig-zagged),
+         * Call from inside a deliver callback. Handles integers (signed values are un-zig-zagged),
          * `bool`, `float`, `double`, `std::string`, `std::string_view` (zero-copy,
          * valid while the source bytes live), nested @ref sofab::IStreamMessage objects,
          * and writable contiguous ranges of integers or floats (excess wire
@@ -1772,35 +1817,45 @@ namespace sofab
          * @param[out] value Destination for the decoded value.
          */
         template <typename T>
-        void read(T &value) noexcept
+        bool read(T &value) noexcept
         {
             if constexpr (std::is_integral_v<T> && !std::is_same_v<T, bool>)
             {
+                constexpr Wire want = std::is_unsigned_v<T> ? Wire::Unsigned : Wire::Signed;
+                if (!tagMatches(want)) return false; /* §7.3 */
                 uint64_t raw;
-                if (!getVarint(p_, end_, raw)) { error_ = true; return; }
+                if (!getVarint(p_, end_, raw)) { error_ = true; return false; }
                 if constexpr (std::is_unsigned_v<T>) value = static_cast<T>(raw);
                 else                                 value = static_cast<T>(detail::zigzagDecode(raw));
                 consumed_ = true;
             }
             else if constexpr (std::is_same_v<T, bool>)
             {
+                /* §4.2: bool travels as an unsigned varint. */
+                if (!tagMatches(Wire::Unsigned)) return false; /* §7.3 */
                 uint64_t raw;
-                if (!getVarint(p_, end_, raw)) { error_ = true; return; }
+                if (!getVarint(p_, end_, raw)) { error_ = true; return false; }
                 value = (raw != 0);
                 consumed_ = true;
             }
             else if constexpr (std::is_same_v<T, float> || std::is_same_v<T, double>)
             {
-                if (static_cast<size_t>(end_ - p_) < sizeof(T)) { error_ = true; return; }
+                constexpr Fix want = std::is_same_v<T, float> ? Fix::Fp32 : Fix::Fp64;
+                if (!tagMatches(Wire::Fixlen, want)) return false; /* §7.3 */
+                if (static_cast<size_t>(end_ - p_) < sizeof(T)) { error_ = true; return false; }
                 value = loadFloat<T>(p_);
                 p_ += sizeof(T);
                 consumed_ = true;
             }
             else if constexpr (std::is_same_v<T, std::string_view>)
             {
+                /* §7.3: `string` and `blob` share Wire::Fixlen and both materialise
+                 * into this type, so only the wire type is checked here; a caller
+                 * that must separate the two calls @ref readString / @ref readBlob. */
+                if (!tagMatches(Wire::Fixlen)) return false;
                 /* zero-copy: the view points into the source buffer, valid as
                  * long as that buffer (or this stream's accumulator) lives. */
-                if (static_cast<size_t>(end_ - p_) < fixLen_) { error_ = true; return; }
+                if (static_cast<size_t>(end_ - p_) < fixLen_) { error_ = true; return false; }
 #if SOFAB_STRICT_UTF8
                 /* §6.4: a materialised `string` (fixlen subtype String) whose
                  * complete payload is not valid UTF-8 is the INVALID outcome —
@@ -1812,7 +1867,7 @@ namespace sofab
                  * validated; a skipped field never reaches read(). */
                 if (fixType_ == Fix::String &&
                     !detail::utf8Valid(reinterpret_cast<const char *>(p_), fixLen_))
-                { error_ = true; return; }
+                { error_ = true; return false; }
 #endif
                 value = std::string_view(reinterpret_cast<const char *>(p_), fixLen_);
                 p_ += fixLen_;
@@ -1820,7 +1875,8 @@ namespace sofab
             }
             else if constexpr (std::is_same_v<T, std::string>)
             {
-                if (static_cast<size_t>(end_ - p_) < fixLen_) { error_ = true; return; }
+                if (!tagMatches(Wire::Fixlen)) return false; /* §7.3, see the view branch */
+                if (static_cast<size_t>(end_ - p_) < fixLen_) { error_ = true; return false; }
 #if SOFAB_STRICT_UTF8
                 /* §6.4: reject an invalid-UTF-8 `string` payload as INVALID (see
                  * the std::string_view branch above for the full rationale).
@@ -1828,7 +1884,7 @@ namespace sofab
                  * is never validated. */
                 if (fixType_ == Fix::String &&
                     !detail::utf8Valid(reinterpret_cast<const char *>(p_), fixLen_))
-                { error_ = true; return; }
+                { error_ = true; return false; }
 #endif
                 value.assign(reinterpret_cast<const char *>(p_), fixLen_);
                 p_ += fixLen_;
@@ -1836,8 +1892,9 @@ namespace sofab
             }
             else if constexpr (InputMessage<T>)
             {
+                if (!tagMatches(Wire::SequenceStart)) return false; /* §7.3 */
                 /* descend into a nested sequence */
-                if (seqDepth_ >= MAX_DEPTH) { error_ = true; return; } /* §4.9 */
+                if (seqDepth_ >= MAX_DEPTH) { error_ = true; return false; } /* §4.9 */
                 ++seqDepth_;
                 dispatchLevel([this, &value](sofab::id i, size_t s, size_t c) {
                     value.deserialize(*this, i, s, c);
@@ -1853,10 +1910,13 @@ namespace sofab
                 size_t n = std::min(sp.size(), count_);
                 if constexpr (std::is_integral_v<Elem> && !std::is_same_v<Elem, bool>)
                 {
+                    /* §7.3: the element kind selects the array wire type. */
+                    constexpr Wire want = std::is_unsigned_v<Elem> ? Wire::ArrayUnsigned : Wire::ArraySigned;
+                    if (!tagMatches(want)) return false;
                     for (size_t i = 0; i < count_; ++i)
                     {
                         uint64_t raw;
-                        if (!getVarint(p_, end_, raw)) { error_ = true; return; }
+                        if (!getVarint(p_, end_, raw)) { error_ = true; return false; }
                         if (i < n)
                         {
                             if constexpr (std::is_unsigned_v<Elem>) sp[i] = static_cast<Elem>(raw);
@@ -1867,8 +1927,10 @@ namespace sofab
                 }
                 else if constexpr (std::is_same_v<Elem, float> || std::is_same_v<Elem, double>)
                 {
+                    constexpr Fix want = std::is_same_v<Elem, float> ? Fix::Fp32 : Fix::Fp64;
+                    if (!tagMatches(Wire::ArrayFixlen, want)) return false; /* §7.3 */
                     size_t bytes = count_ * sizeof(Elem);
-                    if (static_cast<size_t>(end_ - p_) < bytes) { error_ = true; return; }
+                    if (static_cast<size_t>(end_ - p_) < bytes) { error_ = true; return false; }
                     if constexpr (std::endian::native == std::endian::little)
                         std::memcpy(sp.data(), p_, n * sizeof(Elem)); /* wire == native */
                     else
@@ -1885,6 +1947,46 @@ namespace sofab
             {
                 static_assert(always_false_v<T>, "Unsupported type passed to IStream::read()");
             }
+            return true;
+        }
+
+        /**
+         * @brief Read the current field as a `string`, or skip it (§7.3).
+         *
+         * `fp32`, `fp64`, `string` and `blob` all share @ref Wire::Fixlen, so a
+         * plain @ref read cannot tell which one the caller declared. This overload
+         * states it: the value is read only when the wire subtype is
+         * @ref Fix::String, otherwise the field is left unconsumed — the decoder
+         * then skips it exactly like an unknown id, and @ref skipped counts it.
+         *
+         * @param[out] value Destination for the decoded text.
+         * @return `true` when the value was read; `false` when the field was left
+         *         for the decoder to skip.
+         */
+        bool readString(std::string &value) noexcept
+        {
+            if (!tagMatches(Wire::Fixlen, Fix::String)) return false;
+            return read(value);
+        }
+
+        /**
+         * @brief Read the current field as a `blob`, or skip it (§7.3).
+         *
+         * The @ref Fix::Blob counterpart of @ref readString; reads straight into
+         * the byte container, with no intermediate `std::string`.
+         *
+         * @param[out] value Destination for the decoded bytes.
+         * @return `true` when the value was read; `false` when the field was left
+         *         for the decoder to skip.
+         */
+        bool readBlob(std::vector<uint8_t> &value) noexcept
+        {
+            if (!tagMatches(Wire::Fixlen, Fix::Blob)) return false;
+            if (static_cast<size_t>(end_ - p_) < fixLen_) { error_ = true; return false; }
+            value.assign(p_, p_ + fixLen_);
+            p_ += fixLen_;
+            consumed_ = true;
+            return true;
         }
 
         /**

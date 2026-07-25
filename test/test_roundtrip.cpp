@@ -815,20 +815,25 @@ static void wireTypeGuard()
         CHECK(!(*in).read && (*in).v == 0xABCD, "wire-guard: mismatched wire type is not read (no silent mis-decode)");
     }
 
-    /* Control — the exact mis-decode §7.3 prevents: an unguarded reader pulls the
-     * raw varint and applies no zig-zag, yielding 6 where the Signed value is 3.
-     * This is the gap the accessor closes. */
+    /* The same shape with NO hand-written guard. This used to be the gap: the
+     * unguarded reader pulled the raw varint without zig-zag and yielded 6 where
+     * the Signed value is 3. read() now compares the wire tag itself (§7.3), so
+     * the field is left unconsumed, the decoder skips it, the member keeps its
+     * default — and the skip is counted. A caller no longer needs wire() for this. */
     {
         struct UnguardedU : sofab::IStreamMessage
         {
             uint32_t v = 0;
+            bool taken = false;
             void deserialize(sofab::IStreamImpl &is, sofab::id id, size_t, size_t) noexcept override
-            { if (id == 0) is.read(v); }
+            { if (id == 0) taken = is.read(v); }
         };
         const uint8_t bytes[] = {0x01, 0x06}; /* Signed, zig-zag 6 = 3 */
         sofab::IStreamObject<UnguardedU> in;
-        in.feed(bytes, sizeof bytes);
-        CHECK((*in).v == 6, "wire-guard: an unguarded read mis-decodes the Signed value (demonstrates the gap)");
+        auto r = in.feed(bytes, sizeof bytes);
+        CHECK(r.code() == sofab::Error::None, "read-seam: a skipped mismatch stays COMPLETE");
+        CHECK((*in).v == 0 && !(*in).taken, "read-seam: read() skips a mismatched wire type (no silent mis-decode)");
+        CHECK(in.skipped() == 1, "read-seam: the skip is counted");
     }
 
     /* Resync: a skipped (mismatched) field must leave the cursor at the next field
