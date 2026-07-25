@@ -2196,6 +2196,52 @@ namespace sofab
     };
 
     /**
+     * @brief A message that both encodes and decodes: exactly
+     *        @ref OStreamMessage + @ref IStreamMessage.
+     *
+     * Almost every message is both, so spelling out the pair at every declaration
+     * is noise. This is an empty intermediate base — no storage, no vtable slot of
+     * its own, identical layout to inheriting the two directly — so it is a naming
+     * convenience and nothing else:
+     *
+     * ```cpp
+     * struct Telemetry : sofab::Message {
+     *     sofab::OStreamImpl::Result serialize(sofab::OStreamImpl &os) const noexcept override;
+     *     void deserialize(sofab::IStreamImpl &is, sofab::id id, size_t, size_t) noexcept override;
+     * };
+     * ```
+     *
+     * Both @ref sofab::InputMessage and @ref sofab::OutputMessage are satisfied
+     * through it. Inherit a single side directly when a type really is one-way.
+     */
+    struct Message : OStreamMessage, IStreamMessage
+    {
+    };
+
+    /**
+     * @brief Binds a message type to its measure-phase schema, if it has one.
+     *
+     * @ref IStreamObject consults this and installs the schema itself, so a
+     * message never has to call @ref IStreamImpl::setSchema. The primary template
+     * declares no `node`, which is the "this type carries no bounds" case;
+     * generated code specialises it next to the descriptors it generates:
+     *
+     * ```cpp
+     * template <> struct sofab::SchemaOf<myns::Telemetry> {
+     *     static constexpr const schema::SeqNode *node = &myns::Telemetry_schema;
+     * };
+     * ```
+     *
+     * The specialisation only needs @p T declared, not complete.
+     *
+     * @tparam T Message type.
+     */
+    template <typename T>
+    struct SchemaOf
+    {
+    };
+
+    /**
      * @brief Holds a message and routes decoded top-level fields into it.
      *
      * Owns a @p MessageType instance and wires its @ref sofab::IStreamMessage::deserialize
@@ -2218,6 +2264,12 @@ namespace sofab
             topCallback_ = [this](sofab::id id, size_t size, size_t count) {
                 data_.deserialize(*this, id, size, count);
             };
+            /* §5.2: install the message's bound descriptors, if it has any, so the
+             * measure walk can reject an over-bound field at its deciding word.
+             * Looked up rather than passed in, so the message itself carries no
+             * decoder plumbing (@ref SchemaOf). */
+            if constexpr (requires { SchemaOf<MessageType>::node; })
+                setSchema(SchemaOf<MessageType>::node);
         }
 
         /// @return The wrapped message (mutable access).
