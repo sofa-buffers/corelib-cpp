@@ -1030,6 +1030,21 @@ namespace sofab
         {
             uint32_t       id;           ///< Field id this bound applies to.
             sofab::Wire    wire;         ///< Expected wire type; the bound is enforced only on an exact match.
+            /**
+             * @brief Declared fixlen subtype, for a @ref Wire::Fixlen bound.
+             *
+             * fp32, fp64, string and blob all share @ref Wire::Fixlen, so the wire
+             * type alone does not identify the declared type. A fixlen value whose
+             * subtype *contradicts* the declaration is skipped like an unknown id
+             * (MESSAGE_SPEC §7.3) and therefore carries no bound, so the `maxlen`
+             * check matches this subtype as well as @ref wire.
+             *
+             * Must be set on every @ref Wire::Fixlen row; unread for every other
+             * wire type. The default is deliberately `Fp32`, which no bounded
+             * fixlen field can declare (only string/blob carry a `maxlen`), so an
+             * unset subtype disables that row's bound rather than misapplying it.
+             */
+            sofab::Fix     subtype = sofab::Fix::Fp32;
             uint64_t       bound;        ///< count `N` (array) or maxlen `L` (string/blob); `0` = unbounded.
             const SeqNode *child;        ///< Non-null for a nested struct/union/wrapper-array: the next level.
             bool           wrapperArray; ///< `true` when an element's id IS its index → enforce over-INDEX, not over-count.
@@ -1390,9 +1405,15 @@ namespace sofab
                     if (!fixlenWordValid(sub)) { error_ = true; return false; }
                     size_t len = static_cast<size_t>(sub >> 3);
                     /* §7.1/§5.2: a length past the schema `maxlen` is INVALID even when
-                     * the promised payload never arrives (anti-folding). */
+                     * the promised payload never arrives (anti-folding). The bound is
+                     * gated on the DECLARED subtype as well as the wire type: fp32,
+                     * fp64, string and blob all share Wire::Fixlen, and a value whose
+                     * subtype contradicts the declaration is skipped like an unknown
+                     * id (§7.3) — so it carries no bound (generator#229). */
                     if constexpr (Schema)
-                        if (fb && fb->wire == Wire::Fixlen && fb->bound && len > fb->bound) { error_ = true; return false; }
+                        if (fb && fb->wire == Wire::Fixlen && fb->bound
+                            && static_cast<Fix>(sub & 0x7) == fb->subtype
+                            && len > fb->bound) { error_ = true; return false; }
                     /* #26: the declared payload size is known now — reject an oversize
                      * claim before waiting for (or buffering) the bytes it promises. */
                     if constexpr (Capped)

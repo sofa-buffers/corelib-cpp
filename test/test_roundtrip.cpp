@@ -615,7 +615,8 @@ static void measurePhaseSchema()
      *      fixlen word = (len<<3) | String(2): 0x52 = len 10, 0x42 = len 8. ---- */
     {
         static constexpr FieldBound f[] = {
-            {.id = 5, .wire = sofab::Wire::Fixlen, .bound = 8, .child = nullptr, .wrapperArray = false}};
+            {.id = 5, .wire = sofab::Wire::Fixlen, .subtype = sofab::Fix::String,
+             .bound = 8, .child = nullptr, .wrapperArray = false}};
         static constexpr SeqNode root{f, 1};
 
         {   /* len 10 (>8), complete */
@@ -635,6 +636,52 @@ static void measurePhaseSchema()
             sofab::IStreamObject<Quiet> in; in.setSchema(&root);
             CHECK(in.feed(bytes, sizeof bytes).code() == sofab::Error::Incomplete,
                   "schema over-maxlen: clean truncation at the bound stays INCOMPLETE");
+        }
+        {   /* §7.3 (generator#229): a BLOB at the string id contradicts the
+             * declaration, so it is skipped like an unknown id and carries no
+             * bound — even at len 10 (>8). fixlen word (10<<3)|Blob(3) = 0x53. */
+            const uint8_t bytes[] = {0x2a, 0x53, 'A','B','C','D','E','F','G','H','I','J'};
+            sofab::IStreamObject<Quiet> in; in.setSchema(&root);
+            CHECK(in.feed(bytes, sizeof bytes).code() == sofab::Error::None,
+                  "schema over-maxlen: a contradicting subtype is skipped, not bounded (§7.3)");
+        }
+        {   /* Same shape truncated: the skipped field is still measured for
+             * completeness, so the verdict is INCOMPLETE — never INVALID. */
+            const uint8_t bytes[] = {0x2a, 0x53, 'A','B'};
+            sofab::IStreamObject<Quiet> in; in.setSchema(&root);
+            CHECK(in.feed(bytes, sizeof bytes).code() == sofab::Error::Incomplete,
+                  "schema over-maxlen: truncated contradicting subtype is INCOMPLETE (§7.3)");
+        }
+    }
+
+    /* ---- §7.3 x §5.2 (generator#229): the same bound on a BLOB field, with the
+     *      contradicting subtype longer than the bound. blob, maxlen 4, id 3
+     *      (header 0x1a = 3<<3 | Fixlen). An fp64 is 8 bytes > 4. ---- */
+    {
+        static constexpr FieldBound f[] = {
+            {.id = 3, .wire = sofab::Wire::Fixlen, .subtype = sofab::Fix::Blob,
+             .bound = 4, .child = nullptr, .wrapperArray = false}};
+        static constexpr SeqNode root{f, 1};
+
+        {   /* fp64 1.5 — subtype fp64 ≠ blob → skip, accept (the reported bug) */
+            const uint8_t bytes[] = {0x1a, 0x41, 0,0,0,0,0,0,0xf8,0x3f};
+            sofab::IStreamObject<Quiet> in; in.setSchema(&root);
+            CHECK(in.feed(bytes, sizeof bytes).code() == sofab::Error::None,
+                  "schema over-maxlen: an fp64 at a maxlen-4 blob id is skipped (§7.3)");
+        }
+        {   /* Control: a BLOB of 8 bytes at the same id DOES carry the bound.
+             * fixlen word (8<<3)|Blob(3) = 0x43. */
+            const uint8_t bytes[] = {0x1a, 0x43, 0,0,0,0,0,0,0xf8,0x3f};
+            sofab::IStreamObject<Quiet> in; in.setSchema(&root);
+            CHECK(in.feed(bytes, sizeof bytes).code() == sofab::Error::InvalidMessage,
+                  "schema over-maxlen: the matching subtype still hits the bound");
+        }
+        {   /* Control: matching subtype, over-bound AND truncated — INVALID still
+             * dominates INCOMPLETE (§5.2 anti-folding is unaffected by the gate). */
+            const uint8_t bytes[] = {0x1a, 0x43, 0,0};
+            sofab::IStreamObject<Quiet> in; in.setSchema(&root);
+            CHECK(in.feed(bytes, sizeof bytes).code() == sofab::Error::InvalidMessage,
+                  "schema over-maxlen: matching subtype still dominates truncation");
         }
     }
 
