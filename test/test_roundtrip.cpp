@@ -834,6 +834,28 @@ static void wireTypeGuard()
         CHECK(r.code() == sofab::Error::None, "read-seam: a skipped mismatch stays COMPLETE");
         CHECK((*in).v == 0 && !(*in).taken, "read-seam: read() skips a mismatched wire type (no silent mis-decode)");
         CHECK(in.skipped() == 1, "read-seam: the skip is counted");
+        CHECK(r.skipped() == 1, "read-seam: the count rides out on the Result");
+        CHECK(r.code() == sofab::Error::None, "read-seam: counting a skip does not change the outcome");
+    }
+
+    /* The counter is monotonic over the stream, NOT cleared per feed: a message
+     * split across chunks must still report every skip it caused. Two mismatched
+     * fields (id0 and id1, both declared unsigned, both delivered Signed), fed one
+     * byte-pair at a time. */
+    {
+        struct TwoU : sofab::IStreamMessage
+        {
+            uint32_t a = 0, b = 0;
+            void deserialize(sofab::IStreamImpl &is, sofab::id id, size_t, size_t) noexcept override
+            { if (id == 0) is.read(a); else if (id == 1) is.read(b); }
+        };
+        const uint8_t bytes[] = {0x01, 0x06, 0x09, 0x06}; /* id0 Signed, id1 Signed */
+        sofab::IStreamObject<TwoU> in;
+        auto r1 = in.feed(bytes, 2);
+        CHECK(r1.skipped() == 1, "read-seam: first chunk reports its skip");
+        auto r2 = in.feed(bytes + 2, 2);
+        CHECK(r2.skipped() == 2, "read-seam: the count survives across feeds");
+        CHECK((*in).a == 0 && (*in).b == 0, "read-seam: neither mismatched field was read");
     }
 
     /* Resync: a skipped (mismatched) field must leave the cursor at the next field

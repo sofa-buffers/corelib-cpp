@@ -1104,9 +1104,16 @@ namespace sofab
         class Result
         {
             Error error_;
+            size_t skipped_ = 0;
             friend class IStreamImpl;
-            explicit Result(Error e) noexcept : error_(e) {}
+            explicit Result(Error e, size_t skipped = 0) noexcept : error_(e), skipped_(skipped) {}
         public:
+            /// @return Fields skipped because their wire tag contradicted the type
+            ///         the callback asked for (MESSAGE_SPEC §7.3) — see
+            ///         @ref IStreamImpl::skipped. A diagnostic: a non-zero count on
+            ///         a `COMPLETE` result means the message was valid but did not
+            ///         match this schema everywhere.
+            [[nodiscard]] size_t skipped() const noexcept { return skipped_; }
             /// @return `true` only for `COMPLETE` — the bytes end exactly at a field boundary.
             [[nodiscard]] explicit operator bool() const noexcept { return ok(); }
             /// @return `true` only for `COMPLETE`; `false` for both @ref incomplete and @ref invalid.
@@ -1671,17 +1678,17 @@ namespace sofab
                 /* #26: a field over the buffering cap fails as policy — checked
                  * before the incomplete tail is copied into acc_, so a claimed
                  * oversize is rejected even though its payload never arrived. */
-                if (limitExceeded_) return Result{Error::LimitExceeded};
-                if (error_) return Result{Error::InvalidMessage};
+                if (limitExceeded_) return Result{Error::LimitExceeded, skipped_};
+                if (error_) return Result{Error::InvalidMessage, skipped_};
                 if (stop != buffer + buflen)
                 {
                     /* §7: bytes remain that begin but do not finish a field (or an
                      * open sequence). Retain the partial tail and report INCOMPLETE —
                      * distinct from COMPLETE, and never folded into INVALID. */
                     appendBytes(acc_, stop, static_cast<size_t>(buffer + buflen - stop));
-                    return Result{Error::Incomplete};
+                    return Result{Error::Incomplete, skipped_};
                 }
-                return Result{Error::None};
+                return Result{Error::None, skipped_};
             }
 
             /* Continuation path: append and resume from the buffered tail. */
@@ -1692,11 +1699,11 @@ namespace sofab
             const uint8_t *stop = parseTopLevel(base + topPos_, base + acc_.size());
             /* #26: re-measured from the buffered tail, so the cap is chunk-independent —
              * the same field crosses it whether fed whole or dribbled byte by byte. */
-            if (limitExceeded_) return Result{Error::LimitExceeded};
-            if (error_) return Result{Error::InvalidMessage};
+            if (limitExceeded_) return Result{Error::LimitExceeded, skipped_};
+            if (error_) return Result{Error::InvalidMessage, skipped_};
             topPos_ = static_cast<size_t>(stop - base);
-            if (topPos_ == acc_.size()) { acc_.clear(); topPos_ = 0; return Result{Error::None}; } /* fully drained: COMPLETE */
-            return Result{Error::Incomplete}; /* §7: a partial field is still buffered */
+            if (topPos_ == acc_.size()) { acc_.clear(); topPos_ = 0; return Result{Error::None, skipped_}; } /* fully drained: COMPLETE */
+            return Result{Error::Incomplete, skipped_}; /* §7: a partial field is still buffered */
         }
 
         /**
@@ -1798,8 +1805,12 @@ namespace sofab
          * A diagnostic only — it never influences the decode outcome. A non-zero
          * count on an otherwise `COMPLETE` message means the peer's schema and
          * this one disagree about a field's type (or a hand-written callback
-         * asked for the wrong one). Reset per @ref feed sequence, i.e. it
-         * accumulates over the chunks of one message.
+         * asked for the wrong one).
+         *
+         * Monotonic over the stream's lifetime — unlike the sticky error flags it
+         * is **not** cleared per @ref feed, so a message dribbled in chunk by
+         * chunk still reports every skip it caused. @ref Result::skipped carries
+         * the same value out of a one-shot decode.
          */
         [[nodiscard]] size_t skipped() const noexcept { return skipped_; }
 
