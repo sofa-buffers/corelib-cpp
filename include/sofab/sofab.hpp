@@ -112,7 +112,6 @@ namespace sofab
     enum class Error
     {
         None = 0,            ///< Operation succeeded (decode: `COMPLETE`, §7).
-        UsageError = 2,      ///< The API was used incorrectly (e.g. out-of-order calls).
         BufferFull = 3,      ///< The output buffer filled and no flush callback was set.
         InvalidArgument = 1, ///< An argument was out of range (e.g. a field id above the limit).
         InvalidMessage = 4,  ///< The input bytes are malformed (decode: `INVALID`, §7).

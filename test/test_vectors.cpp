@@ -354,7 +354,7 @@ sofab::Error replay(sofab::OStreamImpl &os, const Op &op)
                 case E::F64: { auto v = castVec<std::vector<double>>(op.af);   return os.write(op.id, v).code(); }
             }
     }
-    return sofab::Error::UsageError;
+    return sofab::Error::InvalidArgument;
 }
 
 bool encode(const Vector &v, size_t tiny, std::string &err)
