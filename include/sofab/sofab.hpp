@@ -997,75 +997,6 @@ namespace sofab
         }
     };
 
-    /* ---------------------------------------------------------------------- */
-    /* Measure-phase schema descriptors (§5.2 anti-folding, generator#216)     */
-    /* ---------------------------------------------------------------------- */
-
-    /**
-     * @brief Static per-message schema descriptors consulted during the
-     *        completeness measure walk (@ref IStreamImpl::measureField).
-     *
-     * corelib is a *measure-then-deliver* decoder: @ref IStreamImpl::feed
-     * measures a whole top-level field for completeness before delivering it to
-     * the generated `deserialize`, where the schema bound checks live. A field
-     * that is *both* over-bound (over-`count` / over-`maxlen` / over-index) and
-     * truncated therefore never reaches those checks and would be reported
-     * INCOMPLETE, where MESSAGE_SPEC §5.2 requires INVALID to dominate ("more
-     * bytes could never make it valid" — anti-folding). These descriptors let the
-     * measure walk reject at the deciding word (count varint / fixlen length word
-     * / element header) before truncation is surfaced.
-     *
-     * The tree is a compile-time constant the generator emits per message
-     * (sofa-buffers/generator#216) and installs with @ref IStreamImpl::setSchema.
-     * When no schema is installed the decoder never touches this type: the
-     * maxspeed measure walk is a distinct template instantiation carrying no
-     * schema code at all, byte-for-byte the pre-schema decoder.
-     */
-    namespace schema
-    {
-        struct SeqNode;
-
-        /// One field's schema bound at a given sequence level.
-        struct FieldBound
-        {
-            uint32_t       id;           ///< Field id this bound applies to.
-            sofab::Wire    wire;         ///< Expected wire type; the bound is enforced only on an exact match.
-            /**
-             * @brief Declared fixlen subtype, for a @ref Wire::Fixlen bound.
-             *
-             * fp32, fp64, string and blob all share @ref Wire::Fixlen, so the wire
-             * type alone does not identify the declared type. A fixlen value whose
-             * subtype *contradicts* the declaration is skipped like an unknown id
-             * (MESSAGE_SPEC §7.3) and therefore carries no bound, so the `maxlen`
-             * check matches this subtype as well as @ref wire.
-             *
-             * Must be set on every @ref Wire::Fixlen row; unread for every other
-             * wire type. The default is deliberately `Fp32`, which no bounded
-             * fixlen field can declare (only string/blob carry a `maxlen`), so an
-             * unset subtype disables that row's bound rather than misapplying it.
-             */
-            sofab::Fix     subtype = sofab::Fix::Fp32;
-            uint64_t       bound;        ///< count `N` (array) or maxlen `L` (string/blob); `0` = unbounded.
-            const SeqNode *child;        ///< Non-null for a nested struct/union/wrapper-array: the next level.
-            bool           wrapperArray; ///< `true` when an element's id IS its index → enforce over-INDEX, not over-count.
-        };
-
-        /// The bounded fields visible at one sequence level; looked up by field id.
-        struct SeqNode
-        {
-            const FieldBound *fields; ///< Bounded fields at this level (unlisted ids carry no bound).
-            uint32_t          n;      ///< Number of entries in @ref fields.
-
-            /// @return The bound for @p id, or `nullptr` when the id is unlisted
-            ///         (skipped/unknown field, §7.3 — no bound applies).
-            constexpr const FieldBound *find(uint32_t id) const noexcept
-            {
-                for (uint32_t i = 0; i < n; ++i)
-                    if (fields[i].id == id) return &fields[i];
-                return nullptr;
-            }
-        };
-    } // namespace schema
 
     /* ---------------------------------------------------------------------- */
     /* IStream — protobuf-style cursor decoder                                */
@@ -1175,8 +1106,6 @@ namespace sofab
         /// Cap on the reassembly buffer's growth for one incomplete field (@ref Limits::max_buffered_field).
         size_t maxBufferedField_ = SIZE_MAX;
 
-        /// Optional measure-phase schema for §5.2 bound enforcement; `nullptr` = none installed (@ref setSchema).
-        const schema::SeqNode *schema_ = nullptr;
 
         std::function<void(sofab::id, size_t, size_t)> topCallback_; ///< Delivers each top-level field.
 
@@ -1413,135 +1342,6 @@ namespace sofab
             return need > static_cast<uint64_t>(maxBufferedField_ - consumed);
         }
 
-        /* The cap checks are gated on a compile-time @p Capped flag: @ref feed
-         * instantiates `measureField<false>` when no @ref maxBufferedField_ is set
-         * (the default, hot path), so `if constexpr` strips every #26 cap check and
-         * the whole `fieldStart` bookkeeping — the uncapped measure walk is then
-         * byte-for-byte the pre-cap decoder. `measureField<true>` keeps the full
-         * policy enforcement for streams constructed with a @ref Limits cap. */
-        template <bool Capped, bool Schema = false>
-        bool measureField(const uint8_t *&p, const uint8_t *end,
-                          const uint8_t *fieldStart,
-                          const schema::SeqNode *node = nullptr, int depth = 0) noexcept
-        {
-            /* Policy cap (issue #26): once the bytes already spanned by this single
-             * top-level field exceed the reassembly-buffer limit, stop — before the
-             * caller grows acc_ any further. Distinct from a wire error. */
-            if constexpr (Capped)
-                if (exceedsBuffer(static_cast<size_t>(p - fieldStart), 0)) { limitExceeded_ = true; return false; }
-            uint64_t header;
-            if (!measureVarint(p, end, header)) return false;
-            auto type = static_cast<Wire>(header & 0x7);
-            /* §5.2: consult the installed schema (if any) at the field's deciding
-             * word, so an over-bound field is rejected before truncation is
-             * surfaced. Compiled out entirely of the schema-free (maxspeed) walk. */
-            const schema::FieldBound *fb = nullptr;
-            if constexpr (Schema)
-                if (node) fb = node->find(static_cast<uint32_t>(header >> 3));
-            switch (type)
-            {
-                case Wire::Unsigned:
-                case Wire::Signed:
-                    return measureSkipVarint(p, end);
-                case Wire::Fixlen:
-                {
-                    uint64_t sub; if (!measureVarint(p, end, sub)) return false;
-                    /* §4.6/§7: a bad subtype or an fp length that isn't 4/8 is
-                     * INVALID regardless of what follows — not a truncated field. */
-                    if (!fixlenWordValid(sub)) { error_ = true; return false; }
-                    size_t len = static_cast<size_t>(sub >> 3);
-                    /* §7.1/§5.2: a length past the schema `maxlen` is INVALID even when
-                     * the promised payload never arrives (anti-folding). The bound is
-                     * gated on the DECLARED subtype as well as the wire type: fp32,
-                     * fp64, string and blob all share Wire::Fixlen, and a value whose
-                     * subtype contradicts the declaration is skipped like an unknown
-                     * id (§7.3) — so it carries no bound (generator#229). */
-                    if constexpr (Schema)
-                        if (fb && fb->wire == Wire::Fixlen && fb->bound
-                            && static_cast<Fix>(sub & 0x7) == fb->subtype
-                            && len > fb->bound) { error_ = true; return false; }
-                    /* #26: the declared payload size is known now — reject an oversize
-                     * claim before waiting for (or buffering) the bytes it promises. */
-                    if constexpr (Capped)
-                        if (exceedsBuffer(static_cast<size_t>(p - fieldStart), len)) { limitExceeded_ = true; return false; }
-                    if (static_cast<size_t>(end - p) < len) return false;
-                    p += len; return true;
-                }
-                case Wire::ArrayUnsigned:
-                case Wire::ArraySigned:
-                {
-                    uint64_t n; if (!measureVarint(p, end, n)) return false;
-                    /* §6.2/§7: a count above ARRAY_MAX is INVALID (and guards the
-                     * skip loop below from a malformed, unbounded element count). */
-                    if (n > ARRAY_MAX) { error_ = true; return false; }
-                    /* §6.2/§7/§5.2: a count past the schema `count` is INVALID even when
-                     * the elements are truncated (anti-folding). */
-                    if constexpr (Schema)
-                        if (fb && fb->wire == type && fb->bound && n > fb->bound) { error_ = true; return false; }
-                    /* #26: each element is at least one byte, so `n` is a lower bound
-                     * on the payload — a count past the cap can never fit. */
-                    if constexpr (Capped)
-                        if (exceedsBuffer(static_cast<size_t>(p - fieldStart), n)) { limitExceeded_ = true; return false; }
-                    for (uint64_t i = 0; i < n; ++i) if (!measureSkipVarint(p, end)) return false;
-                    return true;
-                }
-                case Wire::ArrayFixlen:
-                {
-                    uint64_t n; if (!measureVarint(p, end, n)) return false;
-                    if (n > ARRAY_MAX) { error_ = true; return false; } /* §6.2/§7 */
-                    /* §6.2/§7/§5.2: over the schema `count` is INVALID even if truncated. */
-                    if constexpr (Schema)
-                        if (fb && fb->wire == Wire::ArrayFixlen && fb->bound && n > fb->bound) { error_ = true; return false; }
-                    /* §4.8: the fixlen_word is always present, even for a zero-count array. */
-                    uint64_t sub; if (!measureVarint(p, end, sub)) return false;
-                    if (!arrayFixlenWordValid(sub)) { error_ = true; return false; } /* §4.8/§7 */
-                    size_t esize = static_cast<size_t>(sub >> 3);
-                    uint64_t bytes = n * static_cast<uint64_t>(esize);
-                    /* #26: whole element span is known — reject an oversize array up front. */
-                    if constexpr (Capped)
-                        if (exceedsBuffer(static_cast<size_t>(p - fieldStart), bytes)) { limitExceeded_ = true; return false; }
-                    if (static_cast<uint64_t>(end - p) < bytes) return false;
-                    p += static_cast<size_t>(bytes); return true;
-                }
-                case Wire::SequenceStart:
-                {
-                    /* §4.9: reject nesting past MAX_DEPTH instead of recursing unbounded. */
-                    if (depth + 1 > MAX_DEPTH) { error_ = true; return false; }
-                    for (;;)
-                    {
-                        /* #26: a sequence's own bulk accrues field by field — bound it
-                         * as it grows, catching many-small-fields the per-payload
-                         * checks above never individually trip. */
-                        if constexpr (Capped)
-                            if (exceedsBuffer(static_cast<size_t>(p - fieldStart), 0)) { limitExceeded_ = true; return false; }
-                        const uint8_t *save = p;
-                        uint64_t peek;
-                        const uint8_t *q = p;
-                        if (!measureVarint(q, end, peek)) return false;
-                        if (static_cast<Wire>(peek & 0x7) == Wire::SequenceEnd)
-                        { p = q; return true; }
-                        /* §5.1/§7/§5.2: in a wrapper-array the element id IS its index;
-                         * an index past `count` is INVALID even if the sequence is cut
-                         * before its SequenceEnd (anti-folding). Then descend into the
-                         * element/struct level with its own bounds. */
-                        const schema::SeqNode *childNode = nullptr;
-                        if constexpr (Schema)
-                        {
-                            if (fb && fb->wrapperArray && (peek >> 3) >= fb->bound) { error_ = true; return false; }
-                            childNode = fb ? fb->child : nullptr;
-                        }
-                        p = save;
-                        if (!measureField<Capped, Schema>(p, end, fieldStart, childNode, depth + 1)) return false;
-                    }
-                }
-                case Wire::SequenceEnd:
-                    /* §7: a sequence-end marker with no open sequence is INVALID.
-                     * A properly-nested end is consumed by its parent's peek loop
-                     * above, so reaching here means a dangling end at this level. */
-                    error_ = true; return false;
-            }
-            return false;
-        }
 
         /**
          * @brief Decode fields at the current nesting level, firing @p cb for each.
@@ -1764,23 +1564,6 @@ namespace sofab
          */
         void exceedLimit() noexcept { limitExceeded_ = true; }
 
-        /**
-         * @brief Install a measure-phase schema for §5.2 bound enforcement.
-         *
-         * With a schema installed, @ref measureField rejects an over-`count` /
-         * over-`maxlen` / over-index field at its deciding word (count varint /
-         * fixlen length word / element header) — so a field that is *both*
-         * over-bound and truncated is reported INVALID (dominating INCOMPLETE,
-         * §5.2 anti-folding) instead of waiting for bytes that could never make it
-         * valid. The @ref schema::SeqNode tree is a compile-time constant the
-         * generated code emits per message (sofa-buffers/generator#216).
-         *
-         * Purely additive: with no schema installed (the default) the measure walk
-         * is a distinct, schema-free template instantiation and pays nothing.
-         *
-         * @param root Top-level message descriptor, or `nullptr` to clear.
-         */
-        void setSchema(const schema::SeqNode *root) noexcept { schema_ = root; }
 
     protected:
         /**
@@ -2029,6 +1812,11 @@ namespace sofab
                  * it by carrying `cap`; the check then lives here rather than in
                  * the collector, where a truncated element would outrun it. */
                 const long outerBound = elemBound_;
+                /* consumed_ tracks the field at THIS level. A successful inner read
+                 * would otherwise make a still-open sequence look taken, and its
+                 * caller would not expect the re-delivery that follows. */
+                const bool outerConsumed = consumed_;
+                consumed_ = false;
                 if constexpr (requires { value.cap; }) elemBound_ = value.cap;
                 else                                   elemBound_ = -1;
                 /* descend into a nested sequence */
@@ -2041,7 +1829,7 @@ namespace sofab
                 --seqDepth_;
                 /* A sequence cut short is NOT consumed: the whole field is
                  * delivered again once its remaining bytes arrive. */
-                if (incomplete_) return false;
+                if (incomplete_) { consumed_ = outerConsumed; return false; }
                 consumed_ = true;
             }
             else if constexpr (requires { typename T::value_type; std::span{std::declval<T &>()}; } &&
@@ -2349,28 +2137,6 @@ namespace sofab
     {
     };
 
-    /**
-     * @brief Binds a message type to its measure-phase schema, if it has one.
-     *
-     * @ref IStreamObject consults this and installs the schema itself, so a
-     * message never has to call @ref IStreamImpl::setSchema. The primary template
-     * declares no `node`, which is the "this type carries no bounds" case;
-     * generated code specialises it next to the descriptors it generates:
-     *
-     * ```cpp
-     * template <> struct sofab::SchemaOf<myns::Telemetry> {
-     *     static constexpr const schema::SeqNode *node = &myns::Telemetry_schema;
-     * };
-     * ```
-     *
-     * The specialisation only needs @p T declared, not complete.
-     *
-     * @tparam T Message type.
-     */
-    template <typename T>
-    struct SchemaOf
-    {
-    };
 
     /**
      * @brief Holds a message and routes decoded top-level fields into it.
@@ -2395,12 +2161,6 @@ namespace sofab
             topCallback_ = [this](sofab::id id, size_t size, size_t count) {
                 data_.deserialize(*this, id, size, count);
             };
-            /* §5.2: install the message's bound descriptors, if it has any, so the
-             * measure walk can reject an over-bound field at its deciding word.
-             * Looked up rather than passed in, so the message itself carries no
-             * decoder plumbing (@ref SchemaOf). */
-            if constexpr (requires { SchemaOf<MessageType>::node; })
-                setSchema(SchemaOf<MessageType>::node);
         }
 
         /// @return The wrapped message (mutable access).
