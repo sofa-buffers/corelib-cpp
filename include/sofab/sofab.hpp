@@ -75,39 +75,25 @@ namespace sofab
     /// Version of the SofaBuffers public API implemented by this header.
     inline constexpr int API_VERSION = 1;
 
-    /// Largest valid field id (`INT32_MAX`); see §6.2 of the spec.
+    /* ---------------------------------------------------------------------- */
+    /* Wire-format limits                                                       */
+    /*                                                                          */
+    /* Fixed by MESSAGE_SPEC §6.2 and identical in every corelib. They are not   */
+    /* configurable and not a policy: exceeding one is malformed input, not a    */
+    /* local decision. Receiver-side caps a caller CHOOSES are @ref Limits.      */
+    /* ---------------------------------------------------------------------- */
+
+    /// Largest valid field id (`INT32_MAX`). Encoding a larger id is
+    /// @ref Error::InvalidArgument; decoding one is @ref Error::InvalidMessage.
     inline constexpr uint32_t ID_MAX = 0x7fffffffu;
-    /// Largest fixlen payload byte-length (`INT32_MAX`); see §6.2 of the spec.
+    /// Largest fixlen payload byte-length (`INT32_MAX`).
     inline constexpr uint32_t FIXLEN_MAX = 0x7fffffffu;
-    /// Largest array element count (`INT32_MAX`); see §6.2 of the spec.
+    /// Largest array element count (`INT32_MAX`).
     inline constexpr uint32_t ARRAY_MAX = 0x7fffffffu;
-    /// Maximum nested-sequence depth (§4.9, §6.2). Deeper nesting is rejected
+    /// Maximum nested-sequence depth (§4.9). Deeper nesting is rejected
     /// (encode: @ref Error::InvalidArgument; decode: @ref Error::InvalidMessage).
     inline constexpr int MAX_DEPTH = 255;
 
-    /**
-     * @brief Optional receiver-side decode limits for a streaming input stream.
-     *
-     * A *mechanism* only: the corelib enforces whatever cap it is handed but
-     * invents no default. The concrete values are configured in the sofabgen
-     * config, baked into generated code as constants, and passed to the istream
-     * constructors — see sofa-buffers/generator#102. The default leaves every
-     * limit disabled, so behaviour is byte-for-byte unchanged from an unlimited
-     * stream.
-     */
-    struct Limits
-    {
-        /**
-         * @brief Cap on how large the streaming reassembly buffer may grow for a
-         *        single incomplete top-level field, in bytes.
-         *
-         * A field whose declared or accumulated size exceeds this is rejected
-         * with @ref Error::LimitExceeded — the claimed size is checked the moment
-         * it is known, so an oversized header fails even if its payload never
-         * arrives. `SIZE_MAX` (the default) means no cap.
-         */
-        size_t max_buffered_field = SIZE_MAX;
-    };
 
     /**
      * @brief Always-false trait used to trigger `static_assert` in the
@@ -198,8 +184,6 @@ namespace sofab
             Blob = 3,   ///< Opaque byte string.
         };
 
-        /// Largest permitted field id (`INT32_MAX`); larger ids are rejected with @ref Error::InvalidArgument.
-        inline constexpr uint32_t kIdMax = 0x7fffffffu; /* INT32_MAX */
 
         /**
          * @brief Map a signed integer to an unsigned one with the zig-zag scheme.
@@ -468,20 +452,20 @@ namespace sofab
 
         /**
          * @brief Write a field header (field id and wire type) as one varint.
-         * @param fieldId Field identifier; must not exceed @ref detail::kIdMax.
+         * @param fieldId Field identifier; must not exceed @ref ID_MAX.
          * @param type Wire type of the field.
          * @return @ref Error::InvalidArgument if @p fieldId is too large,
          *         @ref Error::BufferFull on overflow, otherwise @ref Error::None.
          */
         [[nodiscard]] Error putHeader(sofab::id fieldId, Wire type) noexcept
         {
-            if (fieldId > detail::kIdMax) return Error::InvalidArgument;
+            if (fieldId > ID_MAX) return Error::InvalidArgument;
             return putVarint((static_cast<uint64_t>(fieldId) << 3) | static_cast<uint64_t>(type));
         }
 
         /**
          * @brief Write a scalar field: header varint plus one value varint, in a single bulk write.
-         * @param fieldId Field identifier; must not exceed @ref detail::kIdMax.
+         * @param fieldId Field identifier; must not exceed @ref ID_MAX.
          * @param type Wire type (@ref Wire::Unsigned or @ref Wire::Signed).
          * @param value Already-encoded scalar value (zig-zagged for signed fields).
          * @return @ref Error::InvalidArgument if @p fieldId is too large,
@@ -489,7 +473,7 @@ namespace sofab
          */
         [[nodiscard]] Error writeScalar(sofab::id fieldId, Wire type, uint64_t value) noexcept
         {
-            if (fieldId > detail::kIdMax) return Error::InvalidArgument;
+            if (fieldId > ID_MAX) return Error::InvalidArgument;
             uint8_t tmp[20];
             size_t n = encodeVarint(tmp, (static_cast<uint64_t>(fieldId) << 3) | static_cast<uint64_t>(type));
             n += encodeVarint(tmp + n, value);
@@ -498,7 +482,7 @@ namespace sofab
 
         /**
          * @brief Write a length-prefixed field (string, blob or other fixlen payload).
-         * @param fieldId Field identifier; must not exceed @ref detail::kIdMax.
+         * @param fieldId Field identifier; must not exceed @ref ID_MAX.
          * @param ft Payload sub-type (@ref Fix::String, @ref Fix::Blob, ...).
          * @param data Payload bytes.
          * @param len Payload length in bytes.
@@ -507,7 +491,7 @@ namespace sofab
          */
         [[nodiscard]] Error writeFixlen(sofab::id fieldId, Fix ft, const uint8_t *data, size_t len) noexcept
         {
-            if (fieldId > detail::kIdMax) return Error::InvalidArgument;
+            if (fieldId > ID_MAX) return Error::InvalidArgument;
             uint8_t tmp[20];
             size_t n = encodeVarint(tmp, (static_cast<uint64_t>(fieldId) << 3) | static_cast<uint64_t>(Wire::Fixlen));
             n += encodeVarint(tmp + n, (static_cast<uint64_t>(len) << 3) | static_cast<uint64_t>(ft));
@@ -518,7 +502,7 @@ namespace sofab
         /**
          * @brief Write a single float or double as a little-endian fixlen field.
          * @tparam F Floating-point type (`float` or `double`).
-         * @param fieldId Field identifier; must not exceed @ref detail::kIdMax.
+         * @param fieldId Field identifier; must not exceed @ref ID_MAX.
          * @param value Value to encode.
          * @return @ref Error::InvalidArgument if @p fieldId is too large,
          *         @ref Error::BufferFull on overflow, otherwise @ref Error::None.
@@ -527,7 +511,7 @@ namespace sofab
         [[nodiscard]] Error writeFloatScalar(sofab::id fieldId, F value) noexcept
         {
             constexpr Fix ft = (sizeof(F) == 4) ? Fix::Fp32 : Fix::Fp64;
-            if (fieldId > detail::kIdMax) return Error::InvalidArgument;
+            if (fieldId > ID_MAX) return Error::InvalidArgument;
             auto bits = detail::floatBits(value);
             uint8_t tmp[20];
             size_t n = encodeVarint(tmp, (static_cast<uint64_t>(fieldId) << 3) | static_cast<uint64_t>(Wire::Fixlen));
@@ -543,7 +527,7 @@ namespace sofab
          * are zig-zag encoded.
          *
          * @tparam E Integral element type.
-         * @param fieldId Field identifier; must not exceed @ref detail::kIdMax.
+         * @param fieldId Field identifier; must not exceed @ref ID_MAX.
          * @param elems Elements to encode, in order.
          * @return @ref Error::InvalidArgument if @p fieldId is too large,
          *         @ref Error::BufferFull on overflow, otherwise @ref Error::None.
@@ -552,7 +536,7 @@ namespace sofab
         [[nodiscard]] Error writeIntArray(sofab::id fieldId, std::span<const E> elems) noexcept
         {
             constexpr bool isSigned = std::is_signed_v<E>;
-            if (fieldId > detail::kIdMax) return Error::InvalidArgument;
+            if (fieldId > ID_MAX) return Error::InvalidArgument;
             uint8_t hdr[20];
             size_t hn = encodeVarint(hdr, (static_cast<uint64_t>(fieldId) << 3) |
                         static_cast<uint64_t>(isSigned ? Wire::ArraySigned : Wire::ArrayUnsigned));
@@ -575,7 +559,7 @@ namespace sofab
          * layout matches native memory; on big-endian hosts each element is byte-swapped.
          *
          * @tparam F Floating-point element type (`float` or `double`).
-         * @param fieldId Field identifier; must not exceed @ref detail::kIdMax.
+         * @param fieldId Field identifier; must not exceed @ref ID_MAX.
          * @param elems Elements to encode, in order.
          * @return @ref Error::InvalidArgument if @p fieldId is too large,
          *         @ref Error::BufferFull on overflow, otherwise @ref Error::None.
@@ -584,7 +568,7 @@ namespace sofab
         [[nodiscard]] Error writeFloatArray(sofab::id fieldId, std::span<const F> elems) noexcept
         {
             constexpr Fix ft = (sizeof(F) == 4) ? Fix::Fp32 : Fix::Fp64;
-            if (fieldId > detail::kIdMax) return Error::InvalidArgument;
+            if (fieldId > ID_MAX) return Error::InvalidArgument;
             uint8_t hdr[20];
             size_t hn = encodeVarint(hdr, (static_cast<uint64_t>(fieldId) << 3) | static_cast<uint64_t>(Wire::ArrayFixlen));
             hn += encodeVarint(hdr + hn, elems.size());
@@ -720,7 +704,7 @@ namespace sofab
          * objects (encoded as a sub-message). Unsupported types fail to compile.
          *
          * @tparam T Deduced value type.
-         * @param fieldId Field identifier; must not exceed @ref detail::kIdMax.
+         * @param fieldId Field identifier; must not exceed @ref ID_MAX.
          * @param value Value to encode.
          * @return A @ref Result carrying @ref Error::None on success, or the first
          *         error encountered.
@@ -785,7 +769,7 @@ namespace sofab
 
         /**
          * @brief Write a raw byte blob field.
-         * @param fieldId Field identifier; must not exceed @ref detail::kIdMax.
+         * @param fieldId Field identifier; must not exceed @ref ID_MAX.
          * @param value Pointer to the bytes to copy.
          * @param size Number of bytes to copy.
          * @return A @ref Result carrying @ref Error::None on success, or the error encountered.
@@ -1012,6 +996,37 @@ namespace sofab
      */
     template <typename T>
     concept InputMessage = std::derived_from<T, IStreamMessage>;
+
+    /* ---------------------------------------------------------------------- */
+    /* Receiver-side policy                                                     */
+    /*                                                                          */
+    /* Unlike the wire-format limits above, these are a LOCAL choice: the bytes  */
+    /* are well-formed, this receiver just declines to buffer that much. Hence   */
+    /* the separate outcome @ref Error::LimitExceeded, which is not INVALID.     */
+    /* ---------------------------------------------------------------------- */
+
+    /**
+     * @brief Optional receiver-side decode limits for a streaming input stream.
+     *
+     * A *mechanism* only: the stream enforces whatever cap it is handed and
+     * invents no default. Concrete values are configured in the sofabgen config,
+     * baked into generated code as constants and passed to the istream
+     * constructors (sofa-buffers/generator#102). The default leaves every limit
+     * disabled, so behaviour is byte-for-byte that of an unlimited stream.
+     */
+    struct Limits
+    {
+        /**
+         * @brief Cap on how large the reassembly buffer may grow for a single
+         *        incomplete top-level field, in bytes.
+         *
+         * Checked the moment the size becomes known -- at the header for a fixlen
+         * or fixlen-array payload, as it accrues for a sequence -- so an oversized
+         * claim fails before its payload is buffered, and even if that payload
+         * never arrives. `SIZE_MAX` (the default) means no cap.
+         */
+        size_t max_buffered_field = SIZE_MAX;
+    };
 
     /**
      * @brief Base of the input streams: decodes fields from fed bytes.
@@ -1374,7 +1389,7 @@ namespace sofab
                 { limitExceeded_ = true; return; }
                 uint64_t header; bool ovf = false;
                 if (!getVarint(p_, end_, header, &ovf)) { (ovf ? error_ : incomplete_) = true; return; }
-                if ((header >> 3) > detail::kIdMax) { error_ = true; return; }
+                if ((header >> 3) > ID_MAX) { error_ = true; return; }
                 auto fieldId = static_cast<sofab::id>(header >> 3);
                 type_ = static_cast<Wire>(header & 0x7);
                 /* §5.1/§7: an element index at or past the declared count is INVALID,
@@ -1629,7 +1644,7 @@ namespace sofab
             uint64_t header; bool ovf = false;
             if (!getVarint(p_, end_, header, &ovf))
             { if (ovf) error_ = true; else incomplete_ = true; return false; }
-            if ((header >> 3) > detail::kIdMax) { error_ = true; return false; }
+            if ((header >> 3) > ID_MAX) { error_ = true; return false; }
             fieldId_ = static_cast<sofab::id>(header >> 3);
             type_ = static_cast<Wire>(header & 0x7);
             fixLen_ = 0; count_ = 0;
@@ -2039,7 +2054,7 @@ namespace sofab
         {
             uint64_t header;
             if (!getVarint(p_, end_, header)) { error_ = true; return; }
-            if ((header >> 3) > detail::kIdMax) { error_ = true; return; }
+            if ((header >> 3) > ID_MAX) { error_ = true; return; }
             auto fieldId = static_cast<sofab::id>(header >> 3);
             type_ = static_cast<Wire>(header & 0x7);
 
