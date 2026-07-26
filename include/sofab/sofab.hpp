@@ -1980,8 +1980,8 @@ namespace sofab
          * @brief Read the current field's value, dispatching on @p value's type.
          *
          * Call from inside a deliver callback. Handles integers (signed values are un-zig-zagged),
-         * `bool`, `float`, `double`, `std::string`, `std::string_view` (zero-copy,
-         * valid while the source bytes live), nested @ref sofab::IStreamMessage objects,
+         * `bool`, `float`, `double`, `std::string`, `std::string_view` (a view into
+         * the source bytes, valid while they live), nested @ref sofab::IStreamMessage objects,
          * and writable contiguous ranges of integers or floats (excess wire
          * elements past the span's capacity are read and discarded). On a malformed
          * or truncated field the stream's error flag is set.
@@ -2040,8 +2040,8 @@ namespace sofab
                  * into this type, so only the wire type is checked here; a caller
                  * that must separate the two calls @ref readString / @ref readBlob. */
                 if (!tagMatches(Wire::Fixlen)) return false;
-                /* zero-copy: the view points into the source buffer, valid as
-                 * long as that buffer (or this stream's accumulator) lives. */
+                /* the view points into the source buffer, valid as long as that
+                 * buffer (or this stream's accumulator) lives. */
                 if (static_cast<size_t>(end_ - p_) < fixLen_)
                 {
                     incomplete_ = true;

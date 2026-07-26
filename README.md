@@ -89,7 +89,7 @@ where the whole message is already in contiguous memory.
 | Goal | How |
 |------|-----|
 | Fast encode | Payloads written with a single `memcpy`; a field's header + value varints emitted as one write; whole float arrays copied in one shot on little-endian. |
-| Fast decode | The common case parses **with zero copies and zero allocations** — the cursor walks the caller's buffer in place; float arrays bulk-`memcpy`'d; `std::string_view` reads are zero-copy views. |
+| Fast decode | The common case parses **without allocating** — the cursor walks the caller's buffer in place; float arrays bulk-`memcpy`'d; `std::string_view` reads return views into the parsed bytes (the caller's buffer, or the stream's accumulator for a field reassembled across `feed()`s). |
 | Still streamable | `OStream`/`OStreamInline` flush a small buffer via callback; `feed()` dispatches each complete top-level field and buffers only an incomplete tail. |
 | Modern C++ | `std::span`, `std::bit_cast`, concepts, `if constexpr` `write()`/`read()` deduction, `[[nodiscard]]`. Little-endian handled explicitly. |
 
@@ -298,7 +298,7 @@ if (r.complete()) { Point got = *in; }                     // got.x == 3, got.y 
 Buffer ownership is the defining trade-off of the C++ port, and it is the inverse
 of the C (`corelib-c-cpp`) port.
 
-**Decode (`feed` / `IStream`) — zero-copy views into the caller's buffer.**
+**Decode (`feed` / `IStream`) — in-place parsing over the caller's buffer.**
 `feed()` parses *in place*: when nothing is buffered (the common case, a whole
 message handed in at once) the cursor walks straight over the caller's contiguous
 `buf`, allocating and copying nothing.
@@ -409,8 +409,8 @@ SofaBuffers ships **two** C++ implementations of the same wire format, tuned for
 opposite ends of the spectrum:
 
 - **`corelib-cpp` (this library)** — pure C++20, no C backend. Optimised for
-  **throughput** on desktop/server targets. Decodes zero-copy in place and
-  returns `std::string_view`s into the caller's buffer.
+  **throughput** on desktop/server targets. Decodes in place and returns
+  `std::string_view`s into the bytes it parsed (valid while the stream/input lives).
 - **[`corelib-c-cpp`](https://github.com/sofa-buffers/corelib-c-cpp)** — a C
   object API with a thin C++ wrapper (`sofab.hpp`). Optimised for **minimal code
   size and RAM** on bare-metal / microcontroller targets, using a deferred-copy
@@ -423,7 +423,7 @@ porting between them is mostly mechanical.
 |---|---|---|
 | Primary goal | Maximum throughput | Minimum footprint |
 | Implementation | Pure C++20, header-only | C core + C++ wrapper header |
-| Decode model | Zero-copy views into caller buffer | Deferred-copy into address-stable destinations |
+| Decode model | In place over caller buffer, views into it | Deferred-copy into address-stable destinations |
 | Feature gating | Always full format (no `#ifdef`) | `SOFAB_DISABLE_*` compile out unused wire features |
 | Target | Desktop / server | Bare metal / embedded C and C++ |
 
