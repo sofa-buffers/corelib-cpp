@@ -337,8 +337,11 @@ sofab::Error replay(sofab::OStreamImpl &os, const Op &op)
         case K::F64:  return os.write(op.id, op.f).code();
         case K::Str:  return os.write(op.id, std::string_view{op.str}).code();
         case K::Blob: return os.write(op.id, op.blob.data(), static_cast<int32_t>(op.blob.size())).code();
-        case K::SeqB: return os.sequenceBegin(op.id).code();
-        case K::SeqE: return os.sequenceEnd().code();
+        case K::SeqB: return os.sequenceBeginLazy(op.id).code();
+        /* `serialized` is the primitive-layer ground truth and always carries the
+         * frame, so close with the keeping form: identical bytes once the
+         * sequence has content, and the empty-sequence vectors keep their pair. */
+        case K::SeqE: return os.sequenceEndKeep().code();
         case K::Arr:
             switch (op.elem)
             {

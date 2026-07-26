@@ -99,6 +99,15 @@ namespace sofab
      */
     inline constexpr int MAX_DEPTH = 255;
 
+    /**
+     * How many nested sequence headers @ref sofab::OStreamImpl::sequenceBeginLazy
+     * can hold back at once. Not a wire-format limit — an encoder-local window: a
+     * run nested deeper is framed eagerly, which stays valid and merely keeps the
+     * empty frame a decoder accepts and normalizes away (MESSAGE_SPEC §2). Kept
+     * well below @ref MAX_DEPTH so the encoder object stays small.
+     */
+    inline constexpr size_t LAZY_SEQ_DEPTH = 32;
+
 
     /**
      * @brief Always-false trait used to trigger `static_assert` in the
@@ -384,6 +393,13 @@ namespace sofab
         uint8_t *end_ = nullptr;      /**< One past the end of the buffer. */
         flushCallback flushCallback_; /**< Invoked when the buffer fills; may be empty. */
         size_t seqDepth_ = 0;         /**< Number of currently-open nested sequences (§4.9 @ref MAX_DEPTH). */
+        /**
+         * Ids of the innermost open sequences whose header has not been written
+         * yet (@ref sequenceBeginLazy). Always a contiguous suffix of the open
+         * sequences: writing any field commits the whole run at once.
+         */
+        std::array<sofab::id, LAZY_SEQ_DEPTH> pending_{};
+        size_t nPending_ = 0;         /**< Valid entries in @ref pending_. */
         bool failed_ = false;         /**< Sticky: a write has overflowed (see @ref ok). */
 
         /** Construct an unattached stream; a derived class must call @ref initBuffer. */
@@ -491,7 +507,42 @@ namespace sofab
         [[nodiscard]] Error putHeader(sofab::id fieldId, Wire type) noexcept
         {
             if (fieldId > ID_MAX) return Error::InvalidArgument;
+            /* The single choke point every field write passes through, so also
+             * where a held-back sequence run is committed: the field about to be
+             * written is content, which means every enclosing sequence is
+             * non-default and must be framed after all (MESSAGE_SPEC §2). */
+            if (nPending_ != 0 && type != Wire::SequenceStart && type != Wire::SequenceEnd)
+                if (Error e = commitPending(); e != Error::None) return e;
             return putVarint(headerWord(fieldId, type));
+        }
+
+        /**
+         * @brief Write out the held-back sequence headers, outermost first.
+         *
+         * Runs at most once per non-default sequence, never per field.
+         */
+        [[nodiscard]] Error commitPending() noexcept
+        {
+            const size_t n = nPending_;
+            nPending_ = 0;
+            for (size_t i = 0; i < n; ++i)
+                if (Error e = putVarint(headerWord(pending_[i], Wire::SequenceStart));
+                    e != Error::None)
+                    return e;
+            return Error::None;
+        }
+
+        /**
+         * @brief Commit any held-back sequence run before writing content.
+         *
+         * The scalar/fixlen/array writers below compose their header inline for
+         * speed and so bypass @ref putHeader; each calls this first so a
+         * @ref sequenceBeginLazy run is framed exactly when the first child field
+         * appears (MESSAGE_SPEC §2).
+         */
+        [[nodiscard]] Error beforeContent() noexcept
+        {
+            return nPending_ != 0 ? commitPending() : Error::None;
         }
 
         /**
@@ -531,6 +582,7 @@ namespace sofab
         [[nodiscard]] Error writeScalar(sofab::id fieldId, Wire type, uint64_t value) noexcept
         {
             if (fieldId > ID_MAX) return Error::InvalidArgument;
+            if (Error e = beforeContent(); e != Error::None) return e;
             uint8_t tmp[20];
             size_t n = encodeVarint(tmp, headerWord(fieldId, type));
             n += encodeVarint(tmp + n, value);
@@ -549,6 +601,7 @@ namespace sofab
         [[nodiscard]] Error writeFixlen(sofab::id fieldId, Fix ft, const uint8_t *data, size_t len) noexcept
         {
             if (fieldId > ID_MAX) return Error::InvalidArgument;
+            if (Error e = beforeContent(); e != Error::None) return e;
             uint8_t tmp[20];
             size_t n = encodeVarint(tmp, headerWord(fieldId, Wire::Fixlen));
             n += encodeVarint(tmp + n, fixlenWord(len, ft));
@@ -569,6 +622,7 @@ namespace sofab
         {
             constexpr Fix ft = (sizeof(F) == 4) ? Fix::Fp32 : Fix::Fp64;
             if (fieldId > ID_MAX) return Error::InvalidArgument;
+            if (Error e = beforeContent(); e != Error::None) return e;
             auto bits = detail::floatBits(value);
             uint8_t tmp[20];
             size_t n = encodeVarint(tmp, headerWord(fieldId, Wire::Fixlen));
@@ -594,6 +648,7 @@ namespace sofab
         {
             constexpr bool isSigned = std::is_signed_v<E>;
             if (fieldId > ID_MAX) return Error::InvalidArgument;
+            if (Error e = beforeContent(); e != Error::None) return e;
             uint8_t hdr[20];
             size_t hn = encodeVarint(hdr, (static_cast<uint64_t>(fieldId) << 3) |
                         static_cast<uint64_t>(isSigned ? Wire::ArraySigned : Wire::ArrayUnsigned));
@@ -626,6 +681,7 @@ namespace sofab
         {
             constexpr Fix ft = (sizeof(F) == 4) ? Fix::Fp32 : Fix::Fp64;
             if (fieldId > ID_MAX) return Error::InvalidArgument;
+            if (Error e = beforeContent(); e != Error::None) return e;
             uint8_t hdr[20];
             size_t hn = encodeVarint(hdr, headerWord(fieldId, Wire::ArrayFixlen));
             hn += encodeVarint(hdr + hn, elems.size());
@@ -697,13 +753,37 @@ namespace sofab
                 return *this;
             }
             /**
-             * @brief Chain the opening of a nested sub-message.
+             * @brief Chain a nested-message field write that is omitted when the
+             *        message is all-default (@ref OStreamImpl::writeLazy).
+             * @param fieldId Field identifier of the sub-message.
+             * @param value Nested message to encode.
+             * @return `*this`, for further chaining.
+             */
+            template <typename T>
+            Result writeLazy(sofab::id fieldId, const T &value) noexcept
+            {
+                if (error_ == Error::None) error_ = os_.writeLazy(fieldId, value).error_;
+                return *this;
+            }
+            /**
+             * @brief Chain a frame-keeping close (@ref OStreamImpl::sequenceEndKeep).
+             * @return `*this`, for further chaining.
+             */
+            Result sequenceEndKeep() noexcept
+            {
+                if (error_ == Error::None) error_ = os_.sequenceEndKeep().error_;
+                return *this;
+            }
+            /**
+             * @brief Chain the opening of a nested sub-message that is framed only
+             *        if it turns out to have content (@ref
+             *        OStreamImpl::sequenceBeginLazy).
              * @param fieldId Field identifier of the sub-message.
              * @return `*this`, for further chaining.
              */
-            Result sequenceBegin(sofab::id fieldId) noexcept
+            Result sequenceBeginLazy(sofab::id fieldId) noexcept
             {
-                if (error_ == Error::None) error_ = os_.sequenceBegin(fieldId).error_;
+                if (error_ == Error::None) error_ = os_.sequenceBeginLazy(fieldId).error_;
                 return *this;
             }
             /**
@@ -820,9 +900,13 @@ namespace sofab
             }
             else if constexpr (std::is_base_of_v<OStreamMessage, T>)
             {
-                err = sequenceBegin(fieldId).error_;
+                /* The ELEMENT form: the frame is kept even when the nested message
+                 * writes nothing, because element presence carries a wrapper
+                 * array's length (MESSAGE_SPEC §5.1). A nested message FIELD, which
+                 * may vanish when all-default, is @ref writeLazy. */
+                err = sequenceBeginLazy(fieldId).error_;
                 if (err == Error::None) err = value.serialize(*this).error_;
-                if (err == Error::None) err = sequenceEnd().error_;
+                if (err == Error::None) err = sequenceEndKeep().error_;
             }
             else if constexpr (requires { typename T::value_type; std::span{std::declval<const T &>()}; })
             {
@@ -840,6 +924,35 @@ namespace sofab
                 static_assert(always_false_v<T>, "Unsupported type passed to OStream::write()");
             }
 
+            return Result{*this, err};
+        }
+
+        /**
+         * @brief Write a nested message **field**, omitting it when it is all-default.
+         *
+         * Same as @ref write for an @ref OStreamMessage, except it closes with
+         * @ref sequenceEnd rather than @ref sequenceEndKeep: the nested `serialize`
+         * omits every child that equals its default, so "not one child was written"
+         * is exactly "the object equals its declared default" — evaluated per child
+         * field, recursively — and the field is then dropped instead of emitted as
+         * an empty frame (MESSAGE_SPEC §2).
+         *
+         * Use it for a `struct`/`union` **field**. Keep plain @ref write for an
+         * array **element**: element presence carries a dynamic array's length
+         * (§5.1), so an all-default element stays framed.
+         *
+         * @tparam T A type deriving from @ref OStreamMessage.
+         * @param fieldId Field identifier; must not exceed @ref ID_MAX.
+         * @param value Nested message to encode.
+         * @return A @ref Result carrying @ref Error::None on success, or the error encountered.
+         */
+        template <typename T>
+            requires std::is_base_of_v<OStreamMessage, T>
+        Result writeLazy(sofab::id fieldId, const T &value) noexcept
+        {
+            Error err = sequenceBeginLazy(fieldId).error_;
+            if (err == Error::None) err = value.serialize(*this).error_;
+            if (err == Error::None) err = sequenceEnd().error_;
             return Result{*this, err};
         }
 
@@ -871,30 +984,104 @@ namespace sofab
         }
 
         /**
-         * @brief Open a nested sub-message under @p fieldId.
+         * @brief Open a nested sub-message whose header is **held back** until the
+         *        sub-message turns out to have content.
          *
-         * Fields written after this call belong to the sub-message until the
-         * matching @ref sequenceEnd.
+         * MESSAGE_SPEC §2 omits a sequence-typed field whose value equals its
+         * declared default, and "not one child was written" is exactly that
+         * condition — evaluated per child field, recursively, for free. A sequence
+         * closed with nothing in it therefore emits **nothing** instead of a
+         * two-byte empty frame, and an all-default message becomes the empty byte
+         * string.
+         *
+         * The predicate never touches a byte image of the object, so struct padding
+         * cannot influence it and a non-zero nested default is handled by the
+         * caller's ordinary per-field test.
+         *
+         * This is the only way to open a sub-message. How it closes decides whether
+         * a contentless one survives: @ref sequenceEnd drops it, @ref sequenceEndKeep
+         * forces the frame out.
          *
          * @param fieldId Field identifier of the sub-message.
          * @return A @ref Result carrying @ref Error::None on success, or the error encountered.
          */
-        Result sequenceBegin(sofab::id fieldId) noexcept
+        Result sequenceBeginLazy(sofab::id fieldId) noexcept
         {
-            /* §4.9/§6.2: never open more than MAX_DEPTH nested sequences. */
             if (seqDepth_ >= static_cast<size_t>(MAX_DEPTH))
                 return Result{*this, Error::InvalidArgument};
-            Result r{*this, putHeader(fieldId, Wire::SequenceStart)};
-            if (r.ok()) ++seqDepth_;
-            return r;
+            if (fieldId > ID_MAX)
+                return Result{*this, Error::InvalidArgument};
+            if (nPending_ < LAZY_SEQ_DEPTH)
+            {
+                pending_[nPending_++] = fieldId;
+            }
+            else
+            {
+                /* Deeper than the hold-back window: commit the run and frame
+                 * eagerly, which keeps the suffix invariant above. Valid, just not
+                 * canonical if this sequence turns out to be all-default. */
+                if (Error e = commitPending(); e != Error::None)
+                    return Result{*this, e};
+                if (Error e = putVarint(headerWord(fieldId, Wire::SequenceStart));
+                    e != Error::None)
+                    return Result{*this, e};
+            }
+            ++seqDepth_;
+            return Result{*this, Error::None};
         }
         /**
-         * @brief Close the most recently opened sub-message.
+         * @brief Close the most recently opened sub-message, letting it **vanish**
+         *        if it received no content.
+         *
+         * Use it wherever absence encodes the same value as an empty frame: a
+         * `struct`/`union` field, and an array field whose declared `default` is the
+         * empty collection (MESSAGE_SPEC §2). Where the frame must be visible, close
+         * with @ref sequenceEndKeep instead.
+         *
          * @return A @ref Result carrying @ref Error::None on success, or the error encountered.
          */
         Result sequenceEnd() noexcept
         {
             if (seqDepth_ > 0) --seqDepth_;
+            if (nPending_ != 0)
+            {
+                /* The innermost open sequence is the last held-back one: drop it. */
+                --nPending_;
+                return Result{*this, Error::None};
+            }
+            return Result{*this, putHeader(0, Wire::SequenceEnd)};
+        }
+
+        /**
+         * @brief Close the most recently opened sub-message, **keeping** its frame
+         *        even when it received no content.
+         *
+         * Behaves like a write: it first emits any held-back headers — this frame's
+         * and every enclosing one's — and then the end marker, so an empty sequence
+         * reaches the wire as `begin` + `end`.
+         *
+         * Required wherever the frame carries information beyond its contents:
+         * - a **wrapper-array element** (`struct`/`union`/nested row): element
+         *   presence is what carries a dynamic array's length — *highest present id
+         *   + 1* (§5.1) — so dropping an all-default element would change the
+         *   decoded length, not just the bytes;
+         * - an array field already known to **differ from a non-empty declared
+         *   `default`**: absence would reconstruct that default, so the empty frame
+         *   is the only encoding of "explicitly empty" (§2, §3).
+         *
+         * The two failure directions are not symmetric, which is why this is the
+         * safe choice when in doubt: using it where @ref sequenceEnd would do costs
+         * one non-canonical empty frame that a decoder normalizes away, while the
+         * reverse silently changes an array's length.
+         *
+         * @return A @ref Result carrying @ref Error::None on success, or the error encountered.
+         */
+        Result sequenceEndKeep() noexcept
+        {
+            if (seqDepth_ > 0) --seqDepth_;
+            if (nPending_ != 0)
+                if (Error e = commitPending(); e != Error::None)
+                    return Result{*this, e};
             return Result{*this, putHeader(0, Wire::SequenceEnd)};
         }
     };

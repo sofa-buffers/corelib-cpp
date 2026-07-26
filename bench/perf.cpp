@@ -69,7 +69,7 @@ size_t perf_encode(uint8_t *buf, size_t buflen)
     os.write(9, std::span<const uint32_t>(perf_samples, 8));
     os.write(10, std::span<const int32_t>(perf_deltas, 8));
     os.write(11, std::span<const double>(perf_fp64, 4));
-    os.sequenceBegin(12);
+    os.sequenceBeginLazy(12);
     os.write(1, static_cast<uint32_t>(99));
     os.write(2, static_cast<int32_t>(-7));
     os.sequenceEnd();

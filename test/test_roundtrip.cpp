@@ -79,7 +79,7 @@ static void encodeVectors()
 
     checkEncode("nested_sequence", "002a0e002a1153071153", [](auto &os){
         os.write(0, u64{42})
-          .sequenceBegin(1)
+          .sequenceBeginLazy(1)
             .write(0, u64{42})
             .write(2, i64{-42})
           .sequenceEnd()
@@ -172,7 +172,7 @@ static void roundtripNested()
 {
     sofab::OStreamInline<256> os;
     os.write(0, uint64_t{42})
-      .sequenceBegin(1)
+      .sequenceBeginLazy(1)
         .write(0, uint64_t{42})
         .write(2, int64_t{-42})
       .sequenceEnd()
@@ -403,7 +403,7 @@ static void malformedInput()
     /* Skip an entire unread sub-sequence, then resync on the field after it. */
     {
         sofab::OStreamInline<256> os;
-        os.sequenceBegin(1).write(0, uint64_t{7}).write(1, uint64_t{8}).sequenceEnd()
+        os.sequenceBeginLazy(1).write(0, uint64_t{7}).write(1, uint64_t{8}).sequenceEnd()
           .write(2, int64_t{-222});
 
         struct Only2 : sofab::IStreamMessage {
@@ -1007,7 +1007,7 @@ static void zeroLengthForms()
     checkEncode("array_signed_empty",   "0400",   [](auto &os){ std::array<int32_t, 0> a{}; os.write(0, a); });
     checkEncode("array_fp32_empty",     "050020", [](auto &os){ std::array<float, 0> a{}; os.write(0, a); });
     checkEncode("array_fp64_empty",     "050041", [](auto &os){ std::array<double, 0> a{}; os.write(0, a); });
-    checkEncode("empty_sequence",       "0607", [](auto &os){ os.sequenceBegin(0).sequenceEnd(); });
+    checkEncode("empty_sequence",       "0607", [](auto &os){ os.sequenceBeginLazy(0).sequenceEndKeep(); });
 
     /* decode: empty arrays followed by a real field must keep the cursor aligned
      * (the empty fixlen array's fixlen_word is consumed, nothing more). Feed whole,
@@ -1037,7 +1037,7 @@ static void zeroLengthForms()
      * no fields decodes cleanly and the following field resyncs. */
     {
         sofab::OStreamInline<64> seq;
-        seq.sequenceBegin(1).sequenceEnd().write(2, int64_t{-7});
+        seq.sequenceBeginLazy(1).sequenceEndKeep().write(2, int64_t{-7});
         struct OnlyTail : sofab::IStreamMessage {
             int64_t t = 0;
             void deserialize(sofab::IStreamImpl &is, sofab::id id, size_t, size_t) noexcept override
@@ -1046,6 +1046,68 @@ static void zeroLengthForms()
         sofab::IStreamObject<OnlyTail> in;
         in.feed(seq.data(), seq.bytesUsed());
         CHECK((*in).t == -7, "empty sequence: resync after empty sub-sequence");
+    }
+}
+
+/* --- lazy sequence framing (MESSAGE_SPEC §2) ------------------------------- */
+
+static void lazySequenceFraming()
+{
+    /* An all-default sequence carries no information, so the field is omitted --
+     * where the eager API writes the two-byte empty frame. */
+    checkEncode("lazy_empty_omitted", "",
+                [](auto &os){ os.sequenceBeginLazy(1).sequenceEnd(); });
+    checkEncode("end_keep_frames_contentless", "0e07",
+                [](auto &os){ os.sequenceBeginLazy(1).sequenceEndKeep(); });
+
+    /* One child commits the whole held-back run, outermost header first. */
+    checkEncode("lazy_run_commits_on_content", "0e16002a0707",
+                [](auto &os){
+                    os.sequenceBeginLazy(1).sequenceBeginLazy(2)
+                      .write(0, uint64_t{42}).sequenceEnd().sequenceEnd();
+                });
+
+    /* Only the empty inner sequence drops; the outer one has content. */
+    checkEncode("lazy_drops_only_empty_inner", "0e002a07",
+                [](auto &os){
+                    os.sequenceBeginLazy(1).sequenceBeginLazy(2).sequenceEnd()
+                      .write(0, uint64_t{42}).sequenceEnd();
+                });
+
+    /* A lazy sequence after content, and sibling order, stay intact. */
+    checkEncode("lazy_after_content", "00011003",
+                [](auto &os){
+                    os.write(0, uint64_t{1}).sequenceBeginLazy(1).sequenceEnd()
+                      .write(2, uint64_t{3});
+                });
+
+    /* Forcing a frame forces its ancestors too: the outer got content (the inner
+     * frame), so it is framed as well. */
+    checkEncode("end_keep_commits_the_enclosing_run", "0e160707",
+                [](auto &os){
+                    os.sequenceBeginLazy(1).sequenceBeginLazy(2).sequenceEndKeep().sequenceEnd();
+                });
+
+    /* Held-back headers are not in the buffer yet, so a small output buffer
+     * produces the same bytes as a large one -- the chunked-encode guarantee is
+     * unaffected by the hold-back. */
+    {
+        std::vector<uint8_t> out;
+        uint8_t buf[3];
+        sofab::OStreamView os(
+            [&out](std::span<const uint8_t> d){ out.insert(out.end(), d.begin(), d.end()); },
+            buf, sizeof(buf), 0);
+        os.sequenceBeginLazy(1).sequenceBeginLazy(2).sequenceEnd()
+          .write(0, uint64_t{42}).sequenceEnd();
+        os.flush();
+        const std::string got = toHex(std::span<const uint8_t>(out.data(), out.size()));
+        ++g_checks;
+        if (got != "0e002a07")
+        {
+            ++g_failures;
+            std::printf("FAIL lazy framing across a 3-byte buffer:\n  expected 0e002a07\n  got      %s\n",
+                        got.c_str());
+        }
     }
 }
 
@@ -1062,7 +1124,7 @@ static void maxDepth()
         int opened = 0;
         for (int i = 0; i < 300; ++i)
         {
-            auto r = os.sequenceBegin(0);
+            auto r = os.sequenceBeginLazy(0);
             if (!r.ok()) { firstErr = r.code(); break; }
             ++opened;
         }
@@ -1356,6 +1418,7 @@ int main()
     callbackExceedLimit();
     wireTypeGuard();
     zeroLengthForms();
+    lazySequenceFraming();
     maxDepth();
     bufferLimits();
     strictUtf8();
