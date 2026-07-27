@@ -1053,8 +1053,9 @@ static void zeroLengthForms()
 
 static void lazySequenceFraming()
 {
-    /* An all-default sequence carries no information, so the field is omitted --
-     * where the eager API writes the two-byte empty frame. */
+    /* An all-default sequence carries no information, so the FIELD is omitted --
+     * where the pre-§2 rule wrote a two-byte empty frame. An ELEMENT still keeps
+     * its frame; that is the `end_keep` case right below. */
     checkEncode("lazy_empty_omitted", "",
                 [](auto &os){ os.sequenceBeginLazy(1).sequenceEnd(); });
     checkEncode("end_keep_frames_contentless", "0e07",
@@ -1088,10 +1089,19 @@ static void lazySequenceFraming()
                     os.sequenceBeginLazy(1).sequenceBeginLazy(2).sequenceEndKeep().sequenceEnd();
                 });
 
-    /* Held-back headers are not in the buffer yet, so a small output buffer
-     * produces the same bytes as a large one -- the chunked-encode guarantee is
-     * unaffected by the hold-back. */
+    /* A run COMMITTED ACROSS A FLUSH BOUNDARY must give the same bytes as the
+     * one-shot encode.
+     *
+     * Note what is deliberately NOT claimed here: that a flush lands *while* a
+     * header is still held back. No test can show that, because it is
+     * unreachable by construction -- a held-back header occupies no buffer
+     * space (the ids are encoder state, `pending_`, not buffer content), and
+     * the buffer can only fill through a write, which commits the whole run
+     * before its first byte is pushed. So a pending run can never straddle a
+     * flush. The reachable neighbour is the one below: the commit itself is cut
+     * in half by the buffer end. */
     {
+        /* 3-byte window: the flush lands just after the run was committed. */
         std::vector<uint8_t> out;
         uint8_t buf[3];
         sofab::OStreamView os(
@@ -1105,9 +1115,209 @@ static void lazySequenceFraming()
         if (got != "0e002a07")
         {
             ++g_failures;
-            std::printf("FAIL lazy framing across a 3-byte buffer:\n  expected 0e002a07\n  got      %s\n",
+            std::printf("FAIL run committed across a 3-byte buffer:\n  expected 0e002a07\n  got      %s\n",
                         got.c_str());
         }
+    }
+    {
+        /* 2-byte window and a three-header run, so the flush falls INSIDE
+         * commitPending(): two headers fill the window, the third lands after
+         * the flush. Bytes must still equal the one-shot encode. */
+        std::vector<uint8_t> out;
+        uint8_t buf[2];
+        sofab::OStreamView os(
+            [&out](std::span<const uint8_t> d){ out.insert(out.end(), d.begin(), d.end()); },
+            buf, sizeof(buf), 0);
+        os.sequenceBeginLazy(1).sequenceBeginLazy(2).sequenceBeginLazy(3)
+          .write(0, uint64_t{42})
+          .sequenceEnd().sequenceEnd().sequenceEnd();
+        os.flush();
+        const std::string got = toHex(std::span<const uint8_t>(out.data(), out.size()));
+        /* ids 1/2/3 as sequence-start: (id<<3)|6 = 0e/16/1e; then id 0 unsigned
+         * 42 = 00 2a; then three end markers 07. */
+        ++g_checks;
+        if (got != "0e161e002a070707")
+        {
+            ++g_failures;
+            std::printf("FAIL run commit split by a 2-byte buffer:\n  expected 0e161e002a070707\n  got      %s\n",
+                        got.c_str());
+        }
+        /* and the same ops through a buffer that holds everything */
+        checkEncode("same_run_one_shot", "0e161e002a070707",
+                    [](auto &o){
+                        o.sequenceBeginLazy(1).sequenceBeginLazy(2).sequenceBeginLazy(3)
+                         .write(0, uint64_t{42})
+                         .sequenceEnd().sequenceEnd().sequenceEnd();
+                    });
+    }
+}
+
+/* --- the hold-back reaches every legal depth (CORELIB_PLAN §6, "How deep the
+ *     hold-back reaches"): this port can allocate, so the pending run grows on
+ *     demand instead of stopping at a fixed window and framing eagerly beyond
+ *     it. Deep-and-contentless is exactly what the old eager fallback got
+ *     wrong -- it emitted the empty frames §2 omits. --- */
+
+static void deepHoldBack()
+{
+    /* 40 levels: past the 32-entry window this port used to have. */
+    {
+        sofab::OStreamInline<512> os;
+        for (int i = 0; i < 40; ++i) os.sequenceBeginLazy(sofab::id(1));
+        for (int i = 0; i < 40; ++i) os.sequenceEnd();
+        CHECK(os.bytesUsed() == 0, "40 contentless nested sequences encode to zero bytes");
+    }
+
+    /* the full MAX_DEPTH, still zero bytes: there is no window left at all. */
+    {
+        sofab::OStreamInline<2048> os;
+        bool allOpened = true;
+        for (int i = 0; i < sofab::MAX_DEPTH; ++i)
+            if (!os.sequenceBeginLazy(sofab::id(1)).ok()) allOpened = false;
+        for (int i = 0; i < sofab::MAX_DEPTH; ++i) os.sequenceEnd();
+        CHECK(allOpened, "MAX_DEPTH nested sequences all open");
+        CHECK(os.bytesUsed() == 0, "MAX_DEPTH contentless nested sequences encode to zero bytes");
+    }
+
+    /* deep WITH content: the whole run is committed, outermost header first, so
+     * the bytes are 40 starts + the field + 40 end markers. */
+    {
+        sofab::OStreamInline<512> os;
+        for (int i = 0; i < 40; ++i) os.sequenceBeginLazy(sofab::id(1));
+        os.write(0, uint64_t{42});
+        for (int i = 0; i < 40; ++i) os.sequenceEnd();
+        std::string expect;
+        for (int i = 0; i < 40; ++i) expect += "0e";   /* id 1, sequence-start */
+        expect += "002a";                              /* id 0 unsigned = 42 */
+        for (int i = 0; i < 40; ++i) expect += "07";   /* sequence-end */
+        const std::string got = toHex(std::span<const uint8_t>(os.data(), os.bytesUsed()));
+        ++g_checks;
+        if (got != expect)
+        {
+            ++g_failures;
+            std::printf("FAIL 40-deep run with content:\n  expected %s\n  got      %s\n",
+                        expect.c_str(), got.c_str());
+        }
+    }
+
+    /* Every depth from 1 to 20 behaves the same -- this walks across whatever
+     * internal boundary the run has between stream-local and spilled storage,
+     * which must not be observable in the bytes. */
+    {
+        int badDepth = 0;
+        for (int d = 1; d <= 20 && !badDepth; ++d)
+        {
+            sofab::OStreamInline<256> os;
+            for (int i = 0; i < d; ++i) os.sequenceBeginLazy(sofab::id(1));
+            for (int i = 0; i < d; ++i) os.sequenceEnd();
+            if (os.bytesUsed() != 0) badDepth = d;
+        }
+        ++g_checks;
+        if (badDepth)
+        {
+            ++g_failures;
+            std::printf("FAIL contentless nesting emitted bytes at depth %d\n", badDepth);
+        }
+    }
+
+    /* Unwinding back across that boundary: open ids 1..12, let the innermost 5
+     * expire contentless, then write. Exactly the remaining seven headers must
+     * appear, outermost first and in order. */
+    {
+        sofab::OStreamInline<256> os;
+        for (sofab::id i = 1; i <= 12; ++i) os.sequenceBeginLazy(i);
+        for (int i = 0; i < 5; ++i) os.sequenceEnd();
+        os.write(0, uint64_t{42});
+        for (int i = 0; i < 7; ++i) os.sequenceEnd();
+        const std::string got = toHex(std::span<const uint8_t>(os.data(), os.bytesUsed()));
+        /* ids 1..7 as sequence-start ((id<<3)|6), then id 0 unsigned 42, then
+         * seven end markers. */
+        const char *expect = "0e161e262e363e002a07070707070707";
+        ++g_checks;
+        if (got != expect)
+        {
+            ++g_failures;
+            std::printf("FAIL partial unwind of a deep run:\n  expected %s\n  got      %s\n",
+                        expect, got.c_str());
+        }
+    }
+
+    /* the innermost of a deep run stays droppable on its own: only the empty
+     * level 41 vanishes, the 40 that carry it are framed. */
+    {
+        sofab::OStreamInline<512> os;
+        for (int i = 0; i < 40; ++i) os.sequenceBeginLazy(sofab::id(1));
+        os.sequenceBeginLazy(2).sequenceEnd();        /* contentless: dropped */
+        os.write(0, uint64_t{42});
+        for (int i = 0; i < 40; ++i) os.sequenceEnd();
+        std::string expect;
+        for (int i = 0; i < 40; ++i) expect += "0e";
+        expect += "002a";
+        for (int i = 0; i < 40; ++i) expect += "07";
+        const std::string got = toHex(std::span<const uint8_t>(os.data(), os.bytesUsed()));
+        ++g_checks;
+        if (got != expect)
+        {
+            ++g_failures;
+            std::printf("FAIL 40-deep run drops only the empty inner level:\n  expected %s\n  got      %s\n",
+                        expect.c_str(), got.c_str());
+        }
+    }
+}
+
+/* --- depth bookkeeping: BOTH closers must give the nesting budget back, or a
+ *     long run of sibling sequences would eventually be refused although
+ *     nothing is open; and a stray close must not underflow it. --- */
+
+static void sequenceDepthBookkeeping()
+{
+    /* open MAX_DEPTH, close them all, open MAX_DEPTH again -- once per closer.
+     * Contentless opens/closes write nothing, so the keep variant is the only
+     * one that needs buffer room (255 starts + 255 ends, twice). */
+    {
+        sofab::OStreamInline<64> os;
+        for (int round = 0; round < 2; ++round)
+        {
+            int opened = 0;
+            bool allClosed = true;
+            for (int i = 0; i < sofab::MAX_DEPTH; ++i)
+                if (os.sequenceBeginLazy(sofab::id(1)).ok()) ++opened;
+            CHECK(opened == sofab::MAX_DEPTH, "sequenceEnd: MAX_DEPTH opens available each round");
+            for (int i = 0; i < sofab::MAX_DEPTH; ++i)
+                if (!os.sequenceEnd().ok()) allClosed = false;
+            CHECK(allClosed, "sequenceEnd: every open sequence closes cleanly");
+        }
+        CHECK(os.bytesUsed() == 0, "sequenceEnd: two full-depth rounds emit nothing");
+    }
+    {
+        sofab::OStreamInline<2048> os;
+        for (int round = 0; round < 2; ++round)
+        {
+            int opened = 0;
+            bool allClosed = true;
+            for (int i = 0; i < sofab::MAX_DEPTH; ++i)
+                if (os.sequenceBeginLazy(sofab::id(1)).ok()) ++opened;
+            CHECK(opened == sofab::MAX_DEPTH, "sequenceEndKeep: MAX_DEPTH opens available each round");
+            for (int i = 0; i < sofab::MAX_DEPTH; ++i)
+                if (!os.sequenceEndKeep().ok()) allClosed = false;
+            CHECK(allClosed, "sequenceEndKeep: every open sequence closes cleanly");
+        }
+        /* every level was forced out, both rounds: 2 * (255 starts + 255 ends) */
+        CHECK(os.bytesUsed() == 2 * 2 * size_t(sofab::MAX_DEPTH),
+              "sequenceEndKeep: each round frames all MAX_DEPTH levels");
+    }
+
+    /* a close with nothing open must not drive the depth negative: after it the
+     * full MAX_DEPTH budget is still there. (It does emit a stray end marker --
+     * unbalanced calls are caller error -- but the counter stays sane.) */
+    {
+        sofab::OStreamInline<64> os;
+        os.sequenceEnd();
+        os.sequenceEndKeep();
+        int opened = 0;
+        for (int i = 0; i < sofab::MAX_DEPTH + 5; ++i)
+            if (os.sequenceBeginLazy(sofab::id(1)).ok()) ++opened;
+        CHECK(opened == sofab::MAX_DEPTH, "stray close does not underflow the depth counter");
     }
 }
 
@@ -1419,6 +1629,8 @@ int main()
     wireTypeGuard();
     zeroLengthForms();
     lazySequenceFraming();
+    deepHoldBack();
+    sequenceDepthBookkeeping();
     maxDepth();
     bufferLimits();
     strictUtf8();

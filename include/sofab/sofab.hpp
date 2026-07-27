@@ -100,16 +100,6 @@ namespace sofab
     inline constexpr int MAX_DEPTH = 255;
 
     /**
-     * How many nested sequence headers @ref sofab::OStreamImpl::sequenceBeginLazy
-     * can hold back at once. Not a wire-format limit — an encoder-local window: a
-     * run nested deeper is framed eagerly, which stays valid and merely keeps the
-     * empty frame a decoder accepts and normalizes away (MESSAGE_SPEC §2). Kept
-     * well below @ref MAX_DEPTH so the encoder object stays small.
-     */
-    inline constexpr size_t LAZY_SEQ_DEPTH = 32;
-
-
-    /**
      * @brief Always-false trait used to trigger `static_assert` in the
      *        otherwise-unreachable branch of an `if constexpr` chain.
      *
@@ -394,12 +384,61 @@ namespace sofab
         flushCallback flushCallback_; /**< Invoked when the buffer fills; may be empty. */
         size_t seqDepth_ = 0;         /**< Number of currently-open nested sequences (§4.9 @ref MAX_DEPTH). */
         /**
-         * Ids of the innermost open sequences whose header has not been written
-         * yet (@ref sequenceBeginLazy). Always a contiguous suffix of the open
-         * sequences: writing any field commits the whole run at once.
+         * @brief The held-back sequence run: ids of the innermost open sequences
+         *        whose header has not been written yet (@ref sequenceBeginLazy).
+         *
+         * Always a contiguous suffix of the open sequences — writing any field
+         * commits the whole run at once — and it grows **without a bound of its
+         * own**: CORELIB_PLAN §6 ("How deep the hold-back reaches") lets only a
+         * heap-free profile stop holding back at some depth and frame eagerly
+         * beyond it, at the cost of canonicality. This port can allocate, so it
+         * holds back to the full @ref MAX_DEPTH and has no eager fallback path.
+         * @ref MAX_DEPTH is what bounds the nesting, hence the run, at 255 ids.
          */
-        std::array<sofab::id, LAZY_SEQ_DEPTH> pending_{};
-        size_t nPending_ = 0;         /**< Valid entries in @ref pending_. */
+        class PendingRun
+        {
+            /**
+             * Ids up to this depth live inside the stream object; deeper ones
+             * spill onto the heap. This is **not** a window on the hold-back —
+             * nothing about the emitted bytes changes at the boundary, only
+             * where an id is stored — it is the depth up to which the run is
+             * free. Sized for the nesting real schemas reach, so the ordinary
+             * encode allocates nothing, and a stream that never opens a
+             * sequence allocates nothing either.
+             */
+            static constexpr size_t kInline = 8;
+            sofab::id inline_[kInline] = {};
+            std::vector<sofab::id> spill_; /**< ids at depth >= kInline, in order */
+            size_t n_ = 0;                 /**< total ids held back */
+
+        public:
+            /** @return `true` while no header is held back. */
+            [[nodiscard]] bool empty() const noexcept { return n_ == 0; }
+            /** @return How many headers are held back. */
+            [[nodiscard]] size_t size() const noexcept { return n_; }
+            /** @return The @p i-th held-back id, outermost first. */
+            [[nodiscard]] sofab::id operator[](size_t i) const noexcept
+            {
+                return i < kInline ? inline_[i] : spill_[i - kInline];
+            }
+            /** Hold back one more id (the new innermost open sequence). */
+            void push(sofab::id v) noexcept
+            {
+                if (n_ < kInline) inline_[n_] = v;
+                else spill_.push_back(v);
+                ++n_;
+            }
+            /** Drop the innermost held-back id — its sequence got no content. */
+            void pop() noexcept
+            {
+                if (n_ == 0) return;
+                --n_;
+                if (n_ >= kInline) spill_.pop_back();
+            }
+            /** Forget the whole run (it has just been written out). */
+            void clear() noexcept { n_ = 0; spill_.clear(); }
+        };
+        PendingRun pending_;
         bool failed_ = false;         /**< Sticky: a write has overflowed (see @ref ok). */
 
         /** Construct an unattached stream; a derived class must call @ref initBuffer. */
@@ -511,7 +550,7 @@ namespace sofab
              * where a held-back sequence run is committed: the field about to be
              * written is content, which means every enclosing sequence is
              * non-default and must be framed after all (MESSAGE_SPEC §2). */
-            if (nPending_ != 0 && type != Wire::SequenceStart && type != Wire::SequenceEnd)
+            if (!pending_.empty() && type != Wire::SequenceStart && type != Wire::SequenceEnd)
                 if (Error e = commitPending(); e != Error::None) return e;
             return putVarint(headerWord(fieldId, type));
         }
@@ -523,13 +562,15 @@ namespace sofab
          */
         [[nodiscard]] Error commitPending() noexcept
         {
-            const size_t n = nPending_;
-            nPending_ = 0;
+            Error err = Error::None;
+            /* Safe to iterate and clear afterwards: putVarint never touches the
+             * run (it writes bytes, it does not open or close a sequence). */
+            const size_t n = pending_.size();
             for (size_t i = 0; i < n; ++i)
-                if (Error e = putVarint(headerWord(pending_[i], Wire::SequenceStart));
-                    e != Error::None)
-                    return e;
-            return Error::None;
+                if ((err = putVarint(headerWord(pending_[i], Wire::SequenceStart))) != Error::None)
+                    break;
+            pending_.clear();
+            return err;
         }
 
         /**
@@ -542,7 +583,7 @@ namespace sofab
          */
         [[nodiscard]] Error beforeContent() noexcept
         {
-            return nPending_ != 0 ? commitPending() : Error::None;
+            return !pending_.empty() ? commitPending() : Error::None;
         }
 
         /**
@@ -1002,6 +1043,13 @@ namespace sofab
          * a contentless one survives: @ref sequenceEnd drops it, @ref sequenceEndKeep
          * forces the frame out.
          *
+         * The hold-back has **no depth window**: the pending run grows on demand
+         * to whatever nesting @ref MAX_DEPTH allows, so the output is canonical at
+         * every legal depth (CORELIB_PLAN §6, "How deep the hold-back reaches" —
+         * only a heap-free profile may bound the run and frame eagerly past the
+         * bound). Nesting up to @ref PendingRun's inline depth costs no
+         * allocation at all; deeper runs spill to the heap.
+         *
          * @param fieldId Field identifier of the sub-message.
          * @return A @ref Result carrying @ref Error::None on success, or the error encountered.
          */
@@ -1011,21 +1059,10 @@ namespace sofab
                 return Result{*this, Error::InvalidArgument};
             if (fieldId > ID_MAX)
                 return Result{*this, Error::InvalidArgument};
-            if (nPending_ < LAZY_SEQ_DEPTH)
-            {
-                pending_[nPending_++] = fieldId;
-            }
-            else
-            {
-                /* Deeper than the hold-back window: commit the run and frame
-                 * eagerly, which keeps the suffix invariant above. Valid, just not
-                 * canonical if this sequence turns out to be all-default. */
-                if (Error e = commitPending(); e != Error::None)
-                    return Result{*this, e};
-                if (Error e = putVarint(headerWord(fieldId, Wire::SequenceStart));
-                    e != Error::None)
-                    return Result{*this, e};
-            }
+            /* The run grows on demand — no window, no eager fallback. The only
+             * ceiling is the MAX_DEPTH just checked, so the hold-back is
+             * canonical at every legal depth (CORELIB_PLAN §6). */
+            pending_.push(fieldId);
             ++seqDepth_;
             return Result{*this, Error::None};
         }
@@ -1043,10 +1080,10 @@ namespace sofab
         Result sequenceEnd() noexcept
         {
             if (seqDepth_ > 0) --seqDepth_;
-            if (nPending_ != 0)
+            if (!pending_.empty())
             {
                 /* The innermost open sequence is the last held-back one: drop it. */
-                --nPending_;
+                pending_.pop();
                 return Result{*this, Error::None};
             }
             return Result{*this, putHeader(0, Wire::SequenceEnd)};
@@ -1079,7 +1116,7 @@ namespace sofab
         Result sequenceEndKeep() noexcept
         {
             if (seqDepth_ > 0) --seqDepth_;
-            if (nPending_ != 0)
+            if (!pending_.empty())
                 if (Error e = commitPending(); e != Error::None)
                     return Result{*this, e};
             return Result{*this, putHeader(0, Wire::SequenceEnd)};
@@ -1151,17 +1188,14 @@ namespace sofab
     };
 
     /**
-     * @brief Output stream whose buffer is stored inline (no heap allocation).
-     * @tparam N Buffer capacity in bytes; must be greater than zero.
-     * @tparam Offset Number of leading bytes to reserve before the cursor; must be less than @p N.
-     */
-    /**
      * @brief Output stream over a buffer the caller already owns.
      *
-     * Neither allocates nor copies: encoding writes straight into @p buffer. The
-     * counterpart to @ref OStreamInline (buffer inside the object) and @ref
-     * OStream (buffer held by a `shared_ptr`) — this is the one for a destination
-     * that already exists, such as the `dst` of a generated `encodeTo`.
+     * Allocates no buffer and copies no payload: encoding writes straight into
+     * @p buffer. The counterpart to @ref OStreamInline (buffer inside the object)
+     * and @ref OStream (buffer held by a `shared_ptr`) — this is the one for a
+     * destination that already exists, such as the `dst` of a generated
+     * `encodeTo`. (As with every stream, nesting deeper than the held-back run's
+     * inline depth allocates that run — see @ref OStreamImpl::sequenceBeginLazy.)
      *
      * The buffer must outlive the stream, and it is **not** restored if encoding
      * fails: overflow leaves the bytes written so far in place and @ref ok false.
@@ -1195,6 +1229,18 @@ namespace sofab
         }
     };
 
+    /**
+     * @brief Output stream whose buffer is stored inline (the *buffer* costs no
+     *        heap allocation).
+     *
+     * The encoded bytes never leave the inline array. The one allocation such a
+     * stream can still make is the held-back sequence run, and only when the
+     * nesting outgrows that run's inline depth (see
+     * @ref OStreamImpl::sequenceBeginLazy).
+     *
+     * @tparam N Buffer capacity in bytes; must be greater than zero.
+     * @tparam Offset Number of leading bytes to reserve before the cursor; must be less than @p N.
+     */
     template <size_t N, size_t Offset = 0>
     class OStreamInline : public OStreamImpl
     {

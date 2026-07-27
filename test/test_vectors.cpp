@@ -7,6 +7,9 @@
  * decode, roundtrip and chunked scenarios — the same conformance suite the C
  * library runs, but exercising the native C++ implementation.
  *
+ * The asserted column is `serialized`; `serialized_sparse` belongs to the
+ * generator's conformance drivers — see the note in loadVectors().
+ *
  * SPDX-License-Identifier: MIT
  */
 
@@ -245,6 +248,23 @@ bool loadVectors(const char *path, std::vector<Vector> &out, std::string &err)
             size_t tl; const char *tn = sofab_json_string(sofab_json_array_at(req, k), &tl);
             if (tn) v.req |= capFromName(tn);
         }
+        /* WHICH COLUMN THIS REPO ASSERTS: `serialized` -- the primitive-layer
+         * ground truth, the exact bytes this vector's op list produces when
+         * replayed through the raw encoder. It is the only column a corelib can
+         * check.
+         *
+         * A vector may also carry `serialized_sparse`: the same message with
+         * every all-default sequence FIELD omitted (MESSAGE_SPEC §2). Producing
+         * that form needs a message layer -- a schema, per-field defaults, and
+         * the static choice of closer per position -- which a corelib does not
+         * have and never will; it is generated code that decides. So no test
+         * here reads that column, on purpose: it is exercised by the
+         * GENERATOR's conformance drivers (sofabgen, tests/conformance/<lang>),
+         * which own the schema the sparse form is defined against.
+         *
+         * What this repo does cover of §2 is the primitive underneath it: the
+         * hold-back trio (sequenceBeginLazy / sequenceEnd / sequenceEndKeep) in
+         * test_roundtrip.cpp's lazySequenceFraming() and deepHoldBack(). */
         size_t hl; const char *hex = sofab_json_string(sofab_json_get(sofab_json_get(vj, "serialized"), "hex"), &hl);
         if (!hex || !hex2bin(hex, hl, v.bytes)) { err = v.name + ": bad hex"; sofab_json_free(root); return false; }
         out.push_back(std::move(v));
