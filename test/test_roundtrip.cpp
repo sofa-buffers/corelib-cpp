@@ -18,12 +18,44 @@
 #include <cfloat>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
+#include <new>
 #include <span>
 #include <string>
 #include <vector>
 
 static int g_failures = 0;
 static int g_checks = 0;
+
+/* --- allocation hook -------------------------------------------------------
+ *
+ * The encoder is allocation-free except for one place: the held-back sequence
+ * run spills to the heap past its inline depth. Replacing global operator new
+ * lets holdBackAllocationFailure() both COUNT allocations (proving the shallow
+ * path makes none) and fail one on demand (proving a failed spill is reported
+ * as an error instead of terminating the process). Under -fno-exceptions the
+ * arming flag is never set and this stays a plain counting allocator. */
+static unsigned long g_allocCount = 0;
+static bool g_failNextAlloc = false;
+
+void *operator new(size_t n)
+{
+    ++g_allocCount;
+#if defined(__cpp_exceptions) && __cpp_exceptions
+    if (g_failNextAlloc) { g_failNextAlloc = false; throw std::bad_alloc(); }
+#endif
+    if (n == 0) n = 1;
+    void *p = std::malloc(n);
+#if defined(__cpp_exceptions) && __cpp_exceptions
+    if (!p) throw std::bad_alloc();
+#endif
+    return p;
+}
+void *operator new[](size_t n) { return operator new(n); }
+void operator delete(void *p) noexcept { std::free(p); }
+void operator delete[](void *p) noexcept { std::free(p); }
+void operator delete(void *p, size_t) noexcept { std::free(p); }
+void operator delete[](void *p, size_t) noexcept { std::free(p); }
 
 static std::string toHex(std::span<const uint8_t> bytes)
 {
@@ -1061,6 +1093,46 @@ static void lazySequenceFraming()
     checkEncode("end_keep_frames_contentless", "0e07",
                 [](auto &os){ os.sequenceBeginLazy(1).sequenceEndKeep(); });
 
+    /* EVERY writer commits the run, not just the scalar one. The five inline
+     * writers each call beforeContent() themselves (there is no shared header
+     * function left to catch a missing call), so each needs its own check: drop
+     * the call from any one of them and exactly the line below fails, with the
+     * enclosing `0e` header missing from the bytes.
+     *   writeScalar        -> lazy_run_commits_on_content (and most cases here)
+     *   writeFixlen        -> string / blob
+     *   writeFloatScalar   -> float
+     *   writeIntArray      -> integer array
+     *   writeFloatArray    -> float array                                    */
+    checkEncode("first_child_string_commits_the_run", "0e0212686907",
+                [](auto &os){
+                    os.sequenceBeginLazy(1).write(0, "hi").sequenceEnd();
+                });
+    checkEncode("first_child_blob_commits_the_run", "0e020b0107",
+                [](auto &os){
+                    const uint8_t b[] = {1};
+                    os.sequenceBeginLazy(1);
+                    os.write(0, b, 1);
+                    os.sequenceEnd();
+                });
+    checkEncode("first_child_float_commits_the_run", "0e02200000803f07",
+                [](auto &os){
+                    os.sequenceBeginLazy(1).write(0, 1.0f).sequenceEnd();
+                });
+    checkEncode("first_child_double_commits_the_run", "0e0241000000000000f03f07",
+                [](auto &os){
+                    os.sequenceBeginLazy(1).write(0, 1.0).sequenceEnd();
+                });
+    checkEncode("first_child_int_array_commits_the_run", "0e0302010207",
+                [](auto &os){
+                    std::array<uint32_t, 2> a{1, 2};
+                    os.sequenceBeginLazy(1).write(0, a).sequenceEnd();
+                });
+    checkEncode("first_child_float_array_commits_the_run", "0e0501200000803f07",
+                [](auto &os){
+                    std::array<float, 1> a{1.0f};
+                    os.sequenceBeginLazy(1).write(0, a).sequenceEnd();
+                });
+
     /* One child commits the whole held-back run, outermost header first. */
     checkEncode("lazy_run_commits_on_content", "0e16002a0707",
                 [](auto &os){
@@ -1263,6 +1335,138 @@ static void deepHoldBack()
                         expect.c_str(), got.c_str());
         }
     }
+}
+
+/* --- what happens when a run is committed into a buffer too small for it.
+ *
+ * commitPending() drops the whole run even when a header write fails halfway
+ * through, so the ids not yet written are lost. That is safe for exactly one
+ * reason, and this pins the reason rather than the reasoning: the failure sets
+ * the sticky failed_ with the cursor at the buffer end, so nothing more can be
+ * written anyway and ok() already condemns the output. Concretely: for every
+ * capacity below what the message needs, the bytes produced are a byte-exact
+ * PREFIX of the full encoding (never a wrong or resumed one), ok() is false, and
+ * a further write neither succeeds nor appends. --- */
+
+static void bufferFullCondemnsTheRun()
+{
+    constexpr int kDepth = 12;
+
+    /* the full, unconstrained encoding of the same op sequence */
+    std::string full;
+    {
+        sofab::OStreamInline<64> os;
+        for (int i = 0; i < kDepth; ++i) os.sequenceBeginLazy(sofab::id(1));
+        os.write(0, uint64_t{42});
+        for (int i = 0; i < kDepth; ++i) os.sequenceEnd();
+        CHECK(os.ok(), "buffer-full probe: the reference encode itself succeeds");
+        full = toHex(std::span<const uint8_t>(os.data(), os.bytesUsed()));
+    }
+    const size_t fullBytes = full.size() / 2;
+
+    int badPrefix = 0, badOk = 0, badResume = 0;
+    for (size_t cap = 1; cap < fullBytes; ++cap)
+    {
+        std::vector<uint8_t> buf(cap, 0xAA);
+        sofab::OStreamView os(buf.data(), cap, 0);   /* no flush callback */
+        for (int i = 0; i < kDepth; ++i) os.sequenceBeginLazy(sofab::id(1));
+        os.write(0, uint64_t{42});
+        for (int i = 0; i < kDepth; ++i) os.sequenceEnd();
+
+        const std::string got = toHex(std::span<const uint8_t>(os.data(), os.bytesUsed()));
+        if (got != full.substr(0, got.size()) && !badPrefix) badPrefix = static_cast<int>(cap);
+        if (os.ok() && !badOk) badOk = static_cast<int>(cap);
+
+        /* nothing can be written after the failure: the lost ids could not have
+         * reached the wire even if the run had kept them. */
+        const size_t before = os.bytesUsed();
+        if ((os.write(1, uint64_t{7}).ok() || os.bytesUsed() != before) && !badResume)
+            badResume = static_cast<int>(cap);
+    }
+    CHECK(badPrefix == 0, "truncated commit stays a prefix of the full encoding");
+    CHECK(badOk == 0, "a truncated commit always reports ok() == false");
+    CHECK(badResume == 0, "nothing more can be written after a truncated commit");
+
+    /* and with exactly enough room the same ops give the full encoding */
+    {
+        std::vector<uint8_t> buf(fullBytes, 0xAA);
+        sofab::OStreamView os(buf.data(), fullBytes, 0);
+        for (int i = 0; i < kDepth; ++i) os.sequenceBeginLazy(sofab::id(1));
+        os.write(0, uint64_t{42});
+        for (int i = 0; i < kDepth; ++i) os.sequenceEnd();
+        CHECK(os.ok(), "exact-size buffer: the encode succeeds");
+        CHECK(toHex(std::span<const uint8_t>(os.data(), os.bytesUsed())) == full,
+              "exact-size buffer: the bytes are the full encoding");
+    }
+
+    /* with a flush callback the failure is unreachable at ANY window size --
+     * the other half of the argument above. */
+    {
+        int badWindow = 0;
+        for (size_t cap = 1; cap <= 4 && !badWindow; ++cap)
+        {
+            std::vector<uint8_t> out;
+            std::vector<uint8_t> buf(cap, 0xAA);
+            sofab::OStreamView os([&out](std::span<const uint8_t> d){ out.insert(out.end(), d.begin(), d.end()); },
+                                  buf.data(), cap, 0);
+            for (int i = 0; i < kDepth; ++i) os.sequenceBeginLazy(sofab::id(1));
+            os.write(0, uint64_t{42});
+            for (int i = 0; i < kDepth; ++i) os.sequenceEnd();
+            os.flush();
+            if (!os.ok() || toHex(std::span<const uint8_t>(out.data(), out.size())) != full)
+                badWindow = static_cast<int>(cap);
+        }
+        CHECK(badWindow == 0, "with a flush callback no window size can truncate the run");
+    }
+}
+
+/* --- the hold-back's own allocation: past the run's inline depth the ids spill
+ *     to the heap, and a failed allocation there must be REPORTED (BufferFull +
+ *     ok() == false), never fatal. Needs exceptions to observe: the replacement
+ *     operator new below throws on demand. --- */
+
+static void holdBackAllocationFailure()
+{
+#if defined(__cpp_exceptions) && __cpp_exceptions
+    sofab::OStreamInline<64> os;
+
+    /* the shallow part of the run must not allocate at all */
+    g_allocCount = 0;
+    int opened = 0;
+    for (int i = 0; i < 8; ++i)
+        if (os.sequenceBeginLazy(sofab::id(1)).ok()) ++opened;
+    CHECK(opened == 8, "hold-back: the inline levels all open");
+    CHECK(g_allocCount == 0, "hold-back: nesting to the inline depth allocates nothing");
+
+    /* the next one spills -- fail that allocation */
+    g_failNextAlloc = true;
+    const auto refused = os.sequenceBeginLazy(sofab::id(2));
+    g_failNextAlloc = false;
+    CHECK(refused.code() == sofab::Error::BufferFull,
+          "hold-back: a failed spill allocation is reported as BufferFull");
+    CHECK(!refused.ok() && !os.ok(),
+          "hold-back: a failed spill allocation condemns the stream");
+
+    /* the refused level was NOT opened: writing now commits exactly the eight
+     * ids that were accepted. */
+    os.write(0, uint64_t{42});
+    CHECK(toHex(std::span<const uint8_t>(os.data(), os.bytesUsed())) == "0e0e0e0e0e0e0e0e002a",
+          "hold-back: a refused open leaves the run untouched");
+
+    /* and a spill that CAN allocate still works (same stream, deeper) */
+    {
+        sofab::OStreamInline<64> deep;
+        int ok = 0;
+        for (int i = 0; i < 12; ++i)
+            if (deep.sequenceBeginLazy(sofab::id(1)).ok()) ++ok;
+        deep.write(0, uint64_t{42});
+        for (int i = 0; i < 12; ++i) deep.sequenceEnd();
+        CHECK(ok == 12 && deep.ok(), "hold-back: a spill that allocates succeeds");
+        CHECK(toHex(std::span<const uint8_t>(deep.data(), deep.bytesUsed())) ==
+                  "0e0e0e0e0e0e0e0e0e0e0e0e002a070707070707070707070707",
+              "hold-back: the spilled ids reach the wire in order");
+    }
+#endif
 }
 
 /* --- depth bookkeeping: BOTH closers must give the nesting budget back, or a
@@ -2112,6 +2316,8 @@ int main()
     zeroLengthForms();
     lazySequenceFraming();
     deepHoldBack();
+    bufferFullCondemnsTheRun();
+    holdBackAllocationFailure();
     sequenceDepthBookkeeping();
     maxDepth();
     bufferLimits();

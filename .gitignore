@@ -2,3 +2,7 @@ build
 
 # Local secrets — never commit
 .env
+
+# core dumps from tests that deliberately abort (e.g. the bad_alloc probe)
+core
+core.*

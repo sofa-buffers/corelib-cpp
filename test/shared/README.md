@@ -29,11 +29,16 @@ is copied verbatim into every SofaBuffers corelib. We track the copy vendored in
 authority); if our copy and upstream ever disagree, the upstream file wins.
 
 A vector's `serialized` column is what **this** repo asserts: the primitive-layer
-bytes its op list produces. Some vectors also carry `serialized_sparse` — the
-same message with all-default sequence *fields* omitted (MESSAGE_SPEC §2).
-Producing that form needs a schema and per-field defaults, which a corelib does
-not have, so nothing here reads that column; it is consumed by the **generator's**
-conformance drivers.
+bytes its op list produces. Vectors also carry `serialized_sparse` — the same
+message with all-default sequence *fields* omitted (MESSAGE_SPEC §2). Producing
+that form in general needs a schema and per-field defaults, which a corelib does
+not have, so most of that column is consumed by the **generator's** conformance
+drivers. The exception is asserted here: where a vector's sparse form differs
+from its dense one *only* by an omitted empty sequence (`empty_sequence`,
+`nested_empty_sequences`, `empty_sequence_between_fields`), replaying the op list
+with the dropping closer reproduces it byte-for-byte with no schema at all, and
+`test_vectors.cpp` checks that — plus that the dropping closer changes nothing
+for every other vector.
 
 ## ⚠️ Keep in sync
 

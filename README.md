@@ -344,6 +344,24 @@ a flush can never split a run and a tiny output buffer yields byte-identical
 output. Decoding is unaffected: an empty frame remains legal input and decodes to
 the same value as an omitted one.
 
+**What it costs.** The hold-back is not free, and the two prices are measured,
+not estimated:
+
+- **Instructions.** On the shared `encode: typical message` workload (which nests
+  one sub-message) it is **353 Ir/op against 285** for the pre-§2 encoder that
+  framed eagerly — **+68 Ir/op, +24 %**. The other three workloads are unchanged
+  (`encode: u64 array` 106 972 vs 107 961; both decode figures identical) — see
+  [Instruction counts](#instruction-counts-callgrind).
+- **State.** The run lives in the stream object, so every stream grew by **64
+  bytes**: `sizeof(OStreamInline<64>)` 144 → 208, `sizeof(OStreamView)` 80 → 144,
+  `sizeof(OStream)` 96 → 160. That is per stream, not per message — it does not
+  scale with what is encoded.
+
+Beyond the run's inline depth the ids spill to the heap (see
+[Memory handling](#memory-handling)); a failed allocation there is **reported,
+not fatal** — the open is refused with `Error::BufferFull` and `ok()` turns
+false.
+
 The same generated struct also streams — no whole-message buffer on either side.
 Its `serialize` targets any output stream, so a small flushing window works, and
 an `IStreamObject` accepts the wire bytes in arbitrary chunks:
@@ -398,11 +416,18 @@ full buffer yields `Error::BufferFull`.
 
 The one allocation an encoder can still make is the held-back sequence run (see
 [Sequence framing](#sequence-framing-an-all-default-sub-message-is-omitted)): the
-list of open-but-unwritten sequence ids. The first few levels of nesting live
-**inside** the stream object, so the ordinary encode allocates nothing; only a
-run nested deeper than that spills to the heap, and it is bounded by `MAX_DEPTH`
-(255 ids) regardless. It holds encoder state, never message bytes, so it never
-scales with the message.
+list of open-but-unwritten sequence ids. The first eight levels of nesting live
+**inside** the stream object (costing it 64 bytes of state), so the ordinary
+encode allocates nothing; only a run nested deeper than that spills to the heap,
+and it is bounded by `MAX_DEPTH` (255 ids, ~1 KiB) regardless. It holds encoder
+state, never message bytes, so it never scales with the message.
+
+That allocation is the **only** one an encode can fail on, and failing it is not
+fatal: with exceptions enabled (the default) the `bad_alloc` is caught,
+`sequenceBeginLazy` refuses to open the sequence and returns `Error::BufferFull`
+with `ok()` false. In a build compiled `-fno-exceptions` there is nothing to
+catch and the allocation failure terminates the process, exactly as any other
+allocation in such a build does — nest below the inline depth if that matters.
 
 ## Feature flags
 
@@ -443,9 +468,12 @@ Two suites run under CTest:
 - **`test_vectors`** — replays the shared `assets/test_vectors.json` conformance
   suite (copied verbatim from `corelib-c-cpp`, the authoritative source) for
   encode, decode, and byte-at-a-time chunked streaming. It asserts each vector's
-  `serialized` column — the primitive-layer ground truth. The `serialized_sparse`
-  column needs a schema and per-field defaults to produce, so it belongs to the
-  **generator's** conformance drivers, not here.
+  `serialized` column — the primitive-layer ground truth — and, replaying the
+  same ops with the dropping closer, also its `serialized_sparse` column for the
+  three vectors whose sparse form is *pure sequence omission* (the rest of that
+  column encodes per-field defaults, which needs a schema and belongs to the
+  **generator's** conformance drivers). For every other vector the same replay
+  must reproduce `serialized` unchanged.
 
 ### Coverage and API docs
 
@@ -519,10 +547,16 @@ is better). All three are compiled at `-O3` so the comparison is like-for-like:
 
 | Workload | C | C++ wrapper | this (pure C++20) |
 |---|--:|--:|--:|
-| encode: u64 array (1000) | 124 987 | 125 016 | **107 961** (−14 %) |
-| encode: typical message  |     852 |     917 | **285** (−67 %) |
+| encode: u64 array (1000) | 124 987 | 125 016 | **106 972** (−14 %) |
+| encode: typical message  |     852 |     917 | **353** (−59 %) |
 | decode: u64 array (1000) | 272 962 | 272 963 | **111 555** (−59 %) |
 | decode: typical message  |   2 039 |   2 038 | **1 304** (−36 %) |
+
+The encode figures include the §2 sequence hold-back: `encode: typical message`
+cost **285** before it and costs **353** now (+24 %), which is the price of
+never framing an all-default sub-message — see
+[Sequence framing](#sequence-framing-an-all-default-sub-message-is-omitted).
+Reproduce with `bash bench/run_callgrind.sh`.
 
 The pure-C++20 port wins on instructions across the board because it fuses
 header+value writes, bulk-copies arrays, and parses in place without the C port's

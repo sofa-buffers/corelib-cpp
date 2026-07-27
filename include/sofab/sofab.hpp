@@ -116,7 +116,13 @@ namespace sofab
     enum class Error
     {
         None = 0,            /**< Operation succeeded (decode: `COMPLETE`, §7). */
-        BufferFull = 3,      /**< The output buffer filled and no flush callback was set. */
+        /**
+         * Encode-only: the encoder ran out of room. Either the output buffer
+         * filled and no flush callback was set, or — the rare second case —
+         * @ref OStreamImpl::sequenceBeginLazy could not allocate room to hold one
+         * more sequence header back (see @ref OStreamImpl::sequenceBeginLazy).
+         */
+        BufferFull = 3,
         InvalidArgument = 1, /**< An argument was out of range (e.g. a field id above the limit). */
         InvalidMessage = 4,  /**< The input bytes are malformed (decode: `INVALID`, §7). */
         /**
@@ -421,12 +427,30 @@ namespace sofab
             {
                 return i < kInline ? inline_[i] : spill_[i - kInline];
             }
-            /** Hold back one more id (the new innermost open sequence). */
-            void push(sofab::id v) noexcept
+            /**
+             * @brief Hold back one more id (the new innermost open sequence).
+             *
+             * Past `kInline` this grows the spill vector, the one allocation
+             * an encode can make. A failed allocation is **reported, not fatal**:
+             * the `bad_alloc` is caught here and turned into a `false`, which
+             * @ref OStreamImpl::sequenceBeginLazy surfaces as
+             * @ref Error::BufferFull. (A build with exceptions disabled has no
+             * such option — there `push_back` on a failed allocation terminates,
+             * as it does anywhere else in that build.)
+             *
+             * @return `true` if the id is held back, `false` if it could not be.
+             */
+            [[nodiscard]] bool push(sofab::id v) noexcept
             {
-                if (n_ < kInline) inline_[n_] = v;
-                else spill_.push_back(v);
+                if (n_ < kInline) { inline_[n_++] = v; return true; }
+#if defined(__cpp_exceptions) && __cpp_exceptions
+                try { spill_.push_back(v); }
+                catch (...) { return false; }
+#else
+                spill_.push_back(v);
+#endif
                 ++n_;
+                return true;
             }
             /** Drop the innermost held-back id — its sequence got no content. */
             void pop() noexcept
@@ -537,28 +561,38 @@ namespace sofab
         }
 
         /**
-         * @brief Write a field header (field id and wire type) as one varint.
-         * @param fieldId Field identifier; must not exceed @ref ID_MAX.
-         * @param type Wire type of the field.
-         * @return @ref Error::InvalidArgument if @p fieldId is too large,
-         *         @ref Error::BufferFull on overflow, otherwise @ref Error::None.
+         * @brief Write the sequence-end marker (§4.9) — id 0, wire type 7.
+         *
+         * The **only** header not composed inline by one of the five writers, and
+         * deliberately not a general `putHeader(id, type)`: a general one would
+         * look like the place to commit a held-back run, and it is not. It is
+         * reached from @ref sequenceEnd and @ref sequenceEndKeep only, neither of
+         * which may commit here — @ref sequenceEnd only gets here when the run is
+         * already empty, and @ref sequenceEndKeep has committed it itself one line
+         * earlier. The commit choke point is @ref beforeContent, called by the
+         * five inline writers; see the note there.
+         *
+         * @return @ref Error::BufferFull on overflow, otherwise @ref Error::None.
          */
-        [[nodiscard]] Error putHeader(sofab::id fieldId, Wire type) noexcept
+        [[nodiscard]] Error putSequenceEnd() noexcept
         {
-            if (fieldId > ID_MAX) return Error::InvalidArgument;
-            /* The single choke point every field write passes through, so also
-             * where a held-back sequence run is committed: the field about to be
-             * written is content, which means every enclosing sequence is
-             * non-default and must be framed after all (MESSAGE_SPEC §2). */
-            if (!pending_.empty() && type != Wire::SequenceStart && type != Wire::SequenceEnd)
-                if (Error e = commitPending(); e != Error::None) return e;
-            return putVarint(headerWord(fieldId, type));
+            return putVarint(headerWord(0, Wire::SequenceEnd));
         }
 
         /**
          * @brief Write out the held-back sequence headers, outermost first.
          *
          * Runs at most once per non-default sequence, never per field.
+         *
+         * The run is dropped even when a header write fails partway, and that is
+         * deliberate: the only way to fail here is @ref Error::BufferFull, which
+         * is unreachable while a flush callback is set and otherwise latches the
+         * sticky @ref failed_ with the cursor parked at the buffer end — so every
+         * later push fails too and @ref ok is already false. Keeping the leftover
+         * ids could therefore only ever emit them into an output that is already
+         * condemned. `bufferFullCondemnsTheRun()` in test/test_roundtrip.cpp
+         * pins that: a truncated encode stays a byte-exact prefix of the full one
+         * and reports `ok() == false`.
          */
         [[nodiscard]] Error commitPending() noexcept
         {
@@ -576,8 +610,13 @@ namespace sofab
         /**
          * @brief Commit any held-back sequence run before writing content.
          *
-         * The scalar/fixlen/array writers below compose their header inline for
-         * speed and so bypass @ref putHeader; each calls this first so a
+         * **This is the choke point** — there is no other. The five writers below
+         * (@ref writeScalar, @ref writeFixlen, @ref writeFloatScalar,
+         * @ref writeIntArray, @ref writeFloatArray) compose their header inline
+         * for speed, so every field written by this library goes through one of
+         * them and through this call, and through nothing else: dropping it from
+         * any one of the five loses that field's frame, and each of the five has a
+         * check in `lazySequenceFraming()` that fails when it does. A
          * @ref sequenceBeginLazy run is framed exactly when the first child field
          * appears (MESSAGE_SPEC §2).
          */
@@ -878,8 +917,9 @@ namespace sofab
          *
          * Sticky and independent of how the writes were issued — chained, or one
          * at a time with each Result discarded, which is what a generated
-         * `serialize()` does. The only way it turns false is an overflow with no
-         * flush callback set, so it is the verdict to check after encoding into a
+         * `serialize()` does. It turns false on an overflow with no flush callback
+         * set (and, rarely, when @ref sequenceBeginLazy cannot allocate room to
+         * hold a header back), so it is the verdict to check after encoding into a
          * buffer that may be smaller than the message (@ref OStreamView).
          *
          * @return true while no write has overflowed.
@@ -1048,10 +1088,15 @@ namespace sofab
          * every legal depth (CORELIB_PLAN §6, "How deep the hold-back reaches" —
          * only a heap-free profile may bound the run and frame eagerly past the
          * bound). Nesting up to @ref PendingRun's inline depth costs no
-         * allocation at all; deeper runs spill to the heap.
+         * allocation at all; deeper runs spill to the heap. If that allocation
+         * fails, the sequence is not opened and the call returns
+         * @ref Error::BufferFull with @ref ok turned false — an exceptions-enabled
+         * build never terminates over it.
          *
          * @param fieldId Field identifier of the sub-message.
-         * @return A @ref Result carrying @ref Error::None on success, or the error encountered.
+         * @return A @ref Result carrying @ref Error::None on success,
+         *         @ref Error::InvalidArgument past @ref MAX_DEPTH or @ref ID_MAX,
+         *         @ref Error::BufferFull if the hold-back could not grow.
          */
         Result sequenceBeginLazy(sofab::id fieldId) noexcept
         {
@@ -1061,8 +1106,16 @@ namespace sofab
                 return Result{*this, Error::InvalidArgument};
             /* The run grows on demand — no window, no eager fallback. The only
              * ceiling is the MAX_DEPTH just checked, so the hold-back is
-             * canonical at every legal depth (CORELIB_PLAN §6). */
-            pending_.push(fieldId);
+             * canonical at every legal depth (CORELIB_PLAN §6). Past the run's
+             * inline depth that growth allocates; if the allocation fails the
+             * sequence is NOT opened and the stream is condemned (sticky
+             * @ref failed_), because the caller's matching close would otherwise
+             * end an enclosing sequence instead of this one. */
+            if (!pending_.push(fieldId))
+            {
+                failed_ = true;
+                return Result{*this, Error::BufferFull};
+            }
             ++seqDepth_;
             return Result{*this, Error::None};
         }
@@ -1086,7 +1139,7 @@ namespace sofab
                 pending_.pop();
                 return Result{*this, Error::None};
             }
-            return Result{*this, putHeader(0, Wire::SequenceEnd)};
+            return Result{*this, putSequenceEnd()};
         }
 
         /**
@@ -1119,7 +1172,7 @@ namespace sofab
             if (!pending_.empty())
                 if (Error e = commitPending(); e != Error::None)
                     return Result{*this, e};
-            return Result{*this, putHeader(0, Wire::SequenceEnd)};
+            return Result{*this, putSequenceEnd()};
         }
     };
 
