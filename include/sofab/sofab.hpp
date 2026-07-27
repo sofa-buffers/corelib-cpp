@@ -1933,6 +1933,19 @@ namespace sofab
          *         with an open sequence — the partial tail is buffered for the next
          *         @ref feed and is **not** an error; or @ref Error::InvalidMessage
          *         (`INVALID`) when the bytes are malformed regardless of what follows.
+         *
+         * @warning **One message per destination.** Successive @ref feed calls
+         *          continue the *same* message — a decoder cannot see a message
+         *          boundary, because a message has no framing on the wire and a
+         *          zero-byte message is legal (MESSAGE_SPEC §2). Decoding a
+         *          *second* message therefore requires a destination reset: call
+         *          @ref reset (which for @ref IStreamObject also re-initialises the
+         *          wrapped message) or use a fresh stream. MESSAGE_SPEC §5.1 puts
+         *          this duty on the decoding side — "supplying a cleanly
+         *          initialised destination is the application's responsibility" —
+         *          and §2 makes it load-bearing: an all-default field is *absent*
+         *          from the bytes, so nothing runs for it and whatever the previous
+         *          message left in that member survives.
          */
         Result feed(const uint8_t *buffer, size_t buflen) noexcept
         {
@@ -1978,6 +1991,49 @@ namespace sofab
                 return Result{Error::None, skipped_};
             }
             return Result{Error::Incomplete, skipped_}; /* §7: a partial field is still buffered */
+        }
+
+        /**
+         * @brief Drop every byte of decoder state, so the next @ref feed starts a
+         *        brand-new message.
+         *
+         * Discards the buffered partial field, the sticky error/limit flags, the
+         * nesting depth and the §7.3 @ref skipped counter. The reassembly buffer's
+         * *capacity* is deliberately kept: this is the message-loop call, and
+         * handing the allocation back only to take it again next message is the one
+         * thing it must not cost (`Limits::max_buffered_field` is what bounds that
+         * capacity in the first place).
+         *
+         * **It does not touch the destination** — this class has none; it only
+         * dispatches. @ref IStreamObject overrides this to reset the message it
+         * owns as well, which is what a caller reusing a decoder wants. A caller
+         * driving @ref IStreamInline owns its destinations and must clear them
+         * itself.
+         *
+         * Required between messages: MESSAGE_SPEC §2 omits an all-default field
+         * entirely, so an absent field delivers no callback and leaves the previous
+         * message's value in place — including a wrapper-array field, whose
+         * collector (@ref StringSeq, @ref BlobSeq, @ref MessageSeq) only clears its
+         * destination when the wrapper sequence is actually present.
+         */
+        virtual void reset() noexcept
+        {
+            acc_.clear();
+            topPos_ = 0;
+            p_ = end_ = fieldStart_ = nullptr;
+            type_ = Wire{};
+            fixType_ = Fix{};
+            fixLen_ = 0;
+            count_ = 0;
+            fieldId_ = 0;
+            consumed_ = false;
+            error_ = false;
+            limitExceeded_ = false;
+            incomplete_ = false;
+            declined_ = false;
+            seqDepth_ = 0;
+            skipped_ = 0;
+            elemBound_ = -1;
         }
 
         /**
@@ -2739,6 +2795,18 @@ namespace sofab
      * as the per-field callback, so feeding bytes populates the message directly.
      * The decoded message is reached through `operator->` / `operator*`.
      *
+     * @warning **One message per object, unless you @ref reset.** The wrapped
+     *          message is populated *in place* across every @ref IStreamImpl::feed,
+     *          and MESSAGE_SPEC §2 omits an all-default field from the bytes
+     *          altogether — so decoding a second message into the same object
+     *          leaves the first message's value in every field the second one does
+     *          not carry. That is true of a scalar field (it keeps the old number)
+     *          and, since §2, of a wrapper-array field too: its collector clears
+     *          the destination only when the wrapper sequence is present, so an
+     *          absent array field keeps the previous decode's elements instead of
+     *          reading as the empty array §2 requires. Call @ref reset between
+     *          messages — it re-initialises the message and the decoder together.
+     *
      * @tparam MessageType A type satisfying @ref sofab::InputMessage.
      */
     template <InputMessage MessageType>
@@ -2757,6 +2825,25 @@ namespace sofab
             topCallback_ = [this](sofab::id id, size_t size, size_t count) {
                 data_.deserialize(*this, id, size, count);
             };
+        }
+
+        /**
+         * @brief Reset the decoder **and** the wrapped message, ready for the next
+         *        message.
+         *
+         * Extends @ref IStreamImpl::reset by value-initialising the owned
+         * @p MessageType — the destination side of the contract, which the base
+         * class cannot do because it does not own a destination. Its address is
+         * unchanged, so the field callback installed at construction stays valid.
+         *
+         * This is the supported way to decode more than one message with one
+         * object; see the class warning for what goes wrong without it.
+         */
+        void reset() noexcept override
+        {
+            IStreamImpl::reset();
+            std::destroy_at(&data_);
+            std::construct_at(&data_);
         }
 
         /** @return The wrapped message (mutable access). */
@@ -2807,6 +2894,15 @@ namespace sofab
          * §7.4: the sequence IS the array's value, so a repeated field id replaces
          * it whole. @ref IStreamImpl::read calls this once the SequenceStart tag
          * matched, so a §7.3-skipped occurrence cannot wipe a valid earlier one.
+         *
+         * @warning It runs only when the wrapper sequence is **present**. Since
+         *          MESSAGE_SPEC §2 omits an all-default array field, an *absent*
+         *          field reaches no collector at all and @p out is left exactly as
+         *          it was — so a destination reused across messages must be reset
+         *          by its owner first (@ref IStreamObject::reset, §5.1 "supplying a
+         *          cleanly initialised destination is the application's
+         *          responsibility"). This is not the collector's call to make: it
+         *          never learns that the field was absent.
          */
         void prepare() noexcept { out.clear(); }
 
@@ -2839,6 +2935,7 @@ namespace sofab
         explicit BlobSeq(std::vector<std::vector<uint8_t>> &o, long capacity = -1, long elemMax = -1) noexcept
             : out(o), cap(capacity), emax(elemMax) {}
 
+        /** @copydoc StringSeq::prepare */
         void prepare() noexcept { out.clear(); }
 
         void deserialize(IStreamImpl &is, sofab::id id, size_t size, size_t) noexcept override
@@ -2871,16 +2968,34 @@ namespace sofab
         std::vector<T> *out = nullptr;
         long cap = -1;   /**< Schema `count` N, or -1; an id at or past N is INVALID (§5.1/§7). */
 
-        void prepare() noexcept { if (out) out->clear(); } /**< §7.4 replace-whole; see @ref StringSeq. */
+        /** §7.4 replace-whole, and absent ⇒ never called: @copydoc StringSeq::prepare */
+        void prepare() noexcept { if (out) out->clear(); }
 
         void deserialize(IStreamImpl &is, sofab::id id, size_t, size_t count) noexcept override
         {
+            /* §5.1/§7 over-index reject, as a backstop for a direct call. Coming
+             * through @ref IStreamImpl::read this is unreachable: `cap` is handed
+             * to the stream as its element bound and rejected at the element
+             * header, one step earlier and before a truncated element could
+             * outrun it -- which is why @ref StringSeq / @ref BlobSeq carry no
+             * copy of it. Kept here because `deserialize` is public. */
             if (cap >= 0 && static_cast<size_t>(id) >= static_cast<size_t>(cap))
             {
                 is.invalidate();
                 return;
             }
-            T &row = out->emplace_back();
+            /* §5.1: the element id IS the array index, so an element is PLACED at
+             * `dest[id]`, never appended. The ids may contain gaps -- a decoder
+             * MUST accept them and recover a dynamic array's length as *highest
+             * present id + 1*, leaving every absent id at the element default.
+             * Appending instead would silently SHORTEN the array by the size of
+             * the gap: wire `06 0005 07 16 0009 07` (elements at id 0 and id 2,
+             * id 1 absent) is the 3-element array `[5, 0, 9]`, not `[5, 9]`.
+             * Same placement rule as @ref StringSeq / @ref BlobSeq; the growth is
+             * bounded by the `cap` reject above whenever the schema declares a
+             * `count`. */
+            while (out->size() <= static_cast<size_t>(id)) out->emplace_back();
+            T &row = (*out)[id];
             /* A count-less native-array row is a std::vector the span read fills
              * only up to its current size, so size it to the row's wire count
              * first. Struct/union rows and fixed std::array rows have no resize(). */

@@ -155,6 +155,33 @@ in.feed(msg.data(), msg.size());      // msg from the Serialize example above
 // (*in).id and (*in).value now hold the decoded values
 ```
 
+#### One message per destination — `reset()` between messages
+
+A decoder cannot see a message boundary: a message has no framing on the wire, and
+since MESSAGE_SPEC §2 an all-default message is the *empty byte string*. Successive
+`feed()` calls therefore continue **one** message. To decode a second message into
+the same object, call `reset()` — it re-initialises the wrapped message **and** the
+decoder (reassembly buffer, sticky flags, `skipped()` counter) together:
+
+```cpp
+sofab::IStreamObject<Sensor> in;
+in.feed(a.data(), a.size());          // message A
+in.reset();                           // ← required
+in.feed(b.data(), b.size());          // message B, on a clean destination
+```
+
+Without it, every field that message B does **not** carry keeps message A's value.
+That is obvious for a scalar (§2 omits a default-valued field, so nothing is
+delivered for it), and it is equally true of a **wrapper-array** field: its
+collector (`StringSeq` / `BlobSeq` / `MessageSeq`) clears the destination in
+`prepare()`, which runs only when the wrapper sequence is actually *present*. An
+absent array field reaches no collector at all, so it would keep the previous
+decode's elements instead of reading as the empty array §2 requires. MESSAGE_SPEC
+§5.1 places this duty on the decoding side — *"supplying a cleanly initialised
+destination is the application's responsibility"* — and `reset()` is how you
+discharge it. (`IStreamInline` has the same `reset()`, but it owns no destination:
+a callback-driven decoder clears its own targets.)
+
 ### Deserialize stream
 
 `feed()` can be called repeatedly with whatever bytes have arrived; a field that

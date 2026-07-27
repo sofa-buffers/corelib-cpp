@@ -1613,6 +1613,488 @@ static void strictUtf8()
 #endif
 }
 
+/* --- the message layer: write(id, msg) vs writeLazy(id, msg), and the
+ *     wrapper-array collectors StringSeq / BlobSeq / MessageSeq.
+ *
+ * MESSAGE_SPEC §2 omits a sequence-typed FIELD whose value equals its declared
+ * default; a wrapper-array ELEMENT keeps its frame, because element presence is
+ * what carries a dynamic array's length (§5.1). The two closers are what
+ * implement that split, and picking the wrong one for an element does not cost
+ * bytes -- it changes the decoded array's LENGTH. --- */
+
+static std::vector<uint8_t> fromHex(std::string_view h)
+{
+    auto nib = [](char c) { return c <= '9' ? c - '0' : (c | 0x20) - 'a' + 10; };
+    auto isHex = [](char c) {
+        return (c >= '0' && c <= '9') || ((c | 0x20) >= 'a' && (c | 0x20) <= 'f');
+    };
+    std::vector<uint8_t> v;
+    int hi = -1;
+    for (char c : h)                    /* separators are ignored, so the wire can be
+                                         * written in readable groups */
+    {
+        if (!isHex(c)) continue;
+        if (hi < 0) { hi = nib(c); continue; }
+        v.push_back(static_cast<uint8_t>(hi << 4 | nib(c)));
+        hi = -1;
+    }
+    return v;
+}
+
+/* One uint field, all-default when a == 0, serialised sparsely per §2. */
+struct SeqRow : sofab::Message
+{
+    uint64_t a = 0;
+    sofab::OStreamImpl::Result serialize(sofab::OStreamImpl &os) const noexcept override
+    {
+        return os.writeIf(0, a, a != 0);
+    }
+    void deserialize(sofab::IStreamImpl &is, sofab::id id, size_t, size_t) noexcept override
+    {
+        if (id == 0) is.read(a);
+    }
+};
+
+/* A row that is a sub-message FIELD of another row -- for the recursive case:
+ * an all-default child field vanishes, but the element framing it does not. */
+struct NestRow : sofab::Message
+{
+    SeqRow child;
+    sofab::OStreamImpl::Result serialize(sofab::OStreamImpl &os) const noexcept override
+    {
+        return os.writeLazy(1, child); /* FIELD form: drops when all-default */
+    }
+    void deserialize(sofab::IStreamImpl &is, sofab::id id, size_t, size_t) noexcept override
+    {
+        if (id == 1) is.read(child);
+    }
+};
+
+/* Collectors are constructed per delivery exactly as generated code does it. */
+struct SeqMsg : sofab::IStreamMessage
+{
+    std::vector<std::string> tags;                  /* id 1 -- StringSeq  */
+    std::vector<SeqRow> rows;                       /* id 2 -- MessageSeq */
+    std::vector<std::vector<uint8_t>> blobs;        /* id 3 -- BlobSeq    */
+    std::vector<std::vector<uint32_t>> matrix;      /* id 4 -- MessageSeq of native-array rows */
+    std::vector<NestRow> nested;                    /* id 5 -- MessageSeq */
+    uint64_t other = 0;                             /* id 9 -- plain scalar */
+
+    void deserialize(sofab::IStreamImpl &is, sofab::id id, size_t, size_t) noexcept override
+    {
+        switch (id)
+        {
+            case 1: { sofab::StringSeq c{tags};  is.read(c); break; }
+            case 2: { sofab::MessageSeq<SeqRow> c; c.out = &rows; is.read(c); break; }
+            case 3: { sofab::BlobSeq c{blobs};   is.read(c); break; }
+            case 4: { sofab::MessageSeq<std::vector<uint32_t>> c; c.out = &matrix; is.read(c); break; }
+            case 5: { sofab::MessageSeq<NestRow> c; c.out = &nested; is.read(c); break; }
+            case 9: is.read(other); break;
+        }
+    }
+};
+
+/* The auditor's M3 wire puts the wrapper at field id 1; this type decodes it
+ * verbatim, so the exact bytes from the report appear in the test. */
+struct RowsAtOneMsg : sofab::IStreamMessage
+{
+    std::vector<SeqRow> rows;
+    void deserialize(sofab::IStreamImpl &is, sofab::id id, size_t, size_t) noexcept override
+    {
+        if (id == 1) { sofab::MessageSeq<SeqRow> c; c.out = &rows; is.read(c); }
+    }
+};
+
+/* Per-element schema bounds: `maxlen: 2` on every element (§7.1). */
+struct BoundedSeqMsg : sofab::IStreamMessage
+{
+    std::vector<std::string> tags;               /* id 1 */
+    std::vector<std::vector<uint8_t>> blobs;     /* id 2 */
+    void deserialize(sofab::IStreamImpl &is, sofab::id id, size_t, size_t) noexcept override
+    {
+        switch (id)
+        {
+            case 1: { sofab::StringSeq c{tags, -1, 2};  is.read(c); break; }
+            case 2: { sofab::BlobSeq   c{blobs, -1, 2}; is.read(c); break; }
+        }
+    }
+};
+
+/* A bounded array: schema `count: 2`, so an element id >= 2 is INVALID (§5.1/§7). */
+struct CappedMsg : sofab::IStreamMessage
+{
+    std::vector<SeqRow> rows;
+    void deserialize(sofab::IStreamImpl &is, sofab::id id, size_t, size_t) noexcept override
+    {
+        if (id == 1) { sofab::MessageSeq<SeqRow> c; c.out = &rows; c.cap = 2; is.read(c); }
+    }
+};
+
+static void messageLayerFraming()
+{
+    const SeqRow dflt{};
+    SeqRow seven{}; seven.a = 7;
+
+    /* --- write(id, msg): the ELEMENT form, closed with sequenceEndKeep. --- */
+
+    checkEncode("element_all_default_keeps_its_frame", "0e07",
+                [&](auto &os){ os.write(1, dflt); });
+    checkEncode("element_with_content", "0e000707",
+                [&](auto &os){ os.write(1, seven); });
+
+    /* --- writeLazy(id, msg): the FIELD form, closed with sequenceEnd. The
+     *     same all-default value that stays framed above vanishes here. --- */
+
+    checkEncode("field_all_default_is_omitted", "",
+                [&](auto &os){ os.writeLazy(1, dflt); });
+    checkEncode("field_with_content_is_framed", "0e000707",
+                [&](auto &os){ os.writeLazy(1, seven); });
+
+    /* the predicate is recursive: a row whose only child FIELD is all-default is
+     * itself all-default, so the whole thing collapses to zero bytes. */
+    checkEncode("field_omission_is_recursive", "",
+                [&](auto &os){ NestRow n{}; os.writeLazy(1, n); });
+    /* ...but as an ELEMENT the same value is `begin end`, its child still gone. */
+    checkEncode("element_of_recursively_default_row_keeps_one_frame", "0e07",
+                [&](auto &os){ NestRow n{}; os.write(1, n); });
+
+    /* --- the auditor's case, byte for byte: rows = [{}, {}, {a=7}] as a
+     *     wrapper array at field id 2. Every leading element is all-default, so
+     *     with the FIELD closer they would all disappear and the array would
+     *     decode with length 1 instead of 3. --- */
+    checkEncode("wrapper_array_of_all_default_rows", "1606070e071600070707",
+                [&](auto &os){
+                    SeqRow d{}, s{}; s.a = 7;
+                    os.sequenceBeginLazy(2)
+                        .write(0, d).write(1, d).write(2, s)
+                      .sequenceEnd();
+                });
+    {
+        sofab::OStreamInline<64> os;
+        SeqRow d{}, s{}; s.a = 7;
+        os.sequenceBeginLazy(2).write(0, d).write(1, d).write(2, s).sequenceEnd();
+        sofab::IStreamObject<SeqMsg> in;
+        auto r = in.feed(os.data(), os.bytesUsed());
+        CHECK(r.complete(), "wrapper array of all-default rows decodes COMPLETE");
+        CHECK((*in).rows.size() == 3, "element framing carries the array length: 3 rows");
+        if ((*in).rows.size() == 3)
+        {
+            CHECK((*in).rows[0].a == 0 && (*in).rows[1].a == 0 && (*in).rows[2].a == 7,
+                  "all-default elements decode to default rows, in order");
+        }
+    }
+    {
+        /* the pure case: EVERY element all-default. With the field closer the
+         * whole array would encode to nothing and decode as length 0. */
+        sofab::OStreamInline<64> os;
+        SeqRow d{};
+        os.sequenceBeginLazy(2).write(0, d).write(1, d).sequenceEnd();
+        CHECK(os.bytesUsed() != 0, "an array of only all-default elements is not empty on the wire");
+        sofab::IStreamObject<SeqMsg> in;
+        in.feed(os.data(), os.bytesUsed());
+        CHECK((*in).rows.size() == 2, "two all-default elements decode as length 2");
+    }
+    {
+        /* the field form's counterpart: an EMPTY array field (declared default
+         * empty) is omitted entirely -- zero bytes, decoding to the empty array. */
+        sofab::OStreamInline<64> os;
+        os.sequenceBeginLazy(2).sequenceEnd();
+        CHECK(os.bytesUsed() == 0, "an empty array field with an empty default is omitted");
+        sofab::IStreamObject<SeqMsg> in;
+        in.feed(os.data(), os.bytesUsed());
+        CHECK((*in).rows.empty(), "the omitted array field decodes as the empty array");
+    }
+    {
+        /* a nested-message element, i.e. the recursive case end to end. */
+        sofab::OStreamInline<64> os;
+        NestRow n0{}, n1{}; n1.child.a = 5;
+        os.sequenceBeginLazy(5).write(0, n0).write(1, n1).sequenceEnd();
+        CHECK(toHex(std::span<const uint8_t>(os.data(), os.bytesUsed())) == "2e06070e0e0005070707",
+              "nested-row array: element 0 keeps a bare frame, element 1 carries its child");
+        sofab::IStreamObject<SeqMsg> in;
+        in.feed(os.data(), os.bytesUsed());
+        CHECK((*in).nested.size() == 2, "nested-row array decodes as length 2");
+        if ((*in).nested.size() == 2)
+            CHECK((*in).nested[0].child.a == 0 && (*in).nested[1].child.a == 5,
+                  "nested-row array element values survive");
+    }
+}
+
+/* --- the wrapper-array collectors, including §5.1 id gaps --- */
+
+static void wrapperArrayCollectors()
+{
+    /* --- StringSeq. §2 omits a default (empty) leaf element, so ids gap; §5.1
+     *     requires the decoder to refill the gap with the element default. --- */
+    {
+        sofab::OStreamInline<64> os;
+        const std::vector<std::string> tags{"x", "", "y"};
+        os.sequenceBeginLazy(1);
+        for (size_t i = 0; i < tags.size(); ++i)
+            os.writeIf(sofab::id(i), tags[i], !tags[i].empty()); /* §2: drop the default */
+        os.sequenceEnd();
+        CHECK(toHex(std::span<const uint8_t>(os.data(), os.bytesUsed())) == "0e020a78120a7907",
+              "string array omits its default element, leaving an id gap");
+
+        sofab::IStreamObject<SeqMsg> in;
+        auto r = in.feed(os.data(), os.bytesUsed());
+        CHECK(r.complete(), "string array with an id gap decodes COMPLETE");
+        CHECK((*in).tags.size() == 3, "StringSeq fills the id gap: length 3, not 2");
+        if ((*in).tags.size() == 3)
+            CHECK((*in).tags[0] == "x" && (*in).tags[1].empty() && (*in).tags[2] == "y",
+                  "StringSeq places each element at its id, gap at the element default");
+    }
+    {
+        /* the auditor's msgA, verbatim */
+        sofab::IStreamObject<SeqMsg> in;
+        auto a = fromHex("0e020a780a0a7907");
+        in.feed(a.data(), a.size());
+        CHECK((*in).tags.size() == 2 && (*in).tags[0] == "x" && (*in).tags[1] == "y",
+              "StringSeq decodes 0e020a780a0a7907 as [x, y]");
+    }
+    {
+        /* §7.4: a repeated wrapper id REPLACES the array whole -- that is what
+         * prepare() is for. */
+        sofab::IStreamObject<SeqMsg> in;
+        auto w = fromHex("0e020a780a0a7907" "0e020a7a07"); /* [x,y] then [z] */
+        in.feed(w.data(), w.size());
+        CHECK((*in).tags.size() == 1 && (*in).tags[0] == "z",
+              "§7.4: a repeated array field id replaces the whole array");
+    }
+
+    /* --- BlobSeq: same placement rules, an interior default element gaps. --- */
+    {
+        sofab::OStreamInline<64> os;
+        const uint8_t b0[] = {1, 2};
+        const uint8_t b2[] = {3};
+        os.sequenceBeginLazy(3);
+        os.write(0, b0, 2);
+        /* element 1 is the empty blob = the element default: omitted (§2) */
+        os.write(2, b2, 1);
+        os.sequenceEnd();
+        CHECK(toHex(std::span<const uint8_t>(os.data(), os.bytesUsed())) == "1e02130102120b0307",
+              "blob array omits its default element, leaving an id gap");
+
+        sofab::IStreamObject<SeqMsg> in;
+        in.feed(os.data(), os.bytesUsed());
+        CHECK((*in).blobs.size() == 3, "BlobSeq fills the id gap: length 3, not 2");
+        if ((*in).blobs.size() == 3)
+            CHECK(((*in).blobs[0] == std::vector<uint8_t>{1, 2} &&
+                   (*in).blobs[1].empty() &&
+                   (*in).blobs[2] == std::vector<uint8_t>{3}),
+                  "BlobSeq places each element at its id, gap at the element default");
+    }
+
+    /* --- MessageSeq: the element id IS the index here too. A conformant encoder
+     *     never gaps a sequence-form element, but a decoder MUST accept the gap
+     *     and recover the length as *highest present id + 1* (§5.1) -- appending
+     *     instead silently SHORTENS the array. --- */
+    {
+        /* the auditor's M3 wire, verbatim: elements at id 0 and id 2, id 1 absent */
+        sofab::IStreamObject<RowsAtOneMsg> in;
+        auto w = fromHex("0e060005071600090707");
+        auto r = in.feed(w.data(), w.size());
+        CHECK(r.complete(), "MessageSeq id-gap wire decodes COMPLETE");
+        CHECK((*in).rows.size() == 3, "MessageSeq fills the id gap: length 3, not 2");
+        if ((*in).rows.size() == 3)
+            CHECK((*in).rows[0].a == 5 && (*in).rows[1].a == 0 && (*in).rows[2].a == 9,
+                  "MessageSeq places each element at its id: [5, 0, 9]");
+    }
+    {
+        /* the same for a native-array row, which takes MessageSeq's resize path. */
+        sofab::OStreamInline<64> os;
+        const std::vector<uint32_t> r0{1, 2}, r2{3};
+        os.sequenceBeginLazy(4).write(0, r0).write(2, r2).sequenceEnd();
+        sofab::IStreamObject<SeqMsg> in;
+        in.feed(os.data(), os.bytesUsed());
+        CHECK((*in).matrix.size() == 3, "MessageSeq of native-array rows fills the id gap");
+        if ((*in).matrix.size() == 3)
+            CHECK(((*in).matrix[0] == std::vector<uint32_t>{1, 2} &&
+                   (*in).matrix[1].empty() &&
+                   (*in).matrix[2] == std::vector<uint32_t>{3}),
+                  "native-array rows land at their id, gap row stays empty");
+    }
+    {
+        /* an out-of-order / descending id still lands at its index, so a decoder
+         * cannot be talked into appending. */
+        sofab::IStreamObject<RowsAtOneMsg> in;
+        auto w = fromHex("0e" "1600090707"); /* only element id 2 present */
+        in.feed(w.data(), w.size());
+        CHECK((*in).rows.size() == 3, "a lone element at id 2 decodes as length 3");
+        if ((*in).rows.size() == 3)
+            CHECK((*in).rows[0].a == 0 && (*in).rows[1].a == 0 && (*in).rows[2].a == 9,
+                  "a lone element at id 2 lands at index 2");
+    }
+    {
+        /* §5.1/§7: with a schema `count: 2`, an element id >= 2 is INVALID --
+         * decided from the id alone, before the container is grown. */
+        sofab::IStreamObject<CappedMsg> in;
+        auto w = fromHex("0e060005071600090707");
+        auto r = in.feed(w.data(), w.size());
+        CHECK(r.invalid(), "count-bounded array: element id 2 with count 2 is INVALID");
+    }
+    {
+        /* and within the bound it still decodes normally. */
+        sofab::IStreamObject<CappedMsg> in;
+        auto w = fromHex("0e0600050707");
+        auto r = in.feed(w.data(), w.size());
+        CHECK(r.complete(), "count-bounded array: an in-range element decodes COMPLETE");
+        CHECK((*in).rows.size() == 1 && (*in).rows[0].a == 5,
+              "count-bounded array: the in-range element lands at index 0");
+    }
+    /* --- per-element schema bounds ride into the read (§7.1): an over-long
+     *     element is INVALID, never truncated. --- */
+    {
+        sofab::IStreamObject<BoundedSeqMsg> in;
+        auto w = fromHex("0e021a61626307");      /* one 3-byte string, maxlen 2 */
+        CHECK(in.feed(w.data(), w.size()).invalid(),
+              "§7.1: a string element over its maxlen is INVALID");
+    }
+    {
+        sofab::IStreamObject<BoundedSeqMsg> in;
+        auto w = fromHex("0e0212616207");        /* one 2-byte string: at the bound */
+        CHECK(in.feed(w.data(), w.size()).complete(),
+              "§7.1: a string element at its maxlen decodes COMPLETE");
+        CHECK((*in).tags.size() == 1 && (*in).tags[0] == "ab", "bounded string element decodes");
+    }
+    {
+        sofab::IStreamObject<BoundedSeqMsg> in;
+        auto w = fromHex("16021b01020307");      /* one 3-byte blob, maxlen 2 */
+        CHECK(in.feed(w.data(), w.size()).invalid(),
+              "§7.1: a blob element over its maxlen is INVALID");
+    }
+    {
+        sofab::IStreamObject<BoundedSeqMsg> in;
+        auto w = fromHex("1602130102" "07");
+        CHECK(in.feed(w.data(), w.size()).complete(),
+              "§7.1: a blob element at its maxlen decodes COMPLETE");
+        CHECK(((*in).blobs.size() == 1 && (*in).blobs[0] == std::vector<uint8_t>{1, 2}),
+              "bounded blob element decodes");
+    }
+    {
+        /* a blob element cut in half is INCOMPLETE, and completes on the next feed. */
+        sofab::IStreamObject<BoundedSeqMsg> in;
+        auto head = fromHex("160213 01");
+        auto tail = fromHex("0207");
+        CHECK(in.feed(head.data(), head.size()).incomplete(),
+              "a truncated blob element is INCOMPLETE, not INVALID");
+        CHECK(in.feed(tail.data(), tail.size()).complete(),
+              "the truncated blob element completes on the next feed");
+        CHECK(((*in).blobs.size() == 1 && (*in).blobs[0] == std::vector<uint8_t>{1, 2}),
+              "the reassembled blob element decodes correctly");
+    }
+    {
+        /* §7.3: a mis-typed wrapper field is SKIPPED, and must not wipe the
+         * array a previous, correctly typed occurrence produced. */
+        sofab::IStreamObject<SeqMsg> in;
+        auto w = fromHex("0e020a780a0a7907" "0803");   /* [x,y] then id 1 as an unsigned */
+        auto r = in.feed(w.data(), w.size());
+        CHECK(r.complete(), "§7.3 mis-typed array occurrence is skipped, not an error");
+        CHECK(r.skipped() == 1, "§7.3 the mis-typed occurrence is counted as skipped");
+        CHECK((*in).tags.size() == 2, "§7.3 a skipped occurrence does not wipe the array");
+    }
+}
+
+/* --- destination reuse across messages (MESSAGE_SPEC §2 + §5.1).
+ *
+ * §2 omits an all-default field, so a message that does not carry a field
+ * delivers nothing for it and the destination keeps whatever the previous decode
+ * left there. For a wrapper array that is new since §2: the collector clears its
+ * destination in prepare(), which only runs when the wrapper sequence is
+ * PRESENT. §5.1 puts the duty to supply a clean destination on the decoding
+ * side, and reset() is how a caller discharges it. --- */
+
+static void destinationReuse()
+{
+    const auto msgA_tags = fromHex("0e020a780a0a7907"); /* tags = [x, y]       */
+    const auto msgA_rows = fromHex("1606070e00070707"); /* rows = [{}, {a=7}]  */
+    const auto msgB      = fromHex("4801");             /* only id 9 = 1       */
+
+    /* --- reset() is the supported path: message B decodes on a clean slate,
+     *     so an absent array field reads as the empty array §2 requires. --- */
+    {
+        sofab::IStreamObject<SeqMsg> in;
+        in.feed(msgA_tags.data(), msgA_tags.size());
+        CHECK((*in).tags.size() == 2, "reuse: message A decodes tags = [x, y]");
+        in.reset();
+        auto r = in.feed(msgB.data(), msgB.size());
+        CHECK(r.complete(), "reuse: message B decodes COMPLETE after reset()");
+        CHECK((*in).tags.empty(), "reset(): an absent array field reads as the empty array (§2)");
+        CHECK((*in).other == 1, "reset(): message B's own field is decoded");
+    }
+    {
+        sofab::IStreamObject<SeqMsg> in;
+        in.feed(msgA_rows.data(), msgA_rows.size());
+        CHECK((*in).rows.size() == 2, "reuse: message A decodes 2 rows");
+        in.reset();
+        in.feed(msgB.data(), msgB.size());
+        CHECK((*in).rows.empty(), "reset(): an absent MessageSeq field reads as the empty array");
+    }
+    {
+        /* reset() also clears a scalar the second message does not carry... */
+        sofab::IStreamObject<SeqMsg> in;
+        auto scalar = fromHex("4809");
+        in.feed(scalar.data(), scalar.size());
+        CHECK((*in).other == 9, "reuse: message A decodes the scalar");
+        in.reset();
+        auto empty = fromHex("");
+        auto r = in.feed(empty.data(), empty.size());
+        CHECK(r.complete(), "reset(): the zero-byte all-default message is COMPLETE (§2)");
+        CHECK((*in).other == 0, "reset(): an absent scalar reads as its default");
+    }
+    {
+        /* ...and the decoder's own state: a truncated message A leaves a partial
+         * field buffered, which must not bleed into message B. */
+        sofab::IStreamObject<SeqMsg> in;
+        auto truncated = fromHex("0e020a78" "0a0a"); /* element 1's payload missing */
+        auto r = in.feed(truncated.data(), truncated.size());
+        CHECK(r.incomplete(), "reuse: a truncated message A is INCOMPLETE");
+        in.reset();
+        auto r2 = in.feed(msgB.data(), msgB.size());
+        CHECK(r2.complete(), "reset(): the buffered partial field is discarded");
+        CHECK((*in).other == 1 && (*in).tags.empty(),
+              "reset(): message B decodes cleanly after a truncated message A");
+        CHECK(in.skipped() == 0, "reset(): the §7.3 skipped counter is cleared");
+    }
+
+    /* --- WITHOUT reset(): the contract is that this is NOT a second message but
+     *     a continuation of the first, so message A's values survive. Pinned so
+     *     the day this changes, it changes deliberately -- and documented as the
+     *     reason reset() exists (README "One message per destination"). --- */
+    {
+        sofab::IStreamObject<SeqMsg> in;
+        in.feed(msgA_tags.data(), msgA_tags.size());
+        in.feed(msgB.data(), msgB.size());
+        CHECK((*in).tags.size() == 2,
+              "no reset(): feeds continue ONE message, so the array field persists");
+        CHECK((*in).other == 1, "no reset(): the continuation's own field is decoded");
+    }
+    {
+        /* the same continuation semantics is what makes chunked decoding work at
+         * all: a field boundary is not a message boundary. */
+        sofab::IStreamObject<SeqMsg> in;
+        auto whole = fromHex("0e020a780a0a7907" "4801");
+        in.feed(whole.data(), 8);
+        in.feed(whole.data() + 8, whole.size() - 8);
+        CHECK((*in).tags.size() == 2 && (*in).other == 1,
+              "one message split at a field boundary decodes as one message");
+    }
+
+    /* reset() on a callback-driven stream clears the decoder; the caller's own
+     * destinations are its business (there is no destination to reset here). */
+    {
+        int calls = 0;
+        sofab::IStreamInline in([&](sofab::id, size_t, size_t) { ++calls; });
+        auto truncated = fromHex("0e020a78" "0a0a");
+        CHECK(in.feed(truncated.data(), truncated.size()).incomplete(),
+              "IStreamInline: truncated input is INCOMPLETE");
+        in.reset();
+        auto r = in.feed(msgB.data(), msgB.size());
+        CHECK(r.complete(), "IStreamInline: reset() drops the buffered tail");
+        CHECK(calls >= 1, "IStreamInline: fields are still delivered after reset()");
+    }
+}
+
 int main()
 {
     encodeVectors();
@@ -1634,6 +2116,9 @@ int main()
     maxDepth();
     bufferLimits();
     strictUtf8();
+    messageLayerFraming();
+    wrapperArrayCollectors();
+    destinationReuse();
 
     std::printf("\n%d checks, %d failures\n", g_checks, g_failures);
     return g_failures ? 1 : 0;
