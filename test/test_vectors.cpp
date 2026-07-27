@@ -34,6 +34,9 @@
 namespace {
 
 enum class K { U, S, B, F32, F64, Str, Blob, Arr, SeqB, SeqE };
+/* `element: true` on a sequence_end marks an ELEMENT-position sequence: it
+ * keeps its frame even when contentless (MESSAGE_SPEC §5.1), unlike a FIELD,
+ * which §2 omits. See assets/test_vectors_README.md. */
 enum class E { U8, U16, U32, U64, I8, I16, I32, I64, F32, F64 };
 
 /* Optional library-feature capability tags (see assets/test_vectors_README.md upstream).
@@ -87,6 +90,7 @@ uint32_t capFromName(const char *s)
 struct Op
 {
     K kind{};
+    bool elementPos = false;  /* sequence_end only: §5.1 element, keeps its frame */
     uint32_t id = 0;
     uint64_t u = 0;
     int64_t  s = 0;
@@ -127,8 +131,11 @@ bool hasContentlessSequence(const std::vector<Op> &ops)
             if (stack.empty()) continue;
             const bool had = stack.back();
             stack.pop_back();
-            if (!had) found = true;
-            if (!stack.empty() && had) stack.back() = true;
+            /* An ELEMENT-position sequence keeps its frame even when contentless
+             * (§5.1), so it is never an omission -- and it IS content for the
+             * wrapper enclosing it, exactly like a leaf. */
+            if (!had && !op.elementPos) found = true;
+            if (!stack.empty() && (had || op.elementPos)) stack.back() = true;
         }
         else if (!stack.empty()) stack.back() = true;
     }
@@ -233,7 +240,11 @@ bool loadOp(const sofab_json_t *fj, Op &op)
         }
     }
     else if (!std::strcmp(ops, "sequence_begin")) { op.kind = K::SeqB; }
-    else if (!std::strcmp(ops, "sequence_end")) { op.kind = K::SeqE; }
+    else if (!std::strcmp(ops, "sequence_end")) {
+        op.kind = K::SeqE;
+        const sofab_json_t *ep = sofab_json_get(fj, "element");
+        op.elementPos = ep && sofab_json_bool(ep);
+    }
     else return false;
     return true;
 }
@@ -416,7 +427,11 @@ sofab::Error replay(sofab::OStreamImpl &os, const Op &op, bool keepFrames = true
          * sequence has content, and the empty-sequence vectors keep their pair.
          * The dropping form (keepFrames == false) is what the `serialized_sparse`
          * check replays with. */
-        case K::SeqE: return keepFrames ? os.sequenceEndKeep().code() : os.sequenceEnd().code();
+        /* keepFrames is the dense pass (every frame survives). In the dropping
+         * pass a FIELD closes with the dropping end, but an ELEMENT still keeps
+         * its frame -- that is the §5.1 half the sparse column encodes. */
+        case K::SeqE: return (keepFrames || op.elementPos)
+                             ? os.sequenceEndKeep().code() : os.sequenceEnd().code();
         case K::Arr:
             switch (op.elem)
             {
