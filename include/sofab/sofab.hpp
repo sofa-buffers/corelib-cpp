@@ -99,7 +99,6 @@ namespace sofab
      */
     inline constexpr int MAX_DEPTH = 255;
 
-
     /**
      * @brief Always-false trait used to trigger `static_assert` in the
      *        otherwise-unreachable branch of an `if constexpr` chain.
@@ -117,7 +116,13 @@ namespace sofab
     enum class Error
     {
         None = 0,            /**< Operation succeeded (decode: `COMPLETE`, §7). */
-        BufferFull = 3,      /**< The output buffer filled and no flush callback was set. */
+        /**
+         * Encode-only: the encoder ran out of room. Either the output buffer
+         * filled and no flush callback was set, or — the rare second case —
+         * @ref OStreamImpl::sequenceBeginLazy could not allocate room to hold one
+         * more sequence header back (see @ref OStreamImpl::sequenceBeginLazy).
+         */
+        BufferFull = 3,
         InvalidArgument = 1, /**< An argument was out of range (e.g. a field id above the limit). */
         InvalidMessage = 4,  /**< The input bytes are malformed (decode: `INVALID`, §7). */
         /**
@@ -384,6 +389,80 @@ namespace sofab
         uint8_t *end_ = nullptr;      /**< One past the end of the buffer. */
         flushCallback flushCallback_; /**< Invoked when the buffer fills; may be empty. */
         size_t seqDepth_ = 0;         /**< Number of currently-open nested sequences (§4.9 @ref MAX_DEPTH). */
+        /**
+         * @brief The held-back sequence run: ids of the innermost open sequences
+         *        whose header has not been written yet (@ref sequenceBeginLazy).
+         *
+         * Always a contiguous suffix of the open sequences — writing any field
+         * commits the whole run at once — and it grows **without a bound of its
+         * own**: CORELIB_PLAN §6 ("How deep the hold-back reaches") lets only a
+         * heap-free profile stop holding back at some depth and frame eagerly
+         * beyond it, at the cost of canonicality. This port can allocate, so it
+         * holds back to the full @ref MAX_DEPTH and has no eager fallback path.
+         * @ref MAX_DEPTH is what bounds the nesting, hence the run, at 255 ids.
+         */
+        class PendingRun
+        {
+            /**
+             * Ids up to this depth live inside the stream object; deeper ones
+             * spill onto the heap. This is **not** a window on the hold-back —
+             * nothing about the emitted bytes changes at the boundary, only
+             * where an id is stored — it is the depth up to which the run is
+             * free. Sized for the nesting real schemas reach, so the ordinary
+             * encode allocates nothing, and a stream that never opens a
+             * sequence allocates nothing either.
+             */
+            static constexpr size_t kInline = 8;
+            sofab::id inline_[kInline] = {};
+            std::vector<sofab::id> spill_; /**< ids at depth >= kInline, in order */
+            size_t n_ = 0;                 /**< total ids held back */
+
+        public:
+            /** @return `true` while no header is held back. */
+            [[nodiscard]] bool empty() const noexcept { return n_ == 0; }
+            /** @return How many headers are held back. */
+            [[nodiscard]] size_t size() const noexcept { return n_; }
+            /** @return The @p i-th held-back id, outermost first. */
+            [[nodiscard]] sofab::id operator[](size_t i) const noexcept
+            {
+                return i < kInline ? inline_[i] : spill_[i - kInline];
+            }
+            /**
+             * @brief Hold back one more id (the new innermost open sequence).
+             *
+             * Past `kInline` this grows the spill vector, the one allocation
+             * an encode can make. A failed allocation is **reported, not fatal**:
+             * the `bad_alloc` is caught here and turned into a `false`, which
+             * @ref OStreamImpl::sequenceBeginLazy surfaces as
+             * @ref Error::BufferFull. (A build with exceptions disabled has no
+             * such option — there `push_back` on a failed allocation terminates,
+             * as it does anywhere else in that build.)
+             *
+             * @return `true` if the id is held back, `false` if it could not be.
+             */
+            [[nodiscard]] bool push(sofab::id v) noexcept
+            {
+                if (n_ < kInline) { inline_[n_++] = v; return true; }
+#if defined(__cpp_exceptions) && __cpp_exceptions
+                try { spill_.push_back(v); }
+                catch (...) { return false; }
+#else
+                spill_.push_back(v);
+#endif
+                ++n_;
+                return true;
+            }
+            /** Drop the innermost held-back id — its sequence got no content. */
+            void pop() noexcept
+            {
+                if (n_ == 0) return;
+                --n_;
+                if (n_ >= kInline) spill_.pop_back();
+            }
+            /** Forget the whole run (it has just been written out). */
+            void clear() noexcept { n_ = 0; spill_.clear(); }
+        };
+        PendingRun pending_;
         bool failed_ = false;         /**< Sticky: a write has overflowed (see @ref ok). */
 
         /** Construct an unattached stream; a derived class must call @ref initBuffer. */
@@ -482,16 +561,68 @@ namespace sofab
         }
 
         /**
-         * @brief Write a field header (field id and wire type) as one varint.
-         * @param fieldId Field identifier; must not exceed @ref ID_MAX.
-         * @param type Wire type of the field.
-         * @return @ref Error::InvalidArgument if @p fieldId is too large,
-         *         @ref Error::BufferFull on overflow, otherwise @ref Error::None.
+         * @brief Write the sequence-end marker (§4.9) — id 0, wire type 7.
+         *
+         * The **only** header not composed inline by one of the five writers, and
+         * deliberately not a general `putHeader(id, type)`: a general one would
+         * look like the place to commit a held-back run, and it is not. It is
+         * reached from @ref sequenceEnd and @ref sequenceEndKeep only, neither of
+         * which may commit here — @ref sequenceEnd only gets here when the run is
+         * already empty, and @ref sequenceEndKeep has committed it itself one line
+         * earlier. The commit choke point is @ref beforeContent, called by the
+         * five inline writers; see the note there.
+         *
+         * @return @ref Error::BufferFull on overflow, otherwise @ref Error::None.
          */
-        [[nodiscard]] Error putHeader(sofab::id fieldId, Wire type) noexcept
+        [[nodiscard]] Error putSequenceEnd() noexcept
         {
-            if (fieldId > ID_MAX) return Error::InvalidArgument;
-            return putVarint(headerWord(fieldId, type));
+            return putVarint(headerWord(0, Wire::SequenceEnd));
+        }
+
+        /**
+         * @brief Write out the held-back sequence headers, outermost first.
+         *
+         * Runs at most once per non-default sequence, never per field.
+         *
+         * The run is dropped even when a header write fails partway, and that is
+         * deliberate: the only way to fail here is @ref Error::BufferFull, which
+         * is unreachable while a flush callback is set and otherwise latches the
+         * sticky @ref failed_ with the cursor parked at the buffer end — so every
+         * later push fails too and @ref ok is already false. Keeping the leftover
+         * ids could therefore only ever emit them into an output that is already
+         * condemned. `bufferFullCondemnsTheRun()` in test/test_roundtrip.cpp
+         * pins that: a truncated encode stays a byte-exact prefix of the full one
+         * and reports `ok() == false`.
+         */
+        [[nodiscard]] Error commitPending() noexcept
+        {
+            Error err = Error::None;
+            /* Safe to iterate and clear afterwards: putVarint never touches the
+             * run (it writes bytes, it does not open or close a sequence). */
+            const size_t n = pending_.size();
+            for (size_t i = 0; i < n; ++i)
+                if ((err = putVarint(headerWord(pending_[i], Wire::SequenceStart))) != Error::None)
+                    break;
+            pending_.clear();
+            return err;
+        }
+
+        /**
+         * @brief Commit any held-back sequence run before writing content.
+         *
+         * **This is the choke point** — there is no other. The five writers below
+         * (@ref writeScalar, @ref writeFixlen, @ref writeFloatScalar,
+         * @ref writeIntArray, @ref writeFloatArray) compose their header inline
+         * for speed, so every field written by this library goes through one of
+         * them and through this call, and through nothing else: dropping it from
+         * any one of the five loses that field's frame, and each of the five has a
+         * check in `lazySequenceFraming()` that fails when it does. A
+         * @ref sequenceBeginLazy run is framed exactly when the first child field
+         * appears (MESSAGE_SPEC §2).
+         */
+        [[nodiscard]] Error beforeContent() noexcept
+        {
+            return !pending_.empty() ? commitPending() : Error::None;
         }
 
         /**
@@ -531,6 +662,7 @@ namespace sofab
         [[nodiscard]] Error writeScalar(sofab::id fieldId, Wire type, uint64_t value) noexcept
         {
             if (fieldId > ID_MAX) return Error::InvalidArgument;
+            if (Error e = beforeContent(); e != Error::None) return e;
             uint8_t tmp[20];
             size_t n = encodeVarint(tmp, headerWord(fieldId, type));
             n += encodeVarint(tmp + n, value);
@@ -549,6 +681,7 @@ namespace sofab
         [[nodiscard]] Error writeFixlen(sofab::id fieldId, Fix ft, const uint8_t *data, size_t len) noexcept
         {
             if (fieldId > ID_MAX) return Error::InvalidArgument;
+            if (Error e = beforeContent(); e != Error::None) return e;
             uint8_t tmp[20];
             size_t n = encodeVarint(tmp, headerWord(fieldId, Wire::Fixlen));
             n += encodeVarint(tmp + n, fixlenWord(len, ft));
@@ -569,6 +702,7 @@ namespace sofab
         {
             constexpr Fix ft = (sizeof(F) == 4) ? Fix::Fp32 : Fix::Fp64;
             if (fieldId > ID_MAX) return Error::InvalidArgument;
+            if (Error e = beforeContent(); e != Error::None) return e;
             auto bits = detail::floatBits(value);
             uint8_t tmp[20];
             size_t n = encodeVarint(tmp, headerWord(fieldId, Wire::Fixlen));
@@ -594,6 +728,7 @@ namespace sofab
         {
             constexpr bool isSigned = std::is_signed_v<E>;
             if (fieldId > ID_MAX) return Error::InvalidArgument;
+            if (Error e = beforeContent(); e != Error::None) return e;
             uint8_t hdr[20];
             size_t hn = encodeVarint(hdr, (static_cast<uint64_t>(fieldId) << 3) |
                         static_cast<uint64_t>(isSigned ? Wire::ArraySigned : Wire::ArrayUnsigned));
@@ -626,6 +761,7 @@ namespace sofab
         {
             constexpr Fix ft = (sizeof(F) == 4) ? Fix::Fp32 : Fix::Fp64;
             if (fieldId > ID_MAX) return Error::InvalidArgument;
+            if (Error e = beforeContent(); e != Error::None) return e;
             uint8_t hdr[20];
             size_t hn = encodeVarint(hdr, headerWord(fieldId, Wire::ArrayFixlen));
             hn += encodeVarint(hdr + hn, elems.size());
@@ -697,13 +833,37 @@ namespace sofab
                 return *this;
             }
             /**
-             * @brief Chain the opening of a nested sub-message.
+             * @brief Chain a nested-message field write that is omitted when the
+             *        message is all-default (@ref OStreamImpl::writeLazy).
+             * @param fieldId Field identifier of the sub-message.
+             * @param value Nested message to encode.
+             * @return `*this`, for further chaining.
+             */
+            template <typename T>
+            Result writeLazy(sofab::id fieldId, const T &value) noexcept
+            {
+                if (error_ == Error::None) error_ = os_.writeLazy(fieldId, value).error_;
+                return *this;
+            }
+            /**
+             * @brief Chain a frame-keeping close (@ref OStreamImpl::sequenceEndKeep).
+             * @return `*this`, for further chaining.
+             */
+            Result sequenceEndKeep() noexcept
+            {
+                if (error_ == Error::None) error_ = os_.sequenceEndKeep().error_;
+                return *this;
+            }
+            /**
+             * @brief Chain the opening of a nested sub-message that is framed only
+             *        if it turns out to have content (@ref
+             *        OStreamImpl::sequenceBeginLazy).
              * @param fieldId Field identifier of the sub-message.
              * @return `*this`, for further chaining.
              */
-            Result sequenceBegin(sofab::id fieldId) noexcept
+            Result sequenceBeginLazy(sofab::id fieldId) noexcept
             {
-                if (error_ == Error::None) error_ = os_.sequenceBegin(fieldId).error_;
+                if (error_ == Error::None) error_ = os_.sequenceBeginLazy(fieldId).error_;
                 return *this;
             }
             /**
@@ -757,8 +917,9 @@ namespace sofab
          *
          * Sticky and independent of how the writes were issued — chained, or one
          * at a time with each Result discarded, which is what a generated
-         * `serialize()` does. The only way it turns false is an overflow with no
-         * flush callback set, so it is the verdict to check after encoding into a
+         * `serialize()` does. It turns false on an overflow with no flush callback
+         * set (and, rarely, when @ref sequenceBeginLazy cannot allocate room to
+         * hold a header back), so it is the verdict to check after encoding into a
          * buffer that may be smaller than the message (@ref OStreamView).
          *
          * @return true while no write has overflowed.
@@ -820,9 +981,13 @@ namespace sofab
             }
             else if constexpr (std::is_base_of_v<OStreamMessage, T>)
             {
-                err = sequenceBegin(fieldId).error_;
+                /* The ELEMENT form: the frame is kept even when the nested message
+                 * writes nothing, because element presence carries a wrapper
+                 * array's length (MESSAGE_SPEC §5.1). A nested message FIELD, which
+                 * may vanish when all-default, is @ref writeLazy. */
+                err = sequenceBeginLazy(fieldId).error_;
                 if (err == Error::None) err = value.serialize(*this).error_;
-                if (err == Error::None) err = sequenceEnd().error_;
+                if (err == Error::None) err = sequenceEndKeep().error_;
             }
             else if constexpr (requires { typename T::value_type; std::span{std::declval<const T &>()}; })
             {
@@ -840,6 +1005,35 @@ namespace sofab
                 static_assert(always_false_v<T>, "Unsupported type passed to OStream::write()");
             }
 
+            return Result{*this, err};
+        }
+
+        /**
+         * @brief Write a nested message **field**, omitting it when it is all-default.
+         *
+         * Same as @ref write for an @ref OStreamMessage, except it closes with
+         * @ref sequenceEnd rather than @ref sequenceEndKeep: the nested `serialize`
+         * omits every child that equals its default, so "not one child was written"
+         * is exactly "the object equals its declared default" — evaluated per child
+         * field, recursively — and the field is then dropped instead of emitted as
+         * an empty frame (MESSAGE_SPEC §2).
+         *
+         * Use it for a `struct`/`union` **field**. Keep plain @ref write for an
+         * array **element**: element presence carries a dynamic array's length
+         * (§5.1), so an all-default element stays framed.
+         *
+         * @tparam T A type deriving from @ref OStreamMessage.
+         * @param fieldId Field identifier; must not exceed @ref ID_MAX.
+         * @param value Nested message to encode.
+         * @return A @ref Result carrying @ref Error::None on success, or the error encountered.
+         */
+        template <typename T>
+            requires std::is_base_of_v<OStreamMessage, T>
+        Result writeLazy(sofab::id fieldId, const T &value) noexcept
+        {
+            Error err = sequenceBeginLazy(fieldId).error_;
+            if (err == Error::None) err = value.serialize(*this).error_;
+            if (err == Error::None) err = sequenceEnd().error_;
             return Result{*this, err};
         }
 
@@ -871,31 +1065,114 @@ namespace sofab
         }
 
         /**
-         * @brief Open a nested sub-message under @p fieldId.
+         * @brief Open a nested sub-message whose header is **held back** until the
+         *        sub-message turns out to have content.
          *
-         * Fields written after this call belong to the sub-message until the
-         * matching @ref sequenceEnd.
+         * MESSAGE_SPEC §2 omits a sequence-typed field whose value equals its
+         * declared default, and "not one child was written" is exactly that
+         * condition — evaluated per child field, recursively, for free. A sequence
+         * closed with nothing in it therefore emits **nothing** instead of a
+         * two-byte empty frame, and an all-default message becomes the empty byte
+         * string.
+         *
+         * The predicate never touches a byte image of the object, so struct padding
+         * cannot influence it and a non-zero nested default is handled by the
+         * caller's ordinary per-field test.
+         *
+         * This is the only way to open a sub-message. How it closes decides whether
+         * a contentless one survives: @ref sequenceEnd drops it, @ref sequenceEndKeep
+         * forces the frame out.
+         *
+         * The hold-back has **no depth window**: the pending run grows on demand
+         * to whatever nesting @ref MAX_DEPTH allows, so the output is canonical at
+         * every legal depth (CORELIB_PLAN §6, "How deep the hold-back reaches" —
+         * only a heap-free profile may bound the run and frame eagerly past the
+         * bound). Nesting up to @ref PendingRun's inline depth costs no
+         * allocation at all; deeper runs spill to the heap. If that allocation
+         * fails, the sequence is not opened and the call returns
+         * @ref Error::BufferFull with @ref ok turned false — an exceptions-enabled
+         * build never terminates over it.
          *
          * @param fieldId Field identifier of the sub-message.
-         * @return A @ref Result carrying @ref Error::None on success, or the error encountered.
+         * @return A @ref Result carrying @ref Error::None on success,
+         *         @ref Error::InvalidArgument past @ref MAX_DEPTH or @ref ID_MAX,
+         *         @ref Error::BufferFull if the hold-back could not grow.
          */
-        Result sequenceBegin(sofab::id fieldId) noexcept
+        Result sequenceBeginLazy(sofab::id fieldId) noexcept
         {
-            /* §4.9/§6.2: never open more than MAX_DEPTH nested sequences. */
             if (seqDepth_ >= static_cast<size_t>(MAX_DEPTH))
                 return Result{*this, Error::InvalidArgument};
-            Result r{*this, putHeader(fieldId, Wire::SequenceStart)};
-            if (r.ok()) ++seqDepth_;
-            return r;
+            if (fieldId > ID_MAX)
+                return Result{*this, Error::InvalidArgument};
+            /* The run grows on demand — no window, no eager fallback. The only
+             * ceiling is the MAX_DEPTH just checked, so the hold-back is
+             * canonical at every legal depth (CORELIB_PLAN §6). Past the run's
+             * inline depth that growth allocates; if the allocation fails the
+             * sequence is NOT opened and the stream is condemned (sticky
+             * @ref failed_), because the caller's matching close would otherwise
+             * end an enclosing sequence instead of this one. */
+            if (!pending_.push(fieldId))
+            {
+                failed_ = true;
+                return Result{*this, Error::BufferFull};
+            }
+            ++seqDepth_;
+            return Result{*this, Error::None};
         }
         /**
-         * @brief Close the most recently opened sub-message.
+         * @brief Close the most recently opened sub-message, letting it **vanish**
+         *        if it received no content.
+         *
+         * Use it wherever absence encodes the same value as an empty frame: a
+         * `struct`/`union` field, and an array field whose declared `default` is the
+         * empty collection (MESSAGE_SPEC §2). Where the frame must be visible, close
+         * with @ref sequenceEndKeep instead.
+         *
          * @return A @ref Result carrying @ref Error::None on success, or the error encountered.
          */
         Result sequenceEnd() noexcept
         {
             if (seqDepth_ > 0) --seqDepth_;
-            return Result{*this, putHeader(0, Wire::SequenceEnd)};
+            if (!pending_.empty())
+            {
+                /* The innermost open sequence is the last held-back one: drop it. */
+                pending_.pop();
+                return Result{*this, Error::None};
+            }
+            return Result{*this, putSequenceEnd()};
+        }
+
+        /**
+         * @brief Close the most recently opened sub-message, **keeping** its frame
+         *        even when it received no content.
+         *
+         * Behaves like a write: it first emits any held-back headers — this frame's
+         * and every enclosing one's — and then the end marker, so an empty sequence
+         * reaches the wire as `begin` + `end`.
+         *
+         * Required wherever the frame carries information beyond its contents:
+         * - a **wrapper-array element** (`struct`/`union`/nested row): element
+         *   presence is what carries a dynamic array's length — *highest present id
+         *   + 1* (§5.1) — so dropping an all-default element would change the
+         *   decoded length, not just the bytes;
+         * - an array field already known to **differ from a non-empty declared
+         *   `default`**: absence would reconstruct that default, so the empty frame
+         *   is the only encoding of "explicitly empty" (§2, §3).
+         *
+         * The two failure directions are not symmetric, which is why this is the
+         * safe choice when in doubt: using it where @ref sequenceEnd would do costs
+         * one non-canonical empty frame that a decoder normalizes away, while the
+         * reverse silently changes an array's length.
+         *
+         * @return A @ref Result carrying @ref Error::None on success, or the error encountered.
+         */
+        Result sequenceEndKeep() noexcept
+        {
+            if (seqDepth_ > 0) --seqDepth_;
+            if (!pending_.empty())
+                if (Error e = commitPending(); e != Error::None)
+                    return Result{*this, e};
+            return Result{*this, putSequenceEnd()};
         }
     };
 
@@ -964,17 +1241,14 @@ namespace sofab
     };
 
     /**
-     * @brief Output stream whose buffer is stored inline (no heap allocation).
-     * @tparam N Buffer capacity in bytes; must be greater than zero.
-     * @tparam Offset Number of leading bytes to reserve before the cursor; must be less than @p N.
-     */
-    /**
      * @brief Output stream over a buffer the caller already owns.
      *
-     * Neither allocates nor copies: encoding writes straight into @p buffer. The
-     * counterpart to @ref OStreamInline (buffer inside the object) and @ref
-     * OStream (buffer held by a `shared_ptr`) — this is the one for a destination
-     * that already exists, such as the `dst` of a generated `encodeTo`.
+     * Allocates no buffer and copies no payload: encoding writes straight into
+     * @p buffer. The counterpart to @ref OStreamInline (buffer inside the object)
+     * and @ref OStream (buffer held by a `shared_ptr`) — this is the one for a
+     * destination that already exists, such as the `dst` of a generated
+     * `encodeTo`. (As with every stream, nesting deeper than the held-back run's
+     * inline depth allocates that run — see @ref OStreamImpl::sequenceBeginLazy.)
      *
      * The buffer must outlive the stream, and it is **not** restored if encoding
      * fails: overflow leaves the bytes written so far in place and @ref ok false.
@@ -1008,6 +1282,18 @@ namespace sofab
         }
     };
 
+    /**
+     * @brief Output stream whose buffer is stored inline (the *buffer* costs no
+     *        heap allocation).
+     *
+     * The encoded bytes never leave the inline array. The one allocation such a
+     * stream can still make is the held-back sequence run, and only when the
+     * nesting outgrows that run's inline depth (see
+     * @ref OStreamImpl::sequenceBeginLazy).
+     *
+     * @tparam N Buffer capacity in bytes; must be greater than zero.
+     * @tparam Offset Number of leading bytes to reserve before the cursor; must be less than @p N.
+     */
     template <size_t N, size_t Offset = 0>
     class OStreamInline : public OStreamImpl
     {
@@ -1700,6 +1986,19 @@ namespace sofab
          *         with an open sequence — the partial tail is buffered for the next
          *         @ref feed and is **not** an error; or @ref Error::InvalidMessage
          *         (`INVALID`) when the bytes are malformed regardless of what follows.
+         *
+         * @warning **One message per destination.** Successive @ref feed calls
+         *          continue the *same* message — a decoder cannot see a message
+         *          boundary, because a message has no framing on the wire and a
+         *          zero-byte message is legal (MESSAGE_SPEC §2). Decoding a
+         *          *second* message therefore requires a destination reset: call
+         *          @ref reset (which for @ref IStreamObject also re-initialises the
+         *          wrapped message) or use a fresh stream. MESSAGE_SPEC §5.1 puts
+         *          this duty on the decoding side — "supplying a cleanly
+         *          initialised destination is the application's responsibility" —
+         *          and §2 makes it load-bearing: an all-default field is *absent*
+         *          from the bytes, so nothing runs for it and whatever the previous
+         *          message left in that member survives.
          */
         Result feed(const uint8_t *buffer, size_t buflen) noexcept
         {
@@ -1745,6 +2044,49 @@ namespace sofab
                 return Result{Error::None, skipped_};
             }
             return Result{Error::Incomplete, skipped_}; /* §7: a partial field is still buffered */
+        }
+
+        /**
+         * @brief Drop every byte of decoder state, so the next @ref feed starts a
+         *        brand-new message.
+         *
+         * Discards the buffered partial field, the sticky error/limit flags, the
+         * nesting depth and the §7.3 @ref skipped counter. The reassembly buffer's
+         * *capacity* is deliberately kept: this is the message-loop call, and
+         * handing the allocation back only to take it again next message is the one
+         * thing it must not cost (`Limits::max_buffered_field` is what bounds that
+         * capacity in the first place).
+         *
+         * **It does not touch the destination** — this class has none; it only
+         * dispatches. @ref IStreamObject overrides this to reset the message it
+         * owns as well, which is what a caller reusing a decoder wants. A caller
+         * driving @ref IStreamInline owns its destinations and must clear them
+         * itself.
+         *
+         * Required between messages: MESSAGE_SPEC §2 omits an all-default field
+         * entirely, so an absent field delivers no callback and leaves the previous
+         * message's value in place — including a wrapper-array field, whose
+         * collector (@ref StringSeq, @ref BlobSeq, @ref MessageSeq) only clears its
+         * destination when the wrapper sequence is actually present.
+         */
+        virtual void reset() noexcept
+        {
+            acc_.clear();
+            topPos_ = 0;
+            p_ = end_ = fieldStart_ = nullptr;
+            type_ = Wire{};
+            fixType_ = Fix{};
+            fixLen_ = 0;
+            count_ = 0;
+            fieldId_ = 0;
+            consumed_ = false;
+            error_ = false;
+            limitExceeded_ = false;
+            incomplete_ = false;
+            declined_ = false;
+            seqDepth_ = 0;
+            skipped_ = 0;
+            elemBound_ = -1;
         }
 
         /**
@@ -2506,6 +2848,18 @@ namespace sofab
      * as the per-field callback, so feeding bytes populates the message directly.
      * The decoded message is reached through `operator->` / `operator*`.
      *
+     * @warning **One message per object, unless you @ref reset.** The wrapped
+     *          message is populated *in place* across every @ref IStreamImpl::feed,
+     *          and MESSAGE_SPEC §2 omits an all-default field from the bytes
+     *          altogether — so decoding a second message into the same object
+     *          leaves the first message's value in every field the second one does
+     *          not carry. That is true of a scalar field (it keeps the old number)
+     *          and, since §2, of a wrapper-array field too: its collector clears
+     *          the destination only when the wrapper sequence is present, so an
+     *          absent array field keeps the previous decode's elements instead of
+     *          reading as the empty array §2 requires. Call @ref reset between
+     *          messages — it re-initialises the message and the decoder together.
+     *
      * @tparam MessageType A type satisfying @ref sofab::InputMessage.
      */
     template <InputMessage MessageType>
@@ -2524,6 +2878,25 @@ namespace sofab
             topCallback_ = [this](sofab::id id, size_t size, size_t count) {
                 data_.deserialize(*this, id, size, count);
             };
+        }
+
+        /**
+         * @brief Reset the decoder **and** the wrapped message, ready for the next
+         *        message.
+         *
+         * Extends @ref IStreamImpl::reset by value-initialising the owned
+         * @p MessageType — the destination side of the contract, which the base
+         * class cannot do because it does not own a destination. Its address is
+         * unchanged, so the field callback installed at construction stays valid.
+         *
+         * This is the supported way to decode more than one message with one
+         * object; see the class warning for what goes wrong without it.
+         */
+        void reset() noexcept override
+        {
+            IStreamImpl::reset();
+            std::destroy_at(&data_);
+            std::construct_at(&data_);
         }
 
         /** @return The wrapped message (mutable access). */
@@ -2574,6 +2947,15 @@ namespace sofab
          * §7.4: the sequence IS the array's value, so a repeated field id replaces
          * it whole. @ref IStreamImpl::read calls this once the SequenceStart tag
          * matched, so a §7.3-skipped occurrence cannot wipe a valid earlier one.
+         *
+         * @warning It runs only when the wrapper sequence is **present**. Since
+         *          MESSAGE_SPEC §2 omits an all-default array field, an *absent*
+         *          field reaches no collector at all and @p out is left exactly as
+         *          it was — so a destination reused across messages must be reset
+         *          by its owner first (@ref IStreamObject::reset, §5.1 "supplying a
+         *          cleanly initialised destination is the application's
+         *          responsibility"). This is not the collector's call to make: it
+         *          never learns that the field was absent.
          */
         void prepare() noexcept { out.clear(); }
 
@@ -2606,6 +2988,7 @@ namespace sofab
         explicit BlobSeq(std::vector<std::vector<uint8_t>> &o, long capacity = -1, long elemMax = -1) noexcept
             : out(o), cap(capacity), emax(elemMax) {}
 
+        /** @copydoc StringSeq::prepare */
         void prepare() noexcept { out.clear(); }
 
         void deserialize(IStreamImpl &is, sofab::id id, size_t size, size_t) noexcept override
@@ -2638,16 +3021,34 @@ namespace sofab
         std::vector<T> *out = nullptr;
         long cap = -1;   /**< Schema `count` N, or -1; an id at or past N is INVALID (§5.1/§7). */
 
-        void prepare() noexcept { if (out) out->clear(); } /**< §7.4 replace-whole; see @ref StringSeq. */
+        /** §7.4 replace-whole, and absent ⇒ never called: @copydoc StringSeq::prepare */
+        void prepare() noexcept { if (out) out->clear(); }
 
         void deserialize(IStreamImpl &is, sofab::id id, size_t, size_t count) noexcept override
         {
+            /* §5.1/§7 over-index reject, as a backstop for a direct call. Coming
+             * through @ref IStreamImpl::read this is unreachable: `cap` is handed
+             * to the stream as its element bound and rejected at the element
+             * header, one step earlier and before a truncated element could
+             * outrun it -- which is why @ref StringSeq / @ref BlobSeq carry no
+             * copy of it. Kept here because `deserialize` is public. */
             if (cap >= 0 && static_cast<size_t>(id) >= static_cast<size_t>(cap))
             {
                 is.invalidate();
                 return;
             }
-            T &row = out->emplace_back();
+            /* §5.1: the element id IS the array index, so an element is PLACED at
+             * `dest[id]`, never appended. The ids may contain gaps -- a decoder
+             * MUST accept them and recover a dynamic array's length as *highest
+             * present id + 1*, leaving every absent id at the element default.
+             * Appending instead would silently SHORTEN the array by the size of
+             * the gap: wire `06 0005 07 16 0009 07` (elements at id 0 and id 2,
+             * id 1 absent) is the 3-element array `[5, 0, 9]`, not `[5, 9]`.
+             * Same placement rule as @ref StringSeq / @ref BlobSeq; the growth is
+             * bounded by the `cap` reject above whenever the schema declares a
+             * `count`. */
+            while (out->size() <= static_cast<size_t>(id)) out->emplace_back();
+            T &row = (*out)[id];
             /* A count-less native-array row is a std::vector the span read fills
              * only up to its current size, so size it to the row's wire count
              * first. Struct/union rows and fixed std::array rows have no resize(). */

@@ -155,6 +155,33 @@ in.feed(msg.data(), msg.size());      // msg from the Serialize example above
 // (*in).id and (*in).value now hold the decoded values
 ```
 
+#### One message per destination — `reset()` between messages
+
+A decoder cannot see a message boundary: a message has no framing on the wire, and
+since MESSAGE_SPEC §2 an all-default message is the *empty byte string*. Successive
+`feed()` calls therefore continue **one** message. To decode a second message into
+the same object, call `reset()` — it re-initialises the wrapped message **and** the
+decoder (reassembly buffer, sticky flags, `skipped()` counter) together:
+
+```cpp
+sofab::IStreamObject<Sensor> in;
+in.feed(a.data(), a.size());          // message A
+in.reset();                           // ← required
+in.feed(b.data(), b.size());          // message B, on a clean destination
+```
+
+Without it, every field that message B does **not** carry keeps message A's value.
+That is obvious for a scalar (§2 omits a default-valued field, so nothing is
+delivered for it), and it is equally true of a **wrapper-array** field: its
+collector (`StringSeq` / `BlobSeq` / `MessageSeq`) clears the destination in
+`prepare()`, which runs only when the wrapper sequence is actually *present*. An
+absent array field reaches no collector at all, so it would keep the previous
+decode's elements instead of reading as the empty array §2 requires. MESSAGE_SPEC
+§5.1 places this duty on the decoding side — *"supplying a cleanly initialised
+destination is the application's responsibility"* — and `reset()` is how you
+discharge it. (`IStreamInline` has the same `reset()`, but it owns no destination:
+a callback-driven decoder clears its own targets.)
+
 ### Deserialize stream
 
 `feed()` can be called repeatedly with whatever bytes have arrived; a field that
@@ -273,6 +300,68 @@ Point got = Point::decode(wire.data(), wire.size());   // got.x == 3, got.y == 4
 Messages nest: passing a message deriving `OStreamMessage` to `write(id, msg)`
 encodes it as a sub-sequence, and `is.read(childMsg)` descends into it on decode.
 
+#### Sequence framing: an all-default sub-message is omitted
+
+MESSAGE_SPEC §2 **omits** a sequence-typed *field* whose value equals its
+declared default, while a wrapper-array *element* **keeps** its frame even when
+all-default — element presence is what carries a dynamic array's length (§5.1).
+Both verdicts depend on what the children turn out to be, but the sequence header
+has to be on the wire before them, so the encoder **holds the header back**
+instead of buffering the sub-message:
+
+| call | effect |
+|---|---|
+| `sequenceBeginLazy(id)` | opens a scope and holds its header back; the open ids form a *pending run* |
+| any field write | emits the whole pending run first, outermost header first, then the field |
+| `sequenceEnd()` | got no content ⇒ **drop** the frame, header and end marker both; otherwise emit the end marker |
+| `sequenceEndKeep()` | behaves like a write: emits the run **and** the end marker, so a contentless sequence still reaches the wire as `begin` + `end` |
+
+```cpp
+sofab::OStreamInline<64> os;
+os.sequenceBeginLazy(1).sequenceEnd();                    // (nothing) — the field vanishes
+os.sequenceBeginLazy(1).sequenceEndKeep();                // 0e 07     — begin + end kept
+os.sequenceBeginLazy(1).write(2, 5u).sequenceEnd();       // 0e 10 05 07 — content ⇒ framed
+```
+
+The choice of closer is **static** — a property of the position in the schema, not
+of the value — so it rides on the two message writes:
+
+- `writeLazy(id, msg)` — the **field** form (`sequenceEnd`): a `struct`/`union`
+  field, or an array wrapper. An all-default child encodes to *zero bytes*.
+- `write(id, msg)` — the **element** form (`sequenceEndKeep`): a wrapper-array
+  element, whose frame must survive. An all-default child encodes to `1e 07` at
+  id 3.
+
+Getting it wrong is asymmetric — a needless `sequenceEndKeep` costs one
+non-canonical empty frame that every decoder normalizes away, a wrong
+`sequenceEnd` silently changes an array's length — so `write` (keep) is the safe
+default and `writeLazy` the deliberate one. Generated code picks per position.
+
+There is **no depth window**: the pending run grows on demand up to `MAX_DEPTH`
+(255), so the omission is canonical at every legal nesting depth
+(CORELIB_PLAN §6). The held-back ids are encoder state, never buffer content, so
+a flush can never split a run and a tiny output buffer yields byte-identical
+output. Decoding is unaffected: an empty frame remains legal input and decodes to
+the same value as an omitted one.
+
+**What it costs.** The hold-back is not free, and the two prices are measured,
+not estimated:
+
+- **Instructions.** On the shared `encode: typical message` workload (which nests
+  one sub-message) it is **353 Ir/op against 285** for the pre-§2 encoder that
+  framed eagerly — **+68 Ir/op, +24 %**. The other three workloads are unchanged
+  (`encode: u64 array` 106 972 vs 107 961; both decode figures identical) — see
+  [Instruction counts](#instruction-counts-callgrind).
+- **State.** The run lives in the stream object, so every stream grew by **64
+  bytes**: `sizeof(OStreamInline<64>)` 144 → 208, `sizeof(OStreamView)` 80 → 144,
+  `sizeof(OStream)` 96 → 160. That is per stream, not per message — it does not
+  scale with what is encoded.
+
+Beyond the run's inline depth the ids spill to the heap (see
+[Memory handling](#memory-handling)); a failed allocation there is **reported,
+not fatal** — the open is refused with `Error::BufferFull` and `ok()` turns
+false.
+
 The same generated struct also streams — no whole-message buffer on either side.
 Its `serialize` targets any output stream, so a small flushing window works, and
 an `IStreamObject` accepts the wire bytes in arbitrary chunks:
@@ -321,9 +410,24 @@ value out immediately, so no per-field destination must stay stable — but the
 **Encode (`OStream` / `OStreamInline`) — writes into an owned, fixed-size buffer;
 flushes, never grows.** `OStream` owns its buffer through a
 `std::shared_ptr<uint8_t[]>`; `OStreamInline<N>` owns an `N`-byte `std::array` on
-the stack (zero heap). Neither grows: at the buffer end it calls the flush
-callback with the filled bytes and rewinds; **without** a callback a full buffer
-yields `Error::BufferFull`.
+the stack (the *buffer* costs no heap). Neither grows: at the buffer end it calls
+the flush callback with the filled bytes and rewinds; **without** a callback a
+full buffer yields `Error::BufferFull`.
+
+The one allocation an encoder can still make is the held-back sequence run (see
+[Sequence framing](#sequence-framing-an-all-default-sub-message-is-omitted)): the
+list of open-but-unwritten sequence ids. The first eight levels of nesting live
+**inside** the stream object (costing it 64 bytes of state), so the ordinary
+encode allocates nothing; only a run nested deeper than that spills to the heap,
+and it is bounded by `MAX_DEPTH` (255 ids, ~1 KiB) regardless. It holds encoder
+state, never message bytes, so it never scales with the message.
+
+That allocation is the **only** one an encode can fail on, and failing it is not
+fatal: with exceptions enabled (the default) the `bad_alloc` is caught,
+`sequenceBeginLazy` refuses to open the sequence and returns `Error::BufferFull`
+with `ok()` false. In a build compiled `-fno-exceptions` there is nothing to
+catch and the allocation failure terminates the process, exactly as any other
+allocation in such a build does — nest below the inline depth if that matters.
 
 ## Feature flags
 
@@ -357,11 +461,19 @@ Two suites run under CTest:
 - **`test_roundtrip`** — encode/decode/nested/chunked/skip checks plus the
   three-valued decode outcome (§7: COMPLETE / INCOMPLETE / INVALID), malformed-input
   handling (truncated tails held as `Incomplete`; overlong varints, oversized
-  lengths and stray markers rejected as `InvalidMessage`) and resync after a
-  skipped sub-sequence.
+  lengths and stray markers rejected as `InvalidMessage`), resync after a
+  skipped sub-sequence, and the §2 sequence framing above (an all-default
+  sequence omitted, a kept element frame, hold-back at full `MAX_DEPTH`, and
+  identical bytes when a run is committed across a flush boundary).
 - **`test_vectors`** — replays the shared `assets/test_vectors.json` conformance
   suite (copied verbatim from `corelib-c-cpp`, the authoritative source) for
-  encode, decode, and byte-at-a-time chunked streaming.
+  encode, decode, and byte-at-a-time chunked streaming. It asserts each vector's
+  `serialized` column — the primitive-layer ground truth — and, replaying the
+  same ops with the dropping closer, also its `serialized_sparse` column for the
+  three vectors whose sparse form is *pure sequence omission* (the rest of that
+  column encodes per-field defaults, which needs a schema and belongs to the
+  **generator's** conformance drivers). For every other vector the same replay
+  must reproduce `serialized` unchanged.
 
 ### Coverage and API docs
 
@@ -435,10 +547,16 @@ is better). All three are compiled at `-O3` so the comparison is like-for-like:
 
 | Workload | C | C++ wrapper | this (pure C++20) |
 |---|--:|--:|--:|
-| encode: u64 array (1000) | 124 987 | 125 016 | **107 961** (−14 %) |
-| encode: typical message  |     852 |     917 | **285** (−67 %) |
+| encode: u64 array (1000) | 124 987 | 125 016 | **106 972** (−14 %) |
+| encode: typical message  |     852 |     917 | **353** (−59 %) |
 | decode: u64 array (1000) | 272 962 | 272 963 | **111 555** (−59 %) |
 | decode: typical message  |   2 039 |   2 038 | **1 304** (−36 %) |
+
+The encode figures include the §2 sequence hold-back: `encode: typical message`
+cost **285** before it and costs **353** now (+24 %), which is the price of
+never framing an all-default sub-message — see
+[Sequence framing](#sequence-framing-an-all-default-sub-message-is-omitted).
+Reproduce with `bash bench/run_callgrind.sh`.
 
 The pure-C++20 port wins on instructions across the board because it fuses
 header+value writes, bulk-copies arrays, and parses in place without the C port's

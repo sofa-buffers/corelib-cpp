@@ -7,6 +7,11 @@
  * decode, roundtrip and chunked scenarios — the same conformance suite the C
  * library runs, but exercising the native C++ implementation.
  *
+ * The asserted column is `serialized`, plus `serialized_sparse` for the vectors
+ * whose sparse form is pure sequence omission (§2) — the rest of the sparse
+ * form needs a schema and belongs to the generator's conformance drivers. See
+ * the note in loadVectors().
+ *
  * SPDX-License-Identifier: MIT
  */
 
@@ -29,6 +34,9 @@
 namespace {
 
 enum class K { U, S, B, F32, F64, Str, Blob, Arr, SeqB, SeqE };
+/* `element: true` on a sequence_end marks an ELEMENT-position sequence: it
+ * keeps its frame even when contentless (MESSAGE_SPEC §5.1), unlike a FIELD,
+ * which §2 omits. See assets/test_vectors_README.md. */
 enum class E { U8, U16, U32, U64, I8, I16, I32, I64, F32, F64 };
 
 /* Optional library-feature capability tags (see assets/test_vectors_README.md upstream).
@@ -82,6 +90,7 @@ uint32_t capFromName(const char *s)
 struct Op
 {
     K kind{};
+    bool elementPos = false;  /* sequence_end only: §5.1 element, keeps its frame */
     uint32_t id = 0;
     uint64_t u = 0;
     int64_t  s = 0;
@@ -101,7 +110,44 @@ struct Vector
     std::vector<uint8_t> bytes;
     std::vector<uint32_t> skip;   // field ids a receiver is expected to skip (skip_ids)
     uint32_t req = 0;             // capability mask from the "requires" tags
+    std::vector<uint8_t> sparse;  // serialized_sparse column (see loadVectors)
+    bool hasSparse = false;
+    bool contentless = false;     // op list contains a sequence with no leaf field
 };
+
+/* Does the op list contain a sequence that receives no leaf field (directly or
+ * through nothing but further empty sequences)? Those are exactly the sequences
+ * MESSAGE_SPEC §2 omits, and — see the loadVectors() note — exactly the vectors
+ * whose sparse form the raw encoder can reproduce on its own. */
+bool hasContentlessSequence(const std::vector<Op> &ops)
+{
+    std::vector<bool> stack;   // per open sequence: has it seen a leaf field?
+    bool found = false;
+    for (const Op &op : ops)
+    {
+        if (op.kind == K::SeqB) stack.push_back(false);
+        else if (op.kind == K::SeqE)
+        {
+            if (stack.empty()) continue;
+            const bool had = stack.back();
+            stack.pop_back();
+            /* Only the array's LAST element keeps its frame when contentless
+             * (§2: nothing that carries the length may be elided); an INTERIOR
+             * all-default element is now an id gap like a default leaf. The
+             * vectors' `element` marker was narrowed to mean exactly that last
+             * position, so a marked closer is never an omission -- and it IS
+             * content for the wrapper enclosing it, exactly like a leaf. */
+            if (!had && !op.elementPos) found = true;
+            if (!stack.empty() && (had || op.elementPos)) stack.back() = true;
+        }
+        else if (!stack.empty()) stack.back() = true;
+    }
+    return found;
+}
+
+/* A name-only Vector, for checks that are about the vector SET rather than one
+ * vector's bytes (the run() reporter takes a Vector for its label). */
+Vector named(const char *nm) { Vector v; v.name = nm; return v; }
 
 bool eq32(float a, float b) { return std::bit_cast<uint32_t>(a) == std::bit_cast<uint32_t>(b); }
 bool eq64(double a, double b) { return std::bit_cast<uint64_t>(a) == std::bit_cast<uint64_t>(b); }
@@ -197,7 +243,11 @@ bool loadOp(const sofab_json_t *fj, Op &op)
         }
     }
     else if (!std::strcmp(ops, "sequence_begin")) { op.kind = K::SeqB; }
-    else if (!std::strcmp(ops, "sequence_end")) { op.kind = K::SeqE; }
+    else if (!std::strcmp(ops, "sequence_end")) {
+        op.kind = K::SeqE;
+        const sofab_json_t *ep = sofab_json_get(fj, "element");
+        op.elementPos = ep && sofab_json_bool(ep);
+    }
     else return false;
     return true;
 }
@@ -245,8 +295,45 @@ bool loadVectors(const char *path, std::vector<Vector> &out, std::string &err)
             size_t tl; const char *tn = sofab_json_string(sofab_json_array_at(req, k), &tl);
             if (tn) v.req |= capFromName(tn);
         }
+        /* WHICH COLUMNS THIS REPO ASSERTS.
+         *
+         * `serialized` -- the primitive-layer ground truth: the exact bytes this
+         * vector's op list produces when replayed through the raw encoder,
+         * closing every sequence with the frame-keeping closer.
+         *
+         * `serialized_sparse` -- the same message with every all-default
+         * sequence FIELD omitted (MESSAGE_SPEC §2). Reproducing it IN GENERAL
+         * needs a message layer -- a schema, per-field defaults, and the static
+         * choice of closer per position -- which a corelib does not have; for
+         * most vectors the two columns differ because a default-valued SCALAR
+         * was dropped, and only generated code knows that a value is the
+         * declared default.
+         *
+         * But not for all of them. Where a vector's sparse form differs from its
+         * dense one ONLY by sequence omission -- the op list contains a sequence
+         * that gets no field -- the raw encoder reproduces it with no schema at
+         * all: replay the same ops closing with the DROPPING closer. That is
+         * this library's §2 primitive measured against the shared vectors, so
+         * the "dropping-closer" scenario below asserts exactly that, and asserts
+         * for every other vector that the dropping closer changes nothing (it
+         * must still give `serialized`). hasContentlessSequence() decides which
+         * of the two, from the op list alone.
+         *
+         * The rest of §2 -- which closer generated code picks per field -- stays
+         * with the GENERATOR's conformance drivers (sofabgen,
+         * tests/conformance/<lang>), which own the schema. The hold-back trio
+         * itself (sequenceBeginLazy / sequenceEnd / sequenceEndKeep) is covered
+         * directly in test_roundtrip.cpp's lazySequenceFraming() and
+         * deepHoldBack(). */
         size_t hl; const char *hex = sofab_json_string(sofab_json_get(sofab_json_get(vj, "serialized"), "hex"), &hl);
         if (!hex || !hex2bin(hex, hl, v.bytes)) { err = v.name + ": bad hex"; sofab_json_free(root); return false; }
+        if (const sofab_json_t *sp = sofab_json_get(vj, "serialized_sparse"))
+        {
+            size_t sl2; const char *shex = sofab_json_string(sofab_json_get(sp, "hex"), &sl2);
+            if (!shex || !hex2bin(shex, sl2, v.sparse)) { err = v.name + ": bad sparse hex"; sofab_json_free(root); return false; }
+            v.hasSparse = true;
+        }
+        v.contentless = hasContentlessSequence(v.ops);
         out.push_back(std::move(v));
     }
     sofab_json_free(root);
@@ -326,7 +413,7 @@ struct NegReadMsg : sofab::IStreamMessage
 template <typename Vec, typename Src>
 Vec castVec(const Src &src) { return Vec(src.begin(), src.end()); }
 
-sofab::Error replay(sofab::OStreamImpl &os, const Op &op)
+sofab::Error replay(sofab::OStreamImpl &os, const Op &op, bool keepFrames = true)
 {
     switch (op.kind)
     {
@@ -337,8 +424,17 @@ sofab::Error replay(sofab::OStreamImpl &os, const Op &op)
         case K::F64:  return os.write(op.id, op.f).code();
         case K::Str:  return os.write(op.id, std::string_view{op.str}).code();
         case K::Blob: return os.write(op.id, op.blob.data(), static_cast<int32_t>(op.blob.size())).code();
-        case K::SeqB: return os.sequenceBegin(op.id).code();
-        case K::SeqE: return os.sequenceEnd().code();
+        case K::SeqB: return os.sequenceBeginLazy(op.id).code();
+        /* `serialized` is the primitive-layer ground truth and always carries the
+         * frame, so close with the keeping form: identical bytes once the
+         * sequence has content, and the empty-sequence vectors keep their pair.
+         * The dropping form (keepFrames == false) is what the `serialized_sparse`
+         * check replays with. */
+        /* keepFrames is the dense pass (every frame survives). In the dropping
+         * pass a FIELD closes with the dropping end, but an ELEMENT still keeps
+         * its frame -- that is the §5.1 half the sparse column encodes. */
+        case K::SeqE: return (keepFrames || op.elementPos)
+                             ? os.sequenceEndKeep().code() : os.sequenceEnd().code();
         case K::Arr:
             switch (op.elem)
             {
@@ -381,6 +477,30 @@ bool encode(const Vector &v, size_t tiny, std::string &err)
     }
     if (out.size() != v.bytes.size() || std::memcmp(out.data(), v.bytes.data(), out.size()) != 0)
     { err = "bytes differ from serialized.hex"; return false; }
+    return true;
+}
+
+/* Replay the op list closing every sequence with the DROPPING closer
+ * (sequenceEnd). Expected bytes: `serialized_sparse` when the vector has a
+ * contentless sequence -- that column then differs from `serialized` by exactly
+ * the frames §2 omits -- and `serialized` otherwise, since dropping a closer
+ * that has content changes nothing. */
+bool encodeDropping(const Vector &v, std::string &err)
+{
+    const std::vector<uint8_t> &want = (v.contentless && v.hasSparse) ? v.sparse : v.bytes;
+    if (v.contentless && !v.hasSparse)
+    { err = "vector has an empty sequence but no serialized_sparse column"; return false; }
+
+    sofab::OStream os(4096);
+    for (const Op &op : v.ops)
+        if (replay(os, op, /*keepFrames=*/false) != sofab::Error::None) { err = "encode error"; return false; }
+    if (os.bytesUsed() != want.size() ||
+        (!want.empty() && std::memcmp(os.data(), want.data(), want.size()) != 0))
+    {
+        err = v.contentless ? "bytes differ from serialized_sparse.hex"
+                            : "dropping closer changed a framed sequence";
+        return false;
+    }
     return true;
 }
 
@@ -546,6 +666,7 @@ int main()
 
     const uint32_t caps = buildCaps();
     int skipped = 0;
+    int sparseByOmission = 0;   // vectors whose sparse form is pure sequence omission
 
     const size_t tinies[] = {1, 3, 7};
     for (const Vector &v : vectors)
@@ -564,7 +685,26 @@ int main()
             std::string s2; run(decode(v, true,  s2, &v.skip), v, "skip-ids-chunked", s2);
         }
         std::string d4; run(roundtrip(v, d4), v, "roundtrip", d4);
+        std::string d5; run(encodeDropping(v, d5), v, "dropping-closer", d5);
+        if (v.contentless) ++sparseByOmission;
     }
+
+    /* The dropping-closer scenario only asserts `serialized_sparse` for vectors
+     * that HAVE a contentless sequence; if upstream ever renames or reshapes
+     * them the check would quietly degrade into "dense == dense". Require the
+     * three by name, and require the count to match. */
+    for (const char *nm : {"empty_sequence", "nested_empty_sequences", "empty_sequence_between_fields"})
+    {
+        bool seen = false;
+        for (const Vector &v : vectors) if (v.name == nm && v.contentless && v.hasSparse) seen = true;
+        run(seen, named(nm), "sparse-by-omission-present",
+            "vector missing, or no longer carries an empty sequence + serialized_sparse");
+    }
+    /* 4, not 3, since count-is-capacity: array_struct_all_default_elements gained a
+     * droppable interior empty frame when interior sequence elements stopped being
+     * framed unconditionally. */
+    run(sparseByOmission == 4, named("(all)"), "sparse-by-omission-count",
+        "expected 4 vectors whose sparse form is pure sequence omission, saw " + std::to_string(sparseByOmission));
 
     /* Negative UTF-8 group (top-level "invalid_utf8"). Under a strict build each
      * serialized_hex must decode to INVALID and each string_hex must be refused
@@ -587,7 +727,7 @@ int main()
             sofab::IStreamObject<NegReadMsg> in;
             auto r = in.feed(nv.serialized.data(), nv.serialized.size());
             run(r.code() == sofab::Error::InvalidMessage && r.status() == sofab::DecodeStatus::Invalid,
-                Vector{nv.name, {}, {}, {}, 0}, "utf8-decode-invalid",
+                named(nv.name.c_str()), "utf8-decode-invalid",
                 "expected INVALID, got code " + std::to_string(static_cast<int>(r.code())));
         }
         /* encode: writing the raw payload as a string field must be refused. */
@@ -596,7 +736,7 @@ int main()
             std::string_view sv(reinterpret_cast<const char *>(nv.payload.data()), nv.payload.size());
             auto w = os.write(nv.id, sv);
             run(w.code() == sofab::Error::InvalidArgument,
-                Vector{nv.name, {}, {}, {}, 0}, "utf8-encode-invalid-argument",
+                named(nv.name.c_str()), "utf8-encode-invalid-argument",
                 "expected InvalidArgument, got code " + std::to_string(static_cast<int>(w.code())));
         }
 #else

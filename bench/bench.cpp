@@ -86,7 +86,7 @@ void encode_typical(OStreamRaw &os)
     os.write(4, 3.14159f);
     os.write(5, "sofab");
     os.write(6, std::span<const uint16_t>(arr16, 4));
-    os.sequenceBegin(7);
+    os.sequenceBeginLazy(7);
     os.write(1, static_cast<uint32_t>(99));
     os.write(2, static_cast<int32_t>(-7));
     os.sequenceEnd();
