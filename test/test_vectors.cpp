@@ -131,9 +131,12 @@ bool hasContentlessSequence(const std::vector<Op> &ops)
             if (stack.empty()) continue;
             const bool had = stack.back();
             stack.pop_back();
-            /* An ELEMENT-position sequence keeps its frame even when contentless
-             * (§5.1), so it is never an omission -- and it IS content for the
-             * wrapper enclosing it, exactly like a leaf. */
+            /* Only the array's LAST element keeps its frame when contentless
+             * (§2: nothing that carries the length may be elided); an INTERIOR
+             * all-default element is now an id gap like a default leaf. The
+             * vectors' `element` marker was narrowed to mean exactly that last
+             * position, so a marked closer is never an omission -- and it IS
+             * content for the wrapper enclosing it, exactly like a leaf. */
             if (!had && !op.elementPos) found = true;
             if (!stack.empty() && (had || op.elementPos)) stack.back() = true;
         }
@@ -697,8 +700,11 @@ int main()
         run(seen, named(nm), "sparse-by-omission-present",
             "vector missing, or no longer carries an empty sequence + serialized_sparse");
     }
-    run(sparseByOmission == 3, named("(all)"), "sparse-by-omission-count",
-        "expected 3 vectors whose sparse form is pure sequence omission, saw " + std::to_string(sparseByOmission));
+    /* 4, not 3, since count-is-capacity: array_struct_all_default_elements gained a
+     * droppable interior empty frame when interior sequence elements stopped being
+     * framed unconditionally. */
+    run(sparseByOmission == 4, named("(all)"), "sparse-by-omission-count",
+        "expected 4 vectors whose sparse form is pure sequence omission, saw " + std::to_string(sparseByOmission));
 
     /* Negative UTF-8 group (top-level "invalid_utf8"). Under a strict build each
      * serialized_hex must decode to INVALID and each string_hex must be refused
