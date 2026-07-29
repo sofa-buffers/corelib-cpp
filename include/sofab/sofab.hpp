@@ -1532,6 +1532,8 @@ namespace sofab
         bool incomplete_ = false;      /**< The field being delivered needs more bytes (§7 INCOMPLETE, not malformed). */
         bool declined_ = false;        /**< The buffered field was already offered and not read: skip it, do not deliver again. */
         long elemBound_ = -1;          /**< Element-index bound of the wrapper sequence being read (§5.1); -1 = none. */
+        int elemWire_ = -1;            /**< §7.3 wire type its elements must carry (a @ref Wire as int); -1 = the collector decides the bound itself. */
+        int elemFix_ = -1;             /**< §7.3 fixlen subtype for that element type (a @ref Fix as int); -1 = the element type has none. */
         sofab::id fieldId_ = 0;        /**< Id of the field being delivered. */
         const uint8_t *fieldStart_ = nullptr; /**< First byte of that field, for the #26 reassembly cap. */
 
@@ -1814,11 +1816,37 @@ namespace sofab
                 }
                 auto fieldId = static_cast<sofab::id>(header >> 3);
                 type_ = static_cast<Wire>(header & 0x7);
-                /* §5.1/§7: an element index at or past the declared count is INVALID,
-                 * decided on the id alone so a truncated element cannot outrun it. */
-                if (elemBound_ >= 0 && type_ != Wire::SequenceEnd &&
+                /* §5.1/§7: an element index at or past the declared count is
+                 * INVALID -- but §7.3 decides first. An element header whose wire
+                 * type (or, for a fixlen element type, whose fixlen subtype)
+                 * contradicts the declared element type MUST be skipped exactly as
+                 * an unknown id is skipped, so it never becomes an element and its
+                 * id is not an array index the bound could measure. §7.4 states the
+                 * same from the other side ("an occurrence skipped under §7.3 is
+                 * not an occurrence"), and CORELIB_PLAN §4.8 gives the reason: the
+                 * field was never this array's value.
+                 *
+                 * The bound is therefore applied only to a header that survives the
+                 * §7.3 test. For a fixlen element type that is known only after the
+                 * fixlen word below, so a message ending BETWEEN the element header
+                 * and its fixlen word is INCOMPLETE, not INVALID (§5.2, the analogue
+                 * of §4.8's ruling for the fixlen array's two words). From the
+                 * fixlen word on the reject is immediate -- it never waits for
+                 * payload bytes. Format-level rejects (over-64-bit varint,
+                 * ARRAY_MAX, a reserved fixlen subtype, ...) still fire on a skipped
+                 * field's own metadata: §7.3 subordinates the SCHEMA bound only.
+                 *
+                 * A collector that publishes no element type (elemWire_ < 0) keeps
+                 * the bound to itself and enforces it in its deserialize. */
+                bool skipElem = false;     /* §7.3: not an element of this array */
+                bool boundPending = false; /* over-index, subtype not yet known */
+                if (elemBound_ >= 0 && elemWire_ >= 0 && type_ != Wire::SequenceEnd &&
                     static_cast<long>(fieldId) >= elemBound_)
-                { error_ = true; return; }
+                {
+                    if (static_cast<int>(type_) != elemWire_) { skipElem = true; ++skipped_; }
+                    else if (type_ != Wire::Fixlen) { error_ = true; return; }
+                    else boundPending = true; /* decided at the fixlen word */
+                }
 
                 if (type_ == Wire::SequenceEnd)
                 {
@@ -1884,9 +1912,19 @@ namespace sofab
                     fixType_ = static_cast<Fix>(sub & 0x7);
                 }
 
+                /* the fixlen word is in: §7.3 first, then the §5.1/§7 bound. */
+                if (boundPending)
+                {
+                    if (elemFix_ >= 0 && static_cast<int>(fixType_) != elemFix_)
+                    { skipElem = true; ++skipped_; }
+                    else { error_ = true; return; }
+                }
+
                 consumed_ = false;
                 const uint8_t *payload = p_;
-                cb(fieldId, fixLen_, count_);
+                /* a §7.3-skipped element is never delivered; leaving it unconsumed
+                 * runs it through the same skip as an unknown id. */
+                if (!skipElem) cb(fieldId, fixLen_, count_);
 
                 if (!consumed_)
                 {
@@ -2087,6 +2125,8 @@ namespace sofab
             seqDepth_ = 0;
             skipped_ = 0;
             elemBound_ = -1;
+            elemWire_ = -1;
+            elemFix_ = -1;
         }
 
         /**
@@ -2439,11 +2479,15 @@ namespace sofab
                  * template and the call disappears at compile time. */
                 if constexpr (requires { value.prepare(); }) value.prepare();
                 /* §5.1: in a wrapper sequence the element id IS its index, so the
-                 * bound is decidable from the header alone -- before the element's
-                 * metadata word, which may not have arrived. A collector declares
-                 * it by carrying `cap`; the check then lives here rather than in
-                 * the collector, where a truncated element would outrun it. */
+                 * bound belongs to the stream rather than to the collector, where a
+                 * truncated element would outrun it. A collector declares it by
+                 * carrying `cap`, and declares the element type the bound is
+                 * conditional on (§7.3, see @ref dispatchLevel) by carrying the
+                 * static `elemWire` / `elemFix`. Both are picked up by the same
+                 * detection; a collector that publishes `cap` without an element
+                 * type keeps the bound and applies it in its own deserialize. */
                 const long outerBound = elemBound_;
+                const int outerElemWire = elemWire_, outerElemFix = elemFix_;
                 /* consumed_ tracks the field at THIS level. A successful inner read
                  * would otherwise make a still-open sequence look taken, and its
                  * caller would not expect the re-delivery that follows. */
@@ -2451,6 +2495,10 @@ namespace sofab
                 consumed_ = false;
                 if constexpr (requires { value.cap; }) elemBound_ = value.cap;
                 else                                   elemBound_ = -1;
+                if constexpr (requires { T::elemWire; }) elemWire_ = static_cast<int>(T::elemWire);
+                else                                     elemWire_ = -1;
+                if constexpr (requires { T::elemFix; })  elemFix_ = static_cast<int>(T::elemFix);
+                else                                     elemFix_ = -1;
                 /* descend into a nested sequence */
                 if (seqDepth_ >= MAX_DEPTH) /* §4.9 */
                 {
@@ -2462,6 +2510,8 @@ namespace sofab
                     value.deserialize(*this, i, s, c);
                 }, /*stopAtEnd*/ true);
                 elemBound_ = outerBound;
+                elemWire_ = outerElemWire;
+                elemFix_ = outerElemFix;
                 --seqDepth_;
                 /* A sequence cut short is NOT consumed: the whole field is
                  * delivered again once its remaining bytes arrive. */
@@ -2923,7 +2973,10 @@ namespace sofab
      *
      * The schema bounds ride into the read, so a mis-typed element is skipped
      * under §7.3 instead of being measured against bounds that are not its own,
-     * and an over-index element is rejected by the stream at the element header.
+     * and an over-index element that survives that test is rejected by the stream
+     * — at the element header for an element type the header settles, and at the
+     * fixlen word for a fixlen one, which is where a `string` element's subtype
+     * becomes known.
      */
     struct StringSeq : IStreamMessage
     {
@@ -2932,11 +2985,25 @@ namespace sofab
         long emax;
 
         /**
+         * @brief The declared element type, published to the stream (§7.3).
+         *
+         * The §5.1/§7 over-index reject applies only to an element whose header
+         * agrees with this — one that contradicts it is not this array's element at
+         * all and is skipped like an unknown id, bound or no bound. The stream
+         * picks these up exactly as it picks up @ref cap; they are compile-time
+         * constants, so no constructor signature changes.
+         */
+        static constexpr int elemWire = static_cast<int>(detail::Wire::Fixlen);
+        /** @copydoc elemWire */
+        static constexpr int elemFix = static_cast<int>(detail::Fix::String);
+
+        /**
          * @param o Destination vector; elements are placed at their index id.
          * @param capacity Schema `count` N, or -1 for an unbounded array. An
-         *                 element id at or past N is INVALID (§5.1/§7), rejected
-         *                 before the container grows — which also bounds an
-         *                 over-index allocation.
+         *                 element id at or past N is INVALID (§5.1/§7) once the
+         *                 element has passed the §7.3 type test, rejected before
+         *                 the container grows — which also bounds an over-index
+         *                 allocation.
          * @param elemMax Element `maxlen`, or -1. A longer element is INVALID
          *                (§7.1), never truncated.
          */
@@ -2964,8 +3031,13 @@ namespace sofab
             /* readString decides both, in the order §5.2 needs and before the
              * payload: the declared subtype (§7.3 -- a mis-typed element is not
              * this array's) and then the element maxlen (§7.1). The over-index
-             * reject (§5.1) is enforced by the stream at the element header, from
-             * `cap` below, since a truncated element would outrun a check here. */
+             * reject (§5.1) is enforced by the stream, from `cap` above, and only
+             * on an element that passed the same §7.3 test first: at the fixlen
+             * word, where the subtype is known. From that word on it is immediate,
+             * so a truncated element still cannot outrun it -- only a message
+             * ending between the element header and its fixlen word is INCOMPLETE
+             * rather than INVALID, since there the subtype, and with it whether the
+             * field is an element at all, is not yet decidable. */
             (void)size;
             std::string s;
             if (!is.readString(s, emax)) return;
@@ -2983,6 +3055,11 @@ namespace sofab
         std::vector<std::vector<uint8_t>> &out;
         long cap;
         long emax;
+
+        /** @copydoc StringSeq::elemWire */
+        static constexpr int elemWire = static_cast<int>(detail::Wire::Fixlen);
+        /** @copydoc StringSeq::elemWire */
+        static constexpr int elemFix = static_cast<int>(detail::Fix::Blob);
 
         /** @copydoc StringSeq::StringSeq */
         explicit BlobSeq(std::vector<std::vector<uint8_t>> &o, long capacity = -1, long elemMax = -1) noexcept
@@ -3021,6 +3098,33 @@ namespace sofab
         std::vector<T> *out = nullptr;
         long cap = -1;   /**< Schema `count` N, or -1; an id at or past N is INVALID (§5.1/§7). */
 
+        /**
+         * @brief The declared element type, published to the stream (§7.3), as
+         *        @ref StringSeq::elemWire is.
+         *
+         * A struct/union element arrives as a sequence; a nested-array row arrives
+         * as the array wire type its element kind selects — the same choice
+         * @ref IStreamImpl::read makes when it reads the row. `-1` for a row type
+         * neither rule covers, which leaves the bound to the check below.
+         */
+        static constexpr int elemWire = []() constexpr -> int {
+            if constexpr (std::is_base_of_v<IStreamMessage, T>)
+                return static_cast<int>(detail::Wire::SequenceStart);
+            else if constexpr (requires { typename T::value_type; })
+            {
+                using Elem = typename T::value_type;
+                if constexpr (std::is_integral_v<Elem> && !std::is_same_v<Elem, bool>)
+                    return static_cast<int>(std::is_unsigned_v<Elem> ? detail::Wire::ArrayUnsigned
+                                                                     : detail::Wire::ArraySigned);
+                else if constexpr (std::is_same_v<Elem, float> || std::is_same_v<Elem, double>)
+                    return static_cast<int>(detail::Wire::ArrayFixlen);
+                else
+                    return -1;
+            }
+            else
+                return -1;
+        }();
+
         /** §7.4 replace-whole, and absent ⇒ never called: @copydoc StringSeq::prepare */
         void prepare() noexcept { if (out) out->clear(); }
 
@@ -3028,12 +3132,19 @@ namespace sofab
         {
             /* §5.1/§7 over-index reject, as a backstop for a direct call. Coming
              * through @ref IStreamImpl::read this is unreachable: `cap` is handed
-             * to the stream as its element bound and rejected at the element
-             * header, one step earlier and before a truncated element could
-             * outrun it -- which is why @ref StringSeq / @ref BlobSeq carry no
-             * copy of it. Kept here because `deserialize` is public. */
+             * to the stream as its element bound and rejected one step earlier,
+             * before a truncated element could outrun it -- which is why
+             * @ref StringSeq / @ref BlobSeq carry no copy of it. Kept here because
+             * `deserialize` is public. §7.3 runs first here too, in the same order
+             * the stream uses, so the two entry points cannot disagree: an element
+             * whose wire type contradicts @ref elemWire is not an element, and an
+             * id that is not an index cannot breach the index bound. */
             if (cap >= 0 && static_cast<size_t>(id) >= static_cast<size_t>(cap))
             {
+                if constexpr (elemWire >= 0)
+                {
+                    if (static_cast<int>(is.wire()) != elemWire) return; /* §7.3 */
+                }
                 is.invalidate();
                 return;
             }

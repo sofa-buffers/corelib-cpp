@@ -2199,6 +2199,269 @@ static void wrapperArrayCollectors()
     }
 }
 
+/* --- §7.3 decides BEFORE the §5.1/§7 over-index bound (Crucible F-0041,
+ *     corelib-cpp#58).
+ *
+ * An element header that is wrong twice over -- an id past the schema `count`
+ * AND a wire type (or fixlen subtype) that contradicts the declared element type
+ * -- must be SKIPPED, exactly as an unknown id is skipped. §7.3's rule is
+ * unconditional ("Against a schema bound, this clause wins"), and a field skipped
+ * under it never becomes an element: its id is therefore not an array index, and
+ * an id that is not an index cannot breach the index bound. §7.4 states the same
+ * for the replace-whole rule; CORELIB_PLAN §4.8 gives the reason -- the field was
+ * never this array's value.
+ *
+ * The bound itself is untouched: it still applies to every element that survives
+ * the type test, and still without waiting for payload bytes. The wire layout of
+ * the isolates mirrors Crucible's Probe: string_array at id 200 (items string,
+ * count 5), blob_array at 201 (items blob), struct_array at 202 (items struct),
+ * so `c6 0c` / `ce 0c` / `d6 0c` open the three wrappers. --- */
+
+/* struct element of the id-202 wrapper: two scalar fields, §2-sparse. */
+struct F41Row : sofab::Message
+{
+    uint64_t k = 0;
+    uint64_t v = 0;
+    sofab::OStreamImpl::Result serialize(sofab::OStreamImpl &os) const noexcept override
+    {
+        os.writeIf(0, k, k != 0);
+        return os.writeIf(1, v, v != 0);
+    }
+    void deserialize(sofab::IStreamImpl &is, sofab::id id, size_t, size_t) noexcept override
+    {
+        if (id == 0) is.read(k);
+        else if (id == 1) is.read(v);
+    }
+};
+
+/* The three count-5 wrapper arrays, collected exactly as generated code does. */
+struct F41Msg : sofab::IStreamMessage
+{
+    std::vector<std::string> strs;              /* id 200 -- string, count 5 */
+    std::vector<std::vector<uint8_t>> blobs;    /* id 201 -- blob,   count 5 */
+    std::vector<F41Row> rows;                   /* id 202 -- struct, count 5 */
+    uint64_t other = 0;                         /* id 8   -- a plain scalar  */
+
+    void deserialize(sofab::IStreamImpl &is, sofab::id id, size_t, size_t) noexcept override
+    {
+        switch (id)
+        {
+            case 200: { sofab::StringSeq c{strs, 5, 64};  is.read(c); break; }
+            case 201: { sofab::BlobSeq   c{blobs, 5, 64}; is.read(c); break; }
+            case 202: { sofab::MessageSeq<F41Row> c; c.out = &rows; c.cap = 5; is.read(c); break; }
+            case 8:   is.read(other); break;
+        }
+    }
+};
+
+/* Generated code (sofabgen) collects struct wrappers with a helper of its own
+ * that carries `cap` but declares no element type, and applies both rules itself
+ * -- in the §7.3-first order. A collector that keeps the bound this way must be
+ * left to it: the stream applies the bound only for a collector that also says
+ * what its elements are, or it would pre-empt the type test at the header. */
+struct F41GenSeq : sofab::IStreamMessage
+{
+    std::vector<F41Row> *out = nullptr;
+    long cap = -1;
+
+    void prepare() noexcept { if (out != nullptr) out->clear(); }
+
+    void deserialize(sofab::IStreamImpl &is, sofab::id id, size_t, size_t) noexcept override
+    {
+        using Tag = decltype(is.wire());
+        if (is.wire() != Tag::SequenceStart) return;                    /* §7.3 */
+        if (cap >= 0 && static_cast<long>(id) >= cap) { is.invalidate(); return; }
+        while (out->size() <= static_cast<size_t>(id)) out->emplace_back();
+        is.read((*out)[id]);
+    }
+};
+
+struct F41GenMsg : sofab::IStreamMessage
+{
+    std::vector<F41Row> rows;
+    void deserialize(sofab::IStreamImpl &is, sofab::id id, size_t, size_t) noexcept override
+    {
+        if (id == 202) { F41GenSeq c; c.out = &rows; c.cap = 5; is.read(c); }
+    }
+};
+
+static void overIndexSkipOrdering()
+{
+    auto feed = [](const char *hex) {
+        sofab::IStreamObject<F41Msg> in;
+        auto w = fromHex(hex);
+        auto r = in.feed(w.data(), w.size());
+        return std::pair<sofab::IStreamImpl::Result, F41Msg>{r, *in};
+    };
+
+    /* ---- THE ISOLATE: id 8 (>= count 5) carrying UNSIGNED where a string is
+     *      declared. §7.3 skips it, so no element and no index ever exist and the
+     *      whole message is all-default. ---- */
+    {
+        auto [r, m] = feed("c60c 40 01 07");
+        CHECK(r.complete(), "F-0041: over-index + mis-typed string element is skipped, not INVALID");
+        CHECK(m.strs.empty(), "F-0041: the skipped element leaves the array empty");
+        CHECK(r.skipped() == 1, "F-0041: the skip is counted as a §7.3 skip");
+    }
+
+    /* ---- CONTROL 1: over-index but CORRECTLY typed (fixlen word 0x0a = len 1,
+     *      subtype string). It survives §7.3, so the bound applies and must still
+     *      reject -- this is the whole §5.1/§7 rule. ---- */
+    {
+        auto [r, m] = feed("c60c 42 0a 41 07");
+        (void)m;
+        CHECK(r.invalid(), "F-0041 control: a well-typed over-index element is still INVALID");
+    }
+
+    /* ---- CONTROL 2: in-range id 2, mis-typed. The plain §7.3 skip, unchanged. ---- */
+    {
+        auto [r, m] = feed("c60c 10 01 07");
+        CHECK(r.complete() && m.strs.empty(), "F-0041 control: in-range mis-typed element is skipped");
+    }
+
+    /* ---- the subtype counts too: fixlen matches the declared wire type, but
+     *      fixlen word 0x0b = (1<<3)|3 says BLOB where string is declared. §7.3
+     *      covers subtype mismatch, so this is skipped like the isolate -- an
+     *      implementation gating only on the header wire type still rejects it. ---- */
+    {
+        auto [r, m] = feed("c60c 42 0b 41 07");
+        CHECK(r.complete() && m.strs.empty(),
+              "F-0041: over-index element with a contradicting SUBTYPE is skipped");
+    }
+    {   /* the same subtype mismatch at an in-range id: the §7.3 half alone */
+        auto [r, m] = feed("c60c 12 0b 41 07");
+        CHECK(r.complete() && m.strs.empty(),
+              "F-0041 control: in-range element with a contradicting subtype is skipped");
+    }
+
+    /* ---- the only window that relaxes: the message ends BETWEEN an over-index
+     *      element header and its fixlen word. The subtype -- and with it whether
+     *      the field is an element at all -- is not yet decidable, so this is
+     *      INCOMPLETE, not INVALID (§5.2; the analogue of §4.8's ruling for the
+     *      fixlen array's two words). ---- */
+    {
+        auto [r, m] = feed("c60c 42");
+        (void)m;
+        CHECK(r.incomplete(), "F-0041: truncation before the element's fixlen word is INCOMPLETE");
+    }
+    /* ...but from the fixlen word on the reject is immediate: a declared length of
+     * 33 with no payload byte present is INVALID, never INCOMPLETE. */
+    {
+        auto [r, m] = feed("c60c 42 8a02");
+        (void)m;
+        CHECK(r.invalid(), "F-0041: the bound does not wait for the payload once the subtype is known");
+    }
+
+    /* ---- the skip leaves nothing behind (§5.1 length, §7.4): a valid element 0
+     *      followed by a mis-typed over-index element decodes to the array of just
+     *      the valid element -- length 1, not 9, and not an error. ---- */
+    {
+        auto [r, m] = feed("c60c 02 0a 41 40 01 07");
+        CHECK(r.complete(), "F-0041: a valid element followed by a skipped one stays COMPLETE");
+        CHECK(m.strs.size() == 1 && m.strs[0] == "A",
+              "F-0041: the skipped id does not extend the array (length 1)");
+    }
+
+    /* ---- format-level rejects still fire on the skipped field's own metadata:
+     *      §7.3 subordinates the SCHEMA bound only (CORELIB_PLAN §4.8). ---- */
+    {   /* an over-index array element whose count varint exceeds 64 bits */
+        auto [r, m] = feed("c60c 43 ffffffffffffffffffff7f");
+        (void)m;
+        CHECK(r.invalid(), "F-0041: an over-64-bit varint in a skipped element is still INVALID");
+    }
+    {   /* reserved fixlen subtype 4 (word 0x0c) at an over-index id */
+        auto [r, m] = feed("c60c 42 0c 41 07");
+        (void)m;
+        CHECK(r.invalid(), "F-0041: a reserved fixlen subtype in a skipped element is still INVALID");
+    }
+    {   /* fp32 with length 1 (word 0x08) at an over-index id: §4.6 length rule */
+        auto [r, m] = feed("c60c 42 08 41 07");
+        (void)m;
+        CHECK(r.invalid(), "F-0041: a bad fp32 fixlen length in a skipped element is still INVALID");
+    }
+
+    /* ---- type-generic, not string-specific: the same three cases on the blob
+     *      wrapper (id 201), with the subtype test running the other way. ---- */
+    {
+        auto [r, m] = feed("ce0c 40 01 07");
+        CHECK(r.complete() && m.blobs.empty(), "F-0041: blob wrapper skips the mis-typed over-index element");
+    }
+    {
+        auto [r, m] = feed("ce0c 42 0b 41 07");
+        (void)m;
+        CHECK(r.invalid(), "F-0041 control: a well-typed over-index blob element is still INVALID");
+    }
+    {
+        auto [r, m] = feed("ce0c 42 0a 41 07");
+        CHECK(r.complete() && m.blobs.empty(),
+              "F-0041: a STRING-subtyped over-index element in a blob array is skipped");
+    }
+
+    /* ---- and on a struct wrapper (id 202), whose elements are sequences: the
+     *      header alone settles §7.3 there, so nothing is deferred. ---- */
+    {
+        auto [r, m] = feed("d60c 40 01 07");
+        CHECK(r.complete() && m.rows.empty(), "F-0041: struct wrapper skips the mis-typed over-index element");
+    }
+    {
+        auto [r, m] = feed("d60c 46 07 07");
+        (void)m;
+        CHECK(r.invalid(), "F-0041 control: a well-typed over-index struct element is still INVALID");
+    }
+
+    /* ---- in-range elements of every wrapper decode exactly as before. ---- */
+    {
+        auto [r, m] = feed("c60c 02 0a41 12 0a42 07  ce0c 02 0b43 07  d60c 06 0005 07 07");
+        CHECK(r.complete(), "F-0041: the three wrappers still decode COMPLETE");
+        CHECK(m.strs.size() == 3 && m.strs[0] == "A" && m.strs[1].empty() && m.strs[2] == "B",
+              "F-0041: in-range string elements land at their index");
+        CHECK(m.blobs.size() == 1 && m.blobs[0] == std::vector<uint8_t>{'C'},
+              "F-0041: in-range blob element decodes");
+        CHECK(m.rows.size() == 1 && m.rows[0].k == 5, "F-0041: in-range struct element decodes");
+    }
+
+    /* ---- §7.4: a mis-typed wrapper OCCURRENCE still does not wipe a valid
+     *      earlier one -- that gate is upstream of all of this. ---- */
+    {
+        auto [r, m] = feed("c60c 02 0a41 07  c00c 01");
+        CHECK(r.complete(), "F-0041: a mis-typed wrapper occurrence is skipped (§7.4)");
+        CHECK(m.strs.size() == 1 && m.strs[0] == "A", "F-0041: it does not wipe the valid earlier array");
+    }
+
+    /* ---- the element bound does not leak out of the wrapper: the same id 8 that
+     *      is over-index INSIDE the array is an ordinary field id outside it. ---- */
+    {
+        auto [r, m] = feed("c60c 02 0a41 07  40 09");
+        CHECK(r.complete() && m.other == 9, "F-0041: the element bound is not applied at the outer level");
+    }
+
+    /* ---- the same three verdicts through a collector that keeps the bound to
+     *      itself (the shape generated code uses). ---- */
+    {
+        auto genFeed = [](const char *hex) {
+            sofab::IStreamObject<F41GenMsg> in;
+            auto w = fromHex(hex);
+            auto r = in.feed(w.data(), w.size());
+            return std::pair<sofab::IStreamImpl::Result, F41GenMsg>{r, *in};
+        };
+        {
+            auto [r, m] = genFeed("d60c 40 01 07");
+            CHECK(r.complete() && m.rows.empty(),
+                  "F-0041: a self-bounding collector still sees the mis-typed over-index element");
+        }
+        {
+            auto [r, m] = genFeed("d60c 46 07 07");
+            (void)m;
+            CHECK(r.invalid(), "F-0041: a self-bounding collector still rejects a well-typed over-index element");
+        }
+        {
+            auto [r, m] = genFeed("d60c 06 0005 07 07");
+            CHECK(r.complete() && m.rows.size() == 1 && m.rows[0].k == 5,
+                  "F-0041: a self-bounding collector decodes an in-range element");
+        }
+    }
+}
+
 /* --- destination reuse across messages (MESSAGE_SPEC §2 + §5.1).
  *
  * §2 omits an all-default field, so a message that does not carry a field
@@ -2324,6 +2587,7 @@ int main()
     strictUtf8();
     messageLayerFraming();
     wrapperArrayCollectors();
+    overIndexSkipOrdering();
     destinationReuse();
 
     std::printf("\n%d checks, %d failures\n", g_checks, g_failures);
