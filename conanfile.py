@@ -7,7 +7,7 @@ from conan.tools.layout import basic_layout
 
 class SofaBuffersCorelibCppConan(ConanFile):
     name = "sofa-buffers-corelib-cpp"
-    version = "0.9.0"
+    version = "0.10.0"
     license = "MIT"
     author = "SofaBuffers"
     url = "https://github.com/sofa-buffers/corelib-cpp"
