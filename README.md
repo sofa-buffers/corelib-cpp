@@ -347,10 +347,13 @@ the same value as an omitted one.
 **What it costs.** The hold-back is not free, and the two prices are measured,
 not estimated:
 
-- **Instructions.** On the shared `encode: typical message` workload (which nests
-  one sub-message) it is **353 Ir/op against 285** for the pre-§2 encoder that
-  framed eagerly — **+68 Ir/op, +24 %**. The other three workloads are unchanged
-  (`encode: u64 array` 106 972 vs 107 961; both decode figures identical) — see
+- **Instructions.** The cost falls entirely on the shared `encode: typical
+  message` workload, the one that nests a sub-message: **353 Ir/op against 285**
+  for the pre-§2 encoder that framed eagerly — **+68 Ir/op, +24 %**. The other
+  three workloads were unchanged (`encode: u64 array` 106 972 vs 107 961; both
+  decode figures identical). Those absolutes are as measured when the hold-back
+  landed; the varint fast paths have since moved every workload, so compare them
+  with each other rather than with the current
   [Instruction counts](#instruction-counts-callgrind).
 - **State.** The run lives in the stream object, so every stream grew by **64
   bytes**: `sizeof(OStreamInline<64>)` 144 → 208, `sizeof(OStreamView)` 80 → 144,
@@ -547,22 +550,34 @@ is better). All three are compiled at `-O3` so the comparison is like-for-like:
 
 | Workload | C | C++ wrapper | this (pure C++20) |
 |---|--:|--:|--:|
-| encode: u64 array (1000) | 124 987 | 125 016 | **106 972** (−14 %) |
-| encode: typical message  |     852 |     917 | **353** (−59 %) |
-| decode: u64 array (1000) | 272 962 | 272 963 | **111 555** (−59 %) |
-| decode: typical message  |   2 039 |   2 038 | **1 304** (−36 %) |
+| encode: u64 array (1000) | 124 992 | 125 021 | **38 046** (−70 %) |
+| encode: typical message  |     908 |   1 008 | **270** (−70 %) |
+| decode: u64 array (1000) | 289 941 | 289 942 | **44 835** (−85 %) |
+| decode: typical message  |   2 057 |   2 056 | **1 321** (−36 %) |
 
-The encode figures include the §2 sequence hold-back: `encode: typical message`
-cost **285** before it and costs **353** now (+24 %), which is the price of
-never framing an all-default sub-message — see
+All four columns were re-measured together on one machine; the percentages are
+against the C column. Reproduce with `bash bench/run_callgrind.sh` here and the
+same script in `corelib-c-cpp`.
+
+The encode figures include the §2 sequence hold-back — the price of never
+framing an all-default sub-message, see
 [Sequence framing](#sequence-framing-an-all-default-sub-message-is-omitted).
-Reproduce with `bash bench/run_callgrind.sh`.
+That cost was **+68 Ir/op (+24 %)** on `encode: typical message` when it landed;
+the absolutes it was measured against (285 → 353) predate the varint fast paths
+below, so they no longer match the table.
 
 The pure-C++20 port wins on instructions across the board because it fuses
-header+value writes, bulk-copies arrays, and parses in place without the C port's
-per-field bookkeeping. In the multi-language arena it lands at a 434-byte wire
-size (vs protobuf's 494 bytes) and roughly **1.3× the throughput of protobuf**
-for a comparable C++ message.
+header+value writes, composes fields straight into the buffer, and parses in
+place without the C port's per-field bookkeeping. The array workloads pull
+furthest ahead because their varint runs establish the ten-byte window once and
+then move whole 64-bit words — eight varint bytes per store on encode, one load
+plus a terminator scan on decode — instead of testing bounds and continuation a
+byte at a time.
+
+In the multi-language arena it lands at a 434-byte wire size (vs protobuf's
+494 bytes) and roughly **1.3× the throughput of protobuf** for a comparable C++
+message. That arena figure predates the varint work above and has not been
+re-run, so treat it as a floor rather than a current reading.
 
 **Rule of thumb:** reach for **`corelib-cpp`** for desktop/server throughput, and
 for **`corelib-c-cpp`** when you need a strictly minimal binary and tight RAM on a
