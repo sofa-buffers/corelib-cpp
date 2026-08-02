@@ -2562,6 +2562,126 @@ static void destinationReuse()
     }
 }
 
+/* --- varint width sweep ----------------------------------------------------
+ *
+ * The array element paths encode and decode varints through windowed fast paths
+ * that skip the per-byte bounds and overlong tests, and the encoder builds the
+ * first eight bytes with a SWAR spread rather than a byte at a time. Those are
+ * pure representation changes, so the check is byte-exactness against an
+ * independent reference encoder — deliberately written in the "shift, then
+ * decide whether to tag" form the fast paths do *not* use — across every varint
+ * width, both boundaries of every width, and a pseudo-random spread.
+ *
+ * The same values are then re-encoded into an exactly-sized buffer and decoded
+ * one byte at a time, which drives the non-windowed fallbacks: the encoder's
+ * `fit == 0` tail and the decoder's short-window tail loop. */
+
+static void refVarint(std::vector<uint8_t> &o, uint64_t v)
+{
+    do {
+        uint8_t b = static_cast<uint8_t>(v & 0x7f);
+        v >>= 7;
+        if (v) b |= 0x80;
+        o.push_back(b);
+    } while (v);
+}
+
+struct SweepU : sofab::IStreamMessage
+{
+    std::vector<uint64_t> v;
+    void deserialize(sofab::IStreamImpl &is, sofab::id id, size_t, size_t count) noexcept override
+    {
+        if (id == 1) { v.assign(count, 0); is.read(v); }
+    }
+};
+struct SweepI : sofab::IStreamMessage
+{
+    std::vector<int64_t> v;
+    void deserialize(sofab::IStreamImpl &is, sofab::id id, size_t, size_t count) noexcept override
+    {
+        if (id == 1) { v.assign(count, 0); is.read(v); }
+    }
+};
+
+static void varintWidthSweep()
+{
+    std::vector<uint64_t> vals{0, 1, UINT64_MAX};
+    for (int k = 0; k < 64; ++k)
+    {
+        const uint64_t bit = uint64_t{1} << k;
+        vals.push_back(bit);
+        vals.push_back(bit - 1);
+        vals.push_back(bit + 1);
+    }
+    for (int k = 1; k <= 9; ++k) /* the varint width boundaries themselves */
+    {
+        const uint64_t lim = uint64_t{1} << (7 * k);
+        vals.push_back(lim - 1);
+        vals.push_back(lim);
+    }
+    uint64_t x = 0x243F6A8885A308D3ull; /* deterministic xorshift64 spread */
+    for (int i = 0; i < 512; ++i)
+    {
+        x ^= x << 13; x ^= x >> 7; x ^= x << 17;
+        vals.push_back(x);
+    }
+
+    /* expected bytes: header, count, then each element, all from the reference */
+    std::vector<uint8_t> want;
+    refVarint(want, (uint64_t{1} << 3) | 3 /* Wire::ArrayUnsigned */);
+    refVarint(want, vals.size());
+    for (uint64_t v : vals) refVarint(want, v);
+
+    std::vector<uint8_t> got(want.size() + 64);
+    sofab::OStreamView os(got.data(), got.size());
+    os.write(1, std::span<const uint64_t>(vals.data(), vals.size()));
+    CHECK(os.ok(), "varint sweep: the unsigned array encodes without error");
+    CHECK(os.bytesUsed() == want.size() &&
+              std::equal(want.begin(), want.end(), got.begin()),
+          "varint sweep: every unsigned width is byte-exact vs the reference");
+
+    sofab::IStreamObject<SweepU> inu;
+    CHECK(inu.feed(got.data(), os.bytesUsed()).complete(), "varint sweep: unsigned array decodes COMPLETE");
+    CHECK((*inu).v == vals, "varint sweep: every unsigned width round-trips");
+
+    /* signed / zig-zag elements over the same bit patterns */
+    std::vector<int64_t> svals;
+    for (uint64_t v : vals) svals.push_back(static_cast<int64_t>(v));
+    std::vector<uint8_t> swant;
+    refVarint(swant, (uint64_t{1} << 3) | 4 /* Wire::ArraySigned */);
+    refVarint(swant, svals.size());
+    for (int64_t v : svals)
+        refVarint(swant, (static_cast<uint64_t>(v) << 1) ^ static_cast<uint64_t>(v >> 63));
+
+    std::vector<uint8_t> sgot(swant.size() + 64);
+    sofab::OStreamView sos(sgot.data(), sgot.size());
+    sos.write(1, std::span<const int64_t>(svals.data(), svals.size()));
+    CHECK(sos.ok() && sos.bytesUsed() == swant.size() &&
+              std::equal(swant.begin(), swant.end(), sgot.begin()),
+          "varint sweep: every signed width is byte-exact vs the reference");
+
+    sofab::IStreamObject<SweepI> ini;
+    CHECK(ini.feed(sgot.data(), sos.bytesUsed()).complete(), "varint sweep: signed array decodes COMPLETE");
+    CHECK((*ini).v == svals, "varint sweep: every signed width round-trips");
+
+    /* Exactly-sized buffer: the encoder runs out of full-varint windows before
+     * the last elements, so they take the checked `fit == 0` path. */
+    std::vector<uint8_t> tight(want.size());
+    sofab::OStreamView tos(tight.data(), tight.size());
+    tos.write(1, std::span<const uint64_t>(vals.data(), vals.size()));
+    CHECK(tos.ok() && tos.bytesUsed() == want.size() && tight == want,
+          "varint sweep: an exactly-sized buffer produces the same bytes");
+
+    /* One byte at a time: the decoder never sees a full varint window, so every
+     * element goes through the short-tail loop and the reassembly path. */
+    sofab::IStreamObject<SweepU> inc;
+    sofab::DecodeStatus last = sofab::DecodeStatus::Incomplete;
+    for (size_t i = 0; i < tight.size(); ++i)
+        last = inc.feed(tight.data() + i, 1).status();
+    CHECK(last == sofab::DecodeStatus::Complete, "varint sweep: byte-at-a-time decode is COMPLETE");
+    CHECK((*inc).v == vals, "varint sweep: byte-at-a-time decode recovers every value");
+}
+
 int main()
 {
     encodeVectors();
@@ -2589,6 +2709,7 @@ int main()
     wrapperArrayCollectors();
     overIndexSkipOrdering();
     destinationReuse();
+    varintWidthSweep();
 
     std::printf("\n%d checks, %d failures\n", g_checks, g_failures);
     return g_failures ? 1 : 0;

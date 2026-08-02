@@ -206,6 +206,79 @@ namespace sofab
             Blob = 3,   /**< Opaque byte string. */
         };
 
+        /**
+         * @brief Widest base-128 varint: ceil(64/7) == 10 bytes (§4.1).
+         *
+         * The encoder and decoder both use it as the "one more varint definitely
+         * fits" window, so a capacity check can be hoisted out of an element loop
+         * and amortised over a whole chunk instead of paid per element.
+         */
+        inline constexpr size_t VARINT_MAX_BYTES = 10;
+
+        /**
+         * @brief Store a 64-bit word as eight little-endian bytes.
+         *
+         * The wire is little-endian (§4), so on a little-endian host this is the
+         * native representation and compiles to a single unaligned store; on a
+         * big-endian one the word is reversed first. `std::byteswap` is C++23, so
+         * the reversal is spelled out.
+         */
+        inline void storeLittle64(uint8_t *out, uint64_t w) noexcept
+        {
+            if constexpr (std::endian::native == std::endian::big)
+                w = ((w & 0x00000000000000FFull) << 56) | ((w & 0x000000000000FF00ull) << 40) |
+                    ((w & 0x0000000000FF0000ull) << 24) | ((w & 0x00000000FF000000ull) << 8) |
+                    ((w & 0x000000FF00000000ull) >> 8)  | ((w & 0x0000FF0000000000ull) >> 24) |
+                    ((w & 0x00FF000000000000ull) >> 40) | ((w & 0xFF00000000000000ull) >> 56);
+            std::memcpy(out, &w, sizeof w);
+        }
+
+        /**
+         * @brief Spread the low 56 bits of @p v into eight 7-bit groups, one per byte.
+         *
+         * Byte `i` of the result holds bits `[7i+6 : 7i]` of @p v, with bit 7 of
+         * each byte clear — exactly the payload layout of the first eight bytes of
+         * a base-128 varint. Three halve-and-shift rounds do it in a handful of
+         * ALU ops, which is what lets the encoder emit eight varint bytes as one
+         * store instead of eight.
+         */
+        constexpr uint64_t spread7(uint64_t v) noexcept
+        {
+            uint64_t w = v & 0x00FFFFFFFFFFFFFFull;                                  /* 56 bits */
+            w = (w & 0x000000000FFFFFFFull) | ((w & 0x00FFFFFFF0000000ull) << 4);    /* 2 x 28 */
+            w = (w & 0x00003FFF00003FFFull) | ((w & 0x0FFFC0000FFFC000ull) << 2);    /* 4 x 14 */
+            w = (w & 0x007F007F007F007Full) | ((w & 0x3F803F803F803F80ull) << 1);    /* 8 x 7  */
+            return w;
+        }
+
+        /**
+         * @brief Inverse of @ref spread7: pack eight bytes' low 7 bits into one value.
+         *
+         * Byte `i` of @p w contributes bits `[7i+6 : 7i]` of the result; bit 7 of
+         * each byte (the varint continuation flag) is discarded by the masks, so
+         * the caller need not clear it. The three rounds mirror @ref spread7's,
+         * run in the opposite order.
+         */
+        constexpr uint64_t gather7(uint64_t w) noexcept
+        {
+            w = (w & 0x007F007F007F007Full) | ((w & 0x7F007F007F007F00ull) >> 1);    /* 4 x 14 */
+            w = (w & 0x00003FFF00003FFFull) | ((w & 0x3FFF00003FFF0000ull) >> 2);    /* 2 x 28 */
+            w = (w & 0x000000000FFFFFFFull) | ((w & 0x0FFFFFFF00000000ull) >> 4);    /* 56 bits */
+            return w;
+        }
+
+        /** @brief Load eight little-endian bytes as a 64-bit word (see @ref storeLittle64). */
+        inline uint64_t loadLittle64(const uint8_t *in) noexcept
+        {
+            uint64_t w;
+            std::memcpy(&w, in, sizeof w);
+            if constexpr (std::endian::native == std::endian::big)
+                w = ((w & 0x00000000000000FFull) << 56) | ((w & 0x000000000000FF00ull) << 40) |
+                    ((w & 0x0000000000FF0000ull) << 24) | ((w & 0x00000000FF000000ull) << 8) |
+                    ((w & 0x000000FF00000000ull) >> 8)  | ((w & 0x0000FF0000000000ull) >> 24) |
+                    ((w & 0x00FF000000000000ull) >> 40) | ((w & 0xFF00000000000000ull) >> 56);
+            return w;
+        }
 
         /**
          * @brief Map a signed integer to an unsigned one with the zig-zag scheme.
@@ -489,13 +562,58 @@ namespace sofab
          */
         static size_t encodeVarint(uint8_t *out, uint64_t v) noexcept
         {
-            size_t n = 0;
-            do {
-                uint8_t b = static_cast<uint8_t>(v & 0x7f);
+            /* Continuation-first: every byte but the last is unconditionally
+             * tagged, so the loop carries one test (`more to come?`) instead of
+             * the two a "shift, then decide whether to tag" body needs. */
+            uint8_t *p = out;
+            while (v >= 0x80)
+            {
+                *p++ = static_cast<uint8_t>(static_cast<uint8_t>(v) | 0x80u);
                 v >>= 7;
-                if (v) b |= 0x80;
-                out[n++] = b;
-            } while (v);
+            }
+            *p++ = static_cast<uint8_t>(v);
+            return static_cast<size_t>(p - out);
+        }
+
+        /**
+         * @brief Encode a varint into a destination with a full varint window.
+         *
+         * The caller must guarantee @ref detail::VARINT_MAX_BYTES writable bytes at
+         * @p out. That buys a branch-free body: the length comes from the value's
+         * bit width in one instruction instead of being discovered a byte at a
+         * time, and all ten bytes are then written unconditionally, with only the
+         * last one of the *encoded* run untagged. Bytes past the returned length
+         * are scratch — the cursor never advances over them, so they are always
+         * overwritten by the next value or left outside the message.
+         *
+         * The single-byte case is peeled off first: it is by far the most common
+         * value in real data, and paying ten stores for it would lose more on
+         * small-element arrays than the wide case gains.
+         *
+         * @param out Destination, with at least @ref detail::VARINT_MAX_BYTES bytes.
+         * @param v Value to encode.
+         * @return Number of meaningful bytes written (1–10).
+         */
+        static size_t encodeVarintPadded(uint8_t *out, uint64_t v) noexcept
+        {
+            if (v < 0x80)
+            {
+                out[0] = static_cast<uint8_t>(v);
+                return 1;
+            }
+            /* The varint length is ceil(bit_width(v) / 7). Spelling the divide as
+             * a multiply and a shift is exact for every width 1..64 — check
+             * b = 7k and 7k+1 for k = 1..9 and it holds at both sides of every
+             * step — and costs a few instructions instead of a division. */
+            const size_t bits = 64u - static_cast<size_t>(std::countl_zero(v));
+            const size_t n = (bits * 9u + 64u) >> 6;
+            /* Bytes 0-7 carry bits 0-55 and go out as one word; bytes 8 and 9
+             * carry what is left of a 64-bit value. Everything is tagged as a
+             * continuation, then the last byte of the encoded run is untagged. */
+            detail::storeLittle64(out, detail::spread7(v) | 0x8080808080808080ull);
+            out[8] = static_cast<uint8_t>((static_cast<uint8_t>(v >> 56) & 0x7fu) | 0x80u);
+            out[9] = static_cast<uint8_t>(v >> 63);
+            out[n - 1] = static_cast<uint8_t>(out[n - 1] & 0x7fu);
             return n;
         }
 
@@ -540,7 +658,10 @@ namespace sofab
         {
             if (static_cast<size_t>(end_ - cursor_) >= len) [[likely]]
             {
-                std::memcpy(cursor_, data, len);
+                /* An empty string or blob passes a null @p data, and memcpy
+                 * forbids that even for a zero length (§7.1.4 [mem.req]) — which
+                 * UBSan reports on the shared-vector suite. */
+                if (len) std::memcpy(cursor_, data, len);
                 cursor_ += len;
                 return Error::None;
             }
@@ -663,6 +784,18 @@ namespace sofab
         {
             if (fieldId > ID_MAX) return Error::InvalidArgument;
             if (Error e = beforeContent(); e != Error::None) return e;
+            /* Header and value are each at most VARINT_MAX_BYTES, so with room for
+             * two of them the field is composed straight into the buffer: no
+             * scratch array and no copy out of it. The checked path below still
+             * runs at the buffer tail and across every flush boundary. */
+            if (static_cast<size_t>(end_ - cursor_) >= 2 * detail::VARINT_MAX_BYTES) [[likely]]
+            {
+                uint8_t *o = cursor_;
+                o += encodeVarintPadded(o, headerWord(fieldId, type));
+                o += encodeVarintPadded(o, value);
+                cursor_ = o;
+                return Error::None;
+            }
             uint8_t tmp[20];
             size_t n = encodeVarint(tmp, headerWord(fieldId, type));
             n += encodeVarint(tmp + n, value);
@@ -682,6 +815,20 @@ namespace sofab
         {
             if (fieldId > ID_MAX) return Error::InvalidArgument;
             if (Error e = beforeContent(); e != Error::None) return e;
+            /* As in @ref writeScalar, plus the payload. The room test is split so
+             * it cannot overflow on a huge @p len. */
+            const size_t room = static_cast<size_t>(end_ - cursor_);
+            if (room >= 2 * detail::VARINT_MAX_BYTES && room - 2 * detail::VARINT_MAX_BYTES >= len) [[likely]]
+            {
+                uint8_t *o = cursor_;
+                o += encodeVarintPadded(o, headerWord(fieldId, Wire::Fixlen));
+                o += encodeVarintPadded(o, fixlenWord(len, ft));
+                /* An empty string or blob passes a null @p data; memcpy forbids
+                 * that even for a zero length (§7.1.4 [mem.req]). */
+                if (len) std::memcpy(o, data, len);
+                cursor_ = o + len;
+                return Error::None;
+            }
             uint8_t tmp[20];
             size_t n = encodeVarint(tmp, headerWord(fieldId, Wire::Fixlen));
             n += encodeVarint(tmp + n, fixlenWord(len, ft));
@@ -704,6 +851,15 @@ namespace sofab
             if (fieldId > ID_MAX) return Error::InvalidArgument;
             if (Error e = beforeContent(); e != Error::None) return e;
             auto bits = detail::floatBits(value);
+            if (static_cast<size_t>(end_ - cursor_) >= 2 * detail::VARINT_MAX_BYTES + sizeof(F)) [[likely]]
+            {
+                uint8_t *o = cursor_;
+                o += encodeVarintPadded(o, headerWord(fieldId, Wire::Fixlen));
+                o += encodeVarintPadded(o, fixlenWord(sizeof(F), ft));
+                for (size_t i = 0; i < sizeof(F); ++i) o[i] = static_cast<uint8_t>((bits >> (8 * i)) & 0xff);
+                cursor_ = o + sizeof(F);
+                return Error::None;
+            }
             uint8_t tmp[20];
             size_t n = encodeVarint(tmp, headerWord(fieldId, Wire::Fixlen));
             n += encodeVarint(tmp + n, fixlenWord(sizeof(F), ft));
@@ -729,17 +885,51 @@ namespace sofab
             constexpr bool isSigned = std::is_signed_v<E>;
             if (fieldId > ID_MAX) return Error::InvalidArgument;
             if (Error e = beforeContent(); e != Error::None) return e;
-            uint8_t hdr[20];
-            size_t hn = encodeVarint(hdr, (static_cast<uint64_t>(fieldId) << 3) |
-                        static_cast<uint64_t>(isSigned ? Wire::ArraySigned : Wire::ArrayUnsigned));
-            hn += encodeVarint(hdr + hn, elems.size());
-            if (Error e = pushBytes(hdr, hn); e != Error::None) return e;
-            for (E v : elems)
+            const uint64_t head = (static_cast<uint64_t>(fieldId) << 3) |
+                        static_cast<uint64_t>(isSigned ? Wire::ArraySigned : Wire::ArrayUnsigned);
+            if (static_cast<size_t>(end_ - cursor_) >= 2 * detail::VARINT_MAX_BYTES) [[likely]]
             {
-                uint8_t tmp[10];
-                size_t n = isSigned ? encodeVarint(tmp, detail::zigzagEncode(static_cast<int64_t>(v)))
-                                    : encodeVarint(tmp, static_cast<uint64_t>(v));
-                if (Error e = pushBytes(tmp, n); e != Error::None) return e;
+                uint8_t *o = cursor_;
+                o += encodeVarintPadded(o, head);
+                o += encodeVarintPadded(o, elems.size());
+                cursor_ = o;
+            }
+            else
+            {
+                uint8_t hdr[20];
+                size_t hn = encodeVarint(hdr, head);
+                hn += encodeVarint(hdr + hn, elems.size());
+                if (Error e = pushBytes(hdr, hn); e != Error::None) return e;
+            }
+
+            /* Element loop. The straightforward body — encode into a scratch
+             * array, then pushBytes it — costs a bounds check and a variable-length
+             * memcpy per element. Instead, ask once how many elements are
+             * *guaranteed* to fit (each varint is at most VARINT_MAX_BYTES) and run
+             * that many straight into the buffer with no per-element check at all.
+             * Only the buffer tail, and every flush boundary, takes the checked
+             * path — which is still pushBytes, so flushing behaviour is unchanged. */
+            const auto word = [](E v) noexcept -> uint64_t {
+                if constexpr (isSigned) return detail::zigzagEncode(static_cast<int64_t>(v));
+                else                    return static_cast<uint64_t>(v);
+            };
+            const size_t n = elems.size();
+            for (size_t i = 0; i < n; )
+            {
+                size_t fit = static_cast<size_t>(end_ - cursor_) / detail::VARINT_MAX_BYTES;
+                if (fit == 0) [[unlikely]]
+                {
+                    uint8_t tmp[detail::VARINT_MAX_BYTES];
+                    size_t k = encodeVarint(tmp, word(elems[i]));
+                    if (Error e = pushBytes(tmp, k); e != Error::None) return e;
+                    ++i;
+                    continue;
+                }
+                if (fit > n - i) fit = n - i;
+                uint8_t *out = cursor_;
+                for (size_t k = 0; k < fit; ++k, ++i)
+                    out += encodeVarintPadded(out, word(elems[i]));
+                cursor_ = out;
             }
             return Error::None;
         }
@@ -762,13 +952,24 @@ namespace sofab
             constexpr Fix ft = (sizeof(F) == 4) ? Fix::Fp32 : Fix::Fp64;
             if (fieldId > ID_MAX) return Error::InvalidArgument;
             if (Error e = beforeContent(); e != Error::None) return e;
-            uint8_t hdr[20];
-            size_t hn = encodeVarint(hdr, headerWord(fieldId, Wire::ArrayFixlen));
-            hn += encodeVarint(hdr + hn, elems.size());
             /* §4.8: a fixlen array always carries its fixlen_word, even when empty
              * (count == 0), so an empty fp32 and fp64 array stay distinguishable. */
-            hn += encodeVarint(hdr + hn, fixlenWord(sizeof(F), ft));
-            if (Error e = pushBytes(hdr, hn); e != Error::None) return e;
+            if (static_cast<size_t>(end_ - cursor_) >= 3 * detail::VARINT_MAX_BYTES) [[likely]]
+            {
+                uint8_t *o = cursor_;
+                o += encodeVarintPadded(o, headerWord(fieldId, Wire::ArrayFixlen));
+                o += encodeVarintPadded(o, elems.size());
+                o += encodeVarintPadded(o, fixlenWord(sizeof(F), ft));
+                cursor_ = o;
+            }
+            else
+            {
+                uint8_t hdr[30];
+                size_t hn = encodeVarint(hdr, headerWord(fieldId, Wire::ArrayFixlen));
+                hn += encodeVarint(hdr + hn, elems.size());
+                hn += encodeVarint(hdr + hn, fixlenWord(sizeof(F), ft));
+                if (Error e = pushBytes(hdr, hn); e != Error::None) return e;
+            }
             if (elems.empty()) return Error::None; /* fixlen_word emitted; no payload */
 
             if constexpr (std::endian::native == std::endian::little)
@@ -1549,6 +1750,97 @@ namespace sofab
         explicit IStreamImpl(Limits limits) noexcept : maxBufferedField_(limits.max_buffered_field) {}
 
         /**
+         * @brief Read one varint, given that a full varint window is in the buffer.
+         *
+         * The caller must have established that at least @ref detail::VARINT_MAX_BYTES
+         * bytes are readable at @p p. That single fact retires both per-byte
+         * checks the general path needs: the cursor cannot run past the end
+         * inside ten bytes, and the first nine bytes carry at most 63 payload
+         * bits, so only the tenth can be overlong (§4.1). With the checks gone
+         * the first eight bytes can be taken as one word and unpacked with
+         * @ref detail::gather7, leaving only a ninth and tenth byte to guard.
+         *
+         * @param[in,out] p Cursor; advanced past the varint, including on overflow.
+         * @param[out] out Decoded value.
+         * @param overflow Set when the varint is wider than 64 bits (INVALID, §6.3).
+         * @return `true` on success, `false` on a > 64-bit varint.
+         */
+        static bool getVarintWindowed(const uint8_t *&p, uint64_t &out, bool *overflow) noexcept
+        {
+            /* A single byte still wins on its own: it is one load and one compare
+             * against the word machinery's load, mask and gather. */
+            if (p[0] < 0x80)
+            {
+                out = p[0];
+                ++p;
+                return true;
+            }
+            /* Read the first eight bytes as one word and locate the terminator by
+             * its clear continuation bit. Everything past it belongs to whatever
+             * follows this varint, so it is masked away before the gather. */
+            const uint64_t w = detail::loadLittle64(p);
+            const uint64_t term = ~w & 0x8080808080808080ull;
+            if (term) [[likely]]
+            {
+                const unsigned len = (static_cast<unsigned>(std::countr_zero(term)) >> 3) + 1u;
+                out = detail::gather7(w & (~uint64_t{0} >> (64u - 8u * len)));
+                p += len;
+                return true;
+            }
+            /* Eight continuation bytes: 56 bits are in, and a ninth (and possibly
+             * tenth) byte carries the rest. */
+            uint64_t v = detail::gather7(w);
+            const uint8_t b8 = p[8];
+            v |= static_cast<uint64_t>(b8 & 0x7f) << 56;
+            if (!(b8 & 0x80))
+            {
+                p += 9;
+                out = v;
+                return true;
+            }
+            /* Tenth byte: 63 bits are already in, so only bit 0 fits. Any higher
+             * payload bit — or a continuation into an eleventh byte — is a varint
+             * wider than 64 bits, which is INVALID (§4.1/§6.3). The cursor still
+             * advances past the offending byte, exactly as the checked loop does,
+             * so callers observe the same position either way. */
+            const uint8_t b9 = p[9];
+            p += 10;
+            if ((b9 & 0x7f) > 1 || (b9 & 0x80))
+            {
+                if (overflow) *overflow = true;
+                return false;
+            }
+            v |= static_cast<uint64_t>(b9) << 63;
+            out = v;
+            return true;
+        }
+
+        /** @brief @ref getVarintWindowed without building the value — see @ref skipVarint. */
+        static bool skipVarintWindowed(const uint8_t *&p, bool *overflow) noexcept
+        {
+            const uint64_t term = ~detail::loadLittle64(p) & 0x8080808080808080ull;
+            if (term) [[likely]]
+            {
+                p += (static_cast<unsigned>(std::countr_zero(term)) >> 3) + 1u;
+                return true;
+            }
+            const uint8_t b8 = p[8];
+            if (!(b8 & 0x80))
+            {
+                p += 9;
+                return true;
+            }
+            const uint8_t b9 = p[9];
+            p += 10;
+            if ((b9 & 0x7f) > 1 || (b9 & 0x80))
+            {
+                if (overflow) *overflow = true;
+                return false;
+            }
+            return true;
+        }
+
+        /**
          * @brief Read one base-128 varint, advancing the cursor (bounds-checked).
          * @param[in,out] p Cursor; advanced past the varint on success.
          * @param end One past the last readable byte.
@@ -1561,20 +1853,32 @@ namespace sofab
         static bool getVarint(const uint8_t *&p, const uint8_t *end, uint64_t &out,
                               bool *overflow = nullptr) noexcept
         {
+            /* One byte is the overwhelmingly common case away from array
+             * payloads — every field header with an id below 16, every short
+             * length, every small count and value — so it is tested before
+             * anything else and costs a load and a compare. Array element runs do
+             * not come through here at all; they drive @ref getVarintWindowed
+             * directly under one shared bounds check (see @ref read). */
+            if (p < end && *p < 0x80) [[likely]]
+            {
+                out = *p++;
+                return true;
+            }
+            if (static_cast<size_t>(end - p) >= detail::VARINT_MAX_BYTES)
+                return getVarintWindowed(p, out, overflow);
+
+            /* Tail: fewer than VARINT_MAX_BYTES bytes are left, so this loop runs
+             * at most nine times and the value it builds carries at most 63 bits.
+             * Both §4.1 overlong tests are therefore dead here — the tenth byte
+             * that could trip them is by definition not in the buffer — and the
+             * only way out other than a terminator byte is running dry, which is
+             * a truncated varint (INCOMPLETE, not INVALID, so `overflow` stays
+             * untouched). @p overflow is still taken for the fast path above. */
             uint64_t v = 0;
             int shift = 0;
             while (p < end)
             {
                 const uint8_t b = *p++;
-                /* Reject an overlong (> 64-bit) varint before it silently wraps
-                 * (§4.1/§6.3): on the 10th byte only the low bit may be set, so
-                 * any payload bit that would spill past bit 63 is INVALID. */
-                const int room = 64 - shift;
-                if (room < 7 && (static_cast<uint8_t>(b & 0x7f) >> room) != 0)
-                {
-                    if (overflow) *overflow = true;
-                    return false;
-                }
                 v |= static_cast<uint64_t>(b & 0x7f) << shift;
                 if (!(b & 0x80))
                 {
@@ -1582,11 +1886,6 @@ namespace sofab
                     return true;
                 }
                 shift += 7;
-                if (shift >= 64)
-                {
-                    if (overflow) *overflow = true;
-                    return false;
-                }
             }
             return false;
         }
@@ -1602,26 +1901,17 @@ namespace sofab
         static bool skipVarint(const uint8_t *&p, const uint8_t *end,
                                bool *overflow = nullptr) noexcept
         {
-            int shift = 0;
-            while (p < end)
+            /* Same three-part shape as @ref getVarint, and for the same reasons. */
+            if (p < end && *p < 0x80) [[likely]]
             {
-                const uint8_t b = *p++;
-                /* Same overlong (> 64-bit) rejection as @ref getVarint (§4.1/§6.3):
-                 * a 10th byte with any bit above bit 0 set is INVALID. */
-                const int room = 64 - shift;
-                if (room < 7 && (static_cast<uint8_t>(b & 0x7f) >> room) != 0)
-                {
-                    if (overflow) *overflow = true;
-                    return false;
-                }
-                if (!(b & 0x80)) return true;
-                shift += 7;
-                if (shift >= 64)
-                {
-                    if (overflow) *overflow = true;
-                    return false;
-                }
+                ++p;
+                return true;
             }
+            if (static_cast<size_t>(end - p) >= detail::VARINT_MAX_BYTES)
+                return skipVarintWindowed(p, overflow);
+
+            while (p < end)
+                if (!(*p++ & 0x80)) return true;
             return false;
         }
 
@@ -2533,20 +2823,73 @@ namespace sofab
                     /* §7.3: the element kind selects the array wire type. */
                     constexpr Wire want = std::is_unsigned_v<Elem> ? Wire::ArrayUnsigned : Wire::ArraySigned;
                     if (!tagMatches(want)) return false;
-                    for (size_t i = 0; i < count_; ++i)
+                    /* Two loops rather than one with an `i < n` test inside: the
+                     * elements that reach the destination and the surplus that is
+                     * parsed only to stay framed are separate runs, so neither
+                     * pays for the other's branch. The surplus skips the value
+                     * accumulation too — skipVarint applies the identical §4.1
+                     * length and overflow rules, it just does not build the
+                     * number it is about to discard. */
+                    size_t i = 0;
+                    while (i < n)
                     {
-                        uint64_t raw;
-                        bool ovf = false;
-                        if (!getVarint(p_, end_, raw, &ovf))
+                        /* One bounds check for a whole run: with R bytes readable,
+                         * R / VARINT_MAX_BYTES elements are decodable without any
+                         * further test, since each consumes at most that many
+                         * bytes. The windowed decoder then carries no per-byte
+                         * bookkeeping at all. Only the last few bytes of the
+                         * buffer — where a varint may really be cut short — fall
+                         * back to the fully checked path. */
+                        size_t fit = static_cast<size_t>(end_ - p_) / detail::VARINT_MAX_BYTES;
+                        if (fit == 0) [[unlikely]]
                         {
-                            (ovf ? error_ : incomplete_) = true;
-                            return false;
+                            uint64_t raw;
+                            bool ovf = false;
+                            if (!getVarint(p_, end_, raw, &ovf))
+                            {
+                                (ovf ? error_ : incomplete_) = true;
+                                return false;
+                            }
+                            if constexpr (std::is_unsigned_v<Elem>) sp[i] = static_cast<Elem>(raw);
+                            else                                    sp[i] = static_cast<Elem>(detail::zigzagDecode(raw));
+                            ++i;
+                            continue;
                         }
-                        if (i < n)
+                        if (fit > n - i) fit = n - i;
+                        for (size_t k = 0; k < fit; ++k, ++i)
                         {
+                            uint64_t raw;
+                            bool ovf = false;
+                            if (!getVarintWindowed(p_, raw, &ovf))
+                            {
+                                (ovf ? error_ : incomplete_) = true;
+                                return false;
+                            }
                             if constexpr (std::is_unsigned_v<Elem>) sp[i] = static_cast<Elem>(raw);
                             else                                    sp[i] = static_cast<Elem>(detail::zigzagDecode(raw));
                         }
+                    }
+                    while (i < count_)
+                    {
+                        size_t fit = static_cast<size_t>(end_ - p_) / detail::VARINT_MAX_BYTES;
+                        bool ovf = false;
+                        if (fit == 0) [[unlikely]]
+                        {
+                            if (!skipVarint(p_, end_, &ovf))
+                            {
+                                (ovf ? error_ : incomplete_) = true;
+                                return false;
+                            }
+                            ++i;
+                            continue;
+                        }
+                        if (fit > count_ - i) fit = count_ - i;
+                        for (size_t k = 0; k < fit; ++k, ++i)
+                            if (!skipVarintWindowed(p_, &ovf))
+                            {
+                                error_ = true; /* only a > 64-bit varint can fail here */
+                                return false;
+                            }
                     }
                     consumed_ = true;
                 }
@@ -2561,7 +2904,11 @@ namespace sofab
                         return false;
                     }
                     if constexpr (std::endian::native == std::endian::little)
-                        std::memcpy(sp.data(), p_, n * sizeof(Elem)); /* wire == native */
+                    {
+                        /* An empty destination span has a null data(), which
+                         * memcpy forbids even for a zero length. */
+                        if (n) std::memcpy(sp.data(), p_, n * sizeof(Elem)); /* wire == native */
+                    }
                     else
                         for (size_t i = 0; i < n; ++i) sp[i] = loadFloat<Elem>(p_ + i * sizeof(Elem));
                     p_ += bytes;
