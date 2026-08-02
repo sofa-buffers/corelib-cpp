@@ -138,6 +138,40 @@ void perf_report(const char *what, PerfResult r, size_t bytes)
     printf("  throughput    : %.1f MB/s  (speedtest, MB = 1e6 bytes)\n", r.mb_s);
 }
 
+/* Sample the CPU clock once per block of operations rather than once per
+ * operation. std::clock() can cost around a microsecond — comparable to, or
+ * larger than, one operation on this message — so a per-iteration reading lands
+ * squarely inside the measurement. It corrupts cycles/op too, not just the
+ * timing: the cycle counter brackets the whole loop, so every clock() call in
+ * between is counted as part of the work. The block is grown until it spans
+ * long enough that a single reading cannot matter. */
+constexpr double kBlockSeconds = 0.01; /* clock cost lands under ~0.01% of a block */
+
+template <class F>
+PerfResult measure_loop(F &&body, size_t bytes)
+{
+    unsigned long block = 1;
+    for (;; block *= 2)
+    {
+        double t0 = cpu_now();
+        for (unsigned long k = 0; k < block; ++k) body();
+        if (cpu_now() - t0 >= kBlockSeconds) break;
+    }
+
+    unsigned long it = 0;
+    double el;
+    uint64_t c0 = perf_cycles();
+    double t0 = cpu_now();
+    do {
+        for (unsigned long k = 0; k < block; ++k) body();
+        it += block;
+        el = cpu_now() - t0;
+    } while (el < 1.0);
+    uint64_t c1 = perf_cycles();
+    return PerfResult{it, (double)(c1 - c0) / (double)it, el / (double)it * 1e9,
+                      (double)bytes * (double)it / el / 1e6};
+}
+
 PerfResult measure_encode(uint8_t *buf, size_t buflen, size_t &msg_size)
 {
     volatile size_t sink = 0;
@@ -145,14 +179,9 @@ PerfResult measure_encode(uint8_t *buf, size_t buflen, size_t &msg_size)
     for (unsigned i = 0; i < 1000u; i++) msg = perf_encode(buf, buflen); /* warmup */
     msg_size = msg;
 
-    unsigned long it = 0;
-    double el;
-    uint64_t c0 = perf_cycles();
-    double t0 = cpu_now();
-    do { sink += perf_encode(buf, buflen); it++; el = cpu_now() - t0; } while (el < 1.0);
-    uint64_t c1 = perf_cycles();
+    PerfResult r = measure_loop([&] { sink += perf_encode(buf, buflen); }, msg);
     (void)sink;
-    return PerfResult{it, (double)(c1 - c0) / (double)it, el / (double)it * 1e9, (double)msg * (double)it / el / 1e6};
+    return r;
 }
 
 PerfResult measure_decode(const uint8_t *buf, size_t len, PerfOut &out)
@@ -160,14 +189,9 @@ PerfResult measure_decode(const uint8_t *buf, size_t len, PerfOut &out)
     volatile uint32_t sink = 0;
     for (unsigned i = 0; i < 1000u; i++) perf_decode(buf, len, out); /* warmup */
 
-    unsigned long it = 0;
-    double el;
-    uint64_t c0 = perf_cycles();
-    double t0 = cpu_now();
-    do { perf_decode(buf, len, out); sink += out.u32; it++; el = cpu_now() - t0; } while (el < 1.0);
-    uint64_t c1 = perf_cycles();
+    PerfResult r = measure_loop([&] { perf_decode(buf, len, out); sink += out.u32; }, len);
     (void)sink;
-    return PerfResult{it, (double)(c1 - c0) / (double)it, el / (double)it * 1e9, (double)len * (double)it / el / 1e6};
+    return r;
 }
 
 } // namespace
