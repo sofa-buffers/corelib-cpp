@@ -589,7 +589,11 @@ struct GenericMsg : sofab::IStreamMessage
             {
                 std::vector<uint8_t> buf(op.blob.size() + 1);
                 size_t n = is.read(buf.data(), buf.size());
-                if (n != op.blob.size() || std::memcmp(buf.data(), op.blob.data(), op.blob.size()) != 0) bad("blob");
+                /* An empty blob's data() is null, and memcmp forbids that even
+                 * for a zero length, so the compare is skipped in that case. */
+                if (n != op.blob.size() ||
+                    (!op.blob.empty() &&
+                     std::memcmp(buf.data(), op.blob.data(), op.blob.size()) != 0)) bad("blob");
                 break;
             }
             case K::Arr:
