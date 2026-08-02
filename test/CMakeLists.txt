@@ -1,7 +1,12 @@
 enable_testing()
 
 add_executable(test_roundtrip test_roundtrip.cpp)
-target_compile_options(test_roundtrip PRIVATE -Wall -Wextra -Wpedantic -Werror)
+# -Wno-mismatched-new-delete: this TU *replaces* global operator new/delete with a
+# counting malloc/free pair (see the allocation hook in test_roundtrip.cpp). gcc 15
+# matches the std::malloc inside the replacement against the ::operator delete at
+# the call site and reports a mismatch, which it is not — the pair is consistent.
+target_compile_options(test_roundtrip PRIVATE -Wall -Wextra -Wpedantic -Werror
+    -Wno-mismatched-new-delete)
 target_link_libraries(test_roundtrip PRIVATE sofab_cpp)
 add_test(NAME test_roundtrip COMMAND test_roundtrip)
 
