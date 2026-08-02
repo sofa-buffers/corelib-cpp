@@ -36,6 +36,7 @@
 #include <cstdint>
 #include <cstring>
 #include <functional>
+#include <limits>
 #include <memory>
 #include <span>
 #include <string>
@@ -1633,6 +1634,60 @@ namespace sofab
     };
 
     /**
+     * @brief The value range a declared integer type admits (MESSAGE_SPEC §7.1).
+     *
+     * §7/§7.1 turned the declared integer width from a *storage hint* into a
+     * **validity bound**: a wire value that does not fit the declared type is
+     * `INVALID` alongside `M > N` and `maxlen`, and **MUST NOT** be masked to the
+     * width, nor kept. The wire itself carries no width — every integer is a
+     * varint read into a 64-bit accumulator — so the width is a **schema** fact
+     * and has to reach the decoder the same way `count` and `maxlen` do
+     * (@ref IStreamImpl::readArray, @ref IStreamImpl::readString).
+     *
+     * For a *scalar* a caller can range-check the value once @ref IStreamImpl::read
+     * has returned it. An array *element* cannot be checked that way without
+     * decoding the whole array into a wider temporary and copying it down —
+     * precisely the cost the bulk path exists to avoid — so for arrays the bound
+     * rides into the read and is applied where each element is decoded.
+     *
+     * Default-constructed it is **unarmed**, so an existing call site keeps the
+     * behaviour it had.
+     *
+     * @note The range is inclusive and applied in full: an element below @ref lo
+     *       or above @ref hi makes the decode `INVALID`. For an unsigned element
+     *       type @ref lo is consulted only when positive, since a varint cannot be
+     *       negative.
+     */
+    struct ElemBound
+    {
+        int64_t lo = 0;     /**< Smallest admissible value, inclusive. */
+        int64_t hi = 0;     /**< Largest admissible value, inclusive. */
+        bool armed = false; /**< `false`: no bound — the decode is unchanged. */
+
+        constexpr ElemBound() noexcept = default;
+
+        /** @brief An explicit inclusive range, armed. */
+        constexpr ElemBound(int64_t low, int64_t high) noexcept
+            : lo(low), hi(high), armed(true) {}
+
+        /**
+         * @brief The bound a declared element type @p E implies.
+         *
+         * **Unarmed for a 64-bit type**, whose range is the accumulator's own and
+         * therefore cannot be exceeded — so generated code may hand this in
+         * unconditionally and a `u64`/`i64` array pays nothing for it.
+         */
+        template <typename E>
+        static constexpr ElemBound of() noexcept
+        {
+            if constexpr (sizeof(E) >= sizeof(int64_t)) return ElemBound{};
+            else
+                return ElemBound{static_cast<int64_t>(std::numeric_limits<E>::min()),
+                                 static_cast<int64_t>(std::numeric_limits<E>::max())};
+        }
+    };
+
+    /**
      * @brief Base of the input streams: decodes fields from fed bytes.
      *
      * Bytes are supplied through @ref feed, which may be called repeatedly with
@@ -2654,6 +2709,144 @@ namespace sofab
             return exceedsBuffer(spanned, need);
         }
 
+        /**
+         * @brief Decode the current integer-array payload: @ref count_ varint
+         *        elements, the first `sp.size()` of them into @p sp.
+         *
+         * The tag is already known to match (§7.3) and the cursor sits at the first
+         * element. On success the field is @ref consumed_; on failure the stream's
+         * @ref error_ / @ref incomplete_ says which.
+         *
+         * @tparam Bounded Apply @p b, the declared element type's value range
+         *         (§7.1): an element outside it makes the decode `INVALID` —
+         *         never masked down to @p Elem, never kept. `false` instantiates
+         *         the plain decode, which is what @ref read alone can do: it sees
+         *         the destination's width, and a destination width is not a
+         *         declared width. The two are separate instantiations, so an
+         *         unbounded array carries no test for a bound it does not have.
+         * @param sp Destination for the leading elements; the rest of @ref count_
+         *        is still parsed, to stay framed.
+         * @param b The element range, when @p Bounded.
+         */
+        template <bool Bounded, typename Elem>
+        bool readIntElements(std::span<Elem> sp, ElemBound b = {}) noexcept
+        {
+            const size_t n = sp.size();
+            /* §7.1: an element outside the declared range is INVALID. Both
+             * alternatives are forbidden by name — masking it to Elem (what a bare
+             * static_cast does) and keeping it — so the reject happens before the
+             * store, through the same sticky flag as @ref invalidate. */
+            auto admits = [b](uint64_t raw) noexcept -> bool {
+                if constexpr (std::is_unsigned_v<Elem>)
+                    return raw <= static_cast<uint64_t>(b.hi) &&
+                           (b.lo <= 0 || raw >= static_cast<uint64_t>(b.lo));
+                else
+                {
+                    const int64_t v = detail::zigzagDecode(raw);
+                    return v >= b.lo && v <= b.hi;
+                }
+            };
+            auto store = [&](size_t i, uint64_t raw) noexcept -> bool {
+                if constexpr (Bounded)
+                    if (!admits(raw)) { error_ = true; return false; }
+                if constexpr (std::is_unsigned_v<Elem>) sp[i] = static_cast<Elem>(raw);
+                else                                    sp[i] = static_cast<Elem>(detail::zigzagDecode(raw));
+                return true;
+            };
+            /* Two loops rather than one with an `i < n` test inside: the
+             * elements that reach the destination and the surplus that is
+             * parsed only to stay framed are separate runs, so neither
+             * pays for the other's branch. The unbounded surplus skips the value
+             * accumulation too — skipVarint applies the identical §4.1
+             * length and overflow rules, it just does not build the
+             * number it is about to discard. A BOUNDED surplus is decoded
+             * instead: §7.1 makes an over-width element INVALID whether or not
+             * it had a destination to be stored in. */
+            size_t i = 0;
+            while (i < n)
+            {
+                /* One bounds check for a whole run: with R bytes readable,
+                 * R / VARINT_MAX_BYTES elements are decodable without any
+                 * further test, since each consumes at most that many
+                 * bytes. The windowed decoder then carries no per-byte
+                 * bookkeeping at all. Only the last few bytes of the
+                 * buffer — where a varint may really be cut short — fall
+                 * back to the fully checked path. */
+                size_t fit = static_cast<size_t>(end_ - p_) / detail::VARINT_MAX_BYTES;
+                if (fit == 0) [[unlikely]]
+                {
+                    uint64_t raw;
+                    bool ovf = false;
+                    if (!getVarint(p_, end_, raw, &ovf))
+                    {
+                        (ovf ? error_ : incomplete_) = true;
+                        return false;
+                    }
+                    if (!store(i, raw)) return false;
+                    ++i;
+                    continue;
+                }
+                if (fit > n - i) fit = n - i;
+                for (size_t k = 0; k < fit; ++k, ++i)
+                {
+                    uint64_t raw;
+                    bool ovf = false;
+                    if (!getVarintWindowed(p_, raw, &ovf))
+                    {
+                        (ovf ? error_ : incomplete_) = true;
+                        return false;
+                    }
+                    if (!store(i, raw)) return false;
+                }
+            }
+            while (i < count_)
+            {
+                size_t fit = static_cast<size_t>(end_ - p_) / detail::VARINT_MAX_BYTES;
+                bool ovf = false;
+                if (fit == 0) [[unlikely]]
+                {
+                    if constexpr (Bounded)
+                    {
+                        uint64_t raw;
+                        if (!getVarint(p_, end_, raw, &ovf))
+                        {
+                            (ovf ? error_ : incomplete_) = true;
+                            return false;
+                        }
+                        if (!admits(raw)) { error_ = true; return false; }
+                    }
+                    else if (!skipVarint(p_, end_, &ovf))
+                    {
+                        (ovf ? error_ : incomplete_) = true;
+                        return false;
+                    }
+                    ++i;
+                    continue;
+                }
+                if (fit > count_ - i) fit = count_ - i;
+                for (size_t k = 0; k < fit; ++k, ++i)
+                {
+                    if constexpr (Bounded)
+                    {
+                        uint64_t raw;
+                        if (!getVarintWindowed(p_, raw, &ovf))
+                        {
+                            error_ = true; /* only a > 64-bit varint can fail here */
+                            return false;
+                        }
+                        if (!admits(raw)) { error_ = true; return false; }
+                    }
+                    else if (!skipVarintWindowed(p_, &ovf))
+                    {
+                        error_ = true; /* only a > 64-bit varint can fail here */
+                        return false;
+                    }
+                }
+            }
+            consumed_ = true;
+            return true;
+        }
+
     public:
 
         /**
@@ -2847,75 +3040,10 @@ namespace sofab
                     /* §7.3: the element kind selects the array wire type. */
                     constexpr Wire want = std::is_unsigned_v<Elem> ? Wire::ArrayUnsigned : Wire::ArraySigned;
                     if (!tagMatches(want)) return false;
-                    /* Two loops rather than one with an `i < n` test inside: the
-                     * elements that reach the destination and the surplus that is
-                     * parsed only to stay framed are separate runs, so neither
-                     * pays for the other's branch. The surplus skips the value
-                     * accumulation too — skipVarint applies the identical §4.1
-                     * length and overflow rules, it just does not build the
-                     * number it is about to discard. */
-                    size_t i = 0;
-                    while (i < n)
-                    {
-                        /* One bounds check for a whole run: with R bytes readable,
-                         * R / VARINT_MAX_BYTES elements are decodable without any
-                         * further test, since each consumes at most that many
-                         * bytes. The windowed decoder then carries no per-byte
-                         * bookkeeping at all. Only the last few bytes of the
-                         * buffer — where a varint may really be cut short — fall
-                         * back to the fully checked path. */
-                        size_t fit = static_cast<size_t>(end_ - p_) / detail::VARINT_MAX_BYTES;
-                        if (fit == 0) [[unlikely]]
-                        {
-                            uint64_t raw;
-                            bool ovf = false;
-                            if (!getVarint(p_, end_, raw, &ovf))
-                            {
-                                (ovf ? error_ : incomplete_) = true;
-                                return false;
-                            }
-                            if constexpr (std::is_unsigned_v<Elem>) sp[i] = static_cast<Elem>(raw);
-                            else                                    sp[i] = static_cast<Elem>(detail::zigzagDecode(raw));
-                            ++i;
-                            continue;
-                        }
-                        if (fit > n - i) fit = n - i;
-                        for (size_t k = 0; k < fit; ++k, ++i)
-                        {
-                            uint64_t raw;
-                            bool ovf = false;
-                            if (!getVarintWindowed(p_, raw, &ovf))
-                            {
-                                (ovf ? error_ : incomplete_) = true;
-                                return false;
-                            }
-                            if constexpr (std::is_unsigned_v<Elem>) sp[i] = static_cast<Elem>(raw);
-                            else                                    sp[i] = static_cast<Elem>(detail::zigzagDecode(raw));
-                        }
-                    }
-                    while (i < count_)
-                    {
-                        size_t fit = static_cast<size_t>(end_ - p_) / detail::VARINT_MAX_BYTES;
-                        bool ovf = false;
-                        if (fit == 0) [[unlikely]]
-                        {
-                            if (!skipVarint(p_, end_, &ovf))
-                            {
-                                (ovf ? error_ : incomplete_) = true;
-                                return false;
-                            }
-                            ++i;
-                            continue;
-                        }
-                        if (fit > count_ - i) fit = count_ - i;
-                        for (size_t k = 0; k < fit; ++k, ++i)
-                            if (!skipVarintWindowed(p_, &ovf))
-                            {
-                                error_ = true; /* only a > 64-bit varint can fail here */
-                                return false;
-                            }
-                    }
-                    consumed_ = true;
+                    /* No declared element width here: read() is handed a
+                     * destination, not a schema. The bounded form is reached
+                     * through readArray, which is handed both. */
+                    if (!readIntElements<false>(sp.first(n))) return false;
                 }
                 else if constexpr (std::is_same_v<Elem, float> || std::is_same_v<Elem, double>)
                 {
@@ -3019,15 +3147,27 @@ namespace sofab
          *    step 1 cannot wipe a valid earlier one (§7.4). A fixed array is refilled
          *    from the element default past the wire count, which is what the
          *    trailing-default-run rule expects (§3).
+         * 5. **Declared element width** (@p elem, §7.1) → `INVALID`, per element as
+         *    it is decoded. The sibling of the `count` bound at step 2: the same
+         *    class of schema fact, arriving through the same call, and the reason it
+         *    is applied *here* rather than by the caller — an element cannot be
+         *    range-checked after the fact without a wide temporary copy of the whole
+         *    array. Unarmed by default, so an omitted bound decodes exactly as before.
          *
          * @param[out] dst        Destination range (fixed extent or resizable).
          * @param schemaCount     Declared `count: N`, or negative when unbounded.
          * @param dynCap          Configured `max_dyn_array_count`, or negative.
+         * @param elem            Declared element range (@ref ElemBound), e.g.
+         *                        `ElemBound::of<std::uint8_t>()` for `items: u8`.
+         *                        Ignored for a float element type, which has no
+         *                        narrowing to reject: `fp32`/`fp64` are carried at
+         *                        their own width on the wire.
          * @return `true` when the array was read; `false` when it was skipped (§7.3)
          *         or rejected, with the outcome already recorded on the stream.
          */
         template <typename T>
-        bool readArray(T &dst, long schemaCount = -1, long dynCap = -1) noexcept
+        bool readArray(T &dst, long schemaCount = -1, long dynCap = -1,
+                       ElemBound elem = {}) noexcept
         {
             using Elem = typename T::value_type;
             if constexpr (std::is_same_v<Elem, float> || std::is_same_v<Elem, double>)
@@ -3052,6 +3192,16 @@ namespace sofab
             }
             if constexpr (requires { dst.resize(count_); }) dst.resize(count_);
             else                                            dst = T{};
+            if constexpr (std::is_integral_v<Elem> && !std::is_same_v<Elem, bool>)
+            {
+                if (elem.armed)
+                {
+                    /* The tag is already settled above, so the bounded decode is
+                     * entered directly rather than through read(). */
+                    std::span<Elem> sp{dst};
+                    return readIntElements<true>(sp.first(std::min(sp.size(), count_)), elem);
+                }
+            }
             return read(dst);
         }
 
