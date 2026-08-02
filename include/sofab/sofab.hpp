@@ -2722,7 +2722,7 @@ namespace sofab
                     return v >= b.lo && v <= b.hi;
                 }
             };
-            auto store = [&, this](size_t i, uint64_t raw) noexcept -> bool {
+            auto store = [&](size_t i, uint64_t raw) noexcept -> bool {
                 if constexpr (Bounded)
                     if (!admits(raw)) { error_ = true; return false; }
                 if constexpr (std::is_unsigned_v<Elem>) sp[i] = static_cast<Elem>(raw);
