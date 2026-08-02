@@ -727,6 +727,277 @@ static void headerFirstBounds()
     }
 }
 
+/* --- the declared element width is a validity bound, not a storage hint
+ *     (MESSAGE_SPEC §7/§7.1, Crucible F-0033, corelib-cpp#64).
+ *
+ * The wire carries no integer width: every element of an `array` is a varint read
+ * into a 64-bit accumulator. §7.1 names an over-width scalar as INVALID alongside
+ * `M > N` and `maxlen`, and forbids both alternatives by name — it MUST NOT be
+ * masked to the declared width, and MUST NOT be kept. For an array element the
+ * check has to run where the element is decoded: reading the array into a wider
+ * temporary and copying it down afterwards would defeat the bulk path.
+ *
+ * The bound is a schema fact, so it arrives the way `count` and `maxlen` do — in
+ * the read call. Omitting it decodes exactly as before, which is what a caller
+ * that has no declared width (a plain read()) must do. --- */
+
+static void elementWidthBound()
+{
+    /* array<u8> count 4 at id 15 (header 0x7b = (15<<3)|ArrayUnsigned). */
+    struct U8Arr : sofab::IStreamMessage
+    {
+        std::array<uint8_t, 4> u{};
+        void deserialize(sofab::IStreamImpl &is, sofab::id id, size_t, size_t) noexcept override
+        { if (id == 15) is.readArray(u, 4, -1, sofab::ElemBound::of<uint8_t>()); }
+    };
+    /* the same array read WITHOUT a declared width, as a hand-written caller
+     * that never had one does. */
+    struct U8ArrUnbounded : sofab::IStreamMessage
+    {
+        std::array<uint8_t, 4> u{};
+        void deserialize(sofab::IStreamImpl &is, sofab::id id, size_t, size_t) noexcept override
+        { if (id == 15) is.readArray(u, 4); }
+    };
+    /* array<i8> count 4 at id 15 (header 0x7c = (15<<3)|ArraySigned). Elements are
+     * zig-zagged: -128 -> 255 (ff 01), -129 -> 257 (81 02), 127 -> 254 (fe 01),
+     * 128 -> 256 (80 02). */
+    struct I8Arr : sofab::IStreamMessage
+    {
+        std::array<int8_t, 4> i{};
+        void deserialize(sofab::IStreamImpl &is, sofab::id id, size_t, size_t) noexcept override
+        { if (id == 15) is.readArray(i, 4, -1, sofab::ElemBound::of<int8_t>()); }
+    };
+
+    /* ---- THE ISOLATE: 16383 (ff 7f) into a declared u8. Masking it stores 255;
+     *      §7.1 says the message is INVALID. ---- */
+    {
+        const uint8_t bytes[] = {0x7b, 0x04, 0xff, 0x7f, 2, 3, 4};
+        sofab::IStreamObject<U8Arr> in;
+        CHECK(in.feed(bytes, sizeof bytes).code() == sofab::Error::InvalidMessage,
+              "§7.1: an over-width array element is INVALID, not masked");
+        CHECK((*in).u[0] != 255, "§7.1: the over-width element is not kept masked either");
+    }
+    /* ...the same bytes with no declared width: unchanged behaviour, by design.
+     * The bound is opt-in so that a caller who has no schema keeps the decode it
+     * always had — it is generated code, holding the declaration, that passes it. */
+    {
+        const uint8_t bytes[] = {0x7b, 0x04, 0xff, 0x7f, 2, 3, 4};
+        sofab::IStreamObject<U8ArrUnbounded> in;
+        CHECK(in.feed(bytes, sizeof bytes).code() == sofab::Error::None,
+              "§7.1: without a declared width the decode is unchanged");
+    }
+
+    /* ---- the boundary itself: 255 fits a u8, 256 does not. ---- */
+    {
+        const uint8_t bytes[] = {0x7b, 0x04, 0xff, 0x01, 2, 3, 4}; /* 255 */
+        sofab::IStreamObject<U8Arr> in;
+        auto r = in.feed(bytes, sizeof bytes);
+        CHECK(r.code() == sofab::Error::None, "§7.1: the largest in-width element is admitted");
+        CHECK(((*in).u == std::array<uint8_t, 4>{255, 2, 3, 4}), "§7.1: in-width elements decode");
+    }
+    {
+        const uint8_t bytes[] = {0x7b, 0x04, 0x80, 0x02, 2, 3, 4}; /* 256 */
+        sofab::IStreamObject<U8Arr> in;
+        CHECK(in.feed(bytes, sizeof bytes).code() == sofab::Error::InvalidMessage,
+              "§7.1: one past the width is INVALID");
+    }
+    /* not only the first element: the bound applies to every one of them */
+    {
+        const uint8_t bytes[] = {0x7b, 0x04, 1, 2, 3, 0x80, 0x02};
+        sofab::IStreamObject<U8Arr> in;
+        CHECK(in.feed(bytes, sizeof bytes).code() == sofab::Error::InvalidMessage,
+              "§7.1: a LAST over-width element is INVALID too");
+    }
+
+    /* ---- signed elements are measured after the zig-zag, at both ends. ---- */
+    {
+        const uint8_t bytes[] = {0x7c, 0x02, 0xff, 0x01, 0xfe, 0x01}; /* -128, 127 */
+        sofab::IStreamObject<I8Arr> in;
+        auto r = in.feed(bytes, sizeof bytes);
+        CHECK(r.code() == sofab::Error::None, "§7.1: the i8 extremes are admitted");
+        CHECK(((*in).i == std::array<int8_t, 4>{-128, 127, 0, 0}), "§7.1: i8 elements decode");
+    }
+    {
+        const uint8_t bytes[] = {0x7c, 0x01, 0x81, 0x02}; /* -129 */
+        sofab::IStreamObject<I8Arr> in;
+        CHECK(in.feed(bytes, sizeof bytes).code() == sofab::Error::InvalidMessage,
+              "§7.1: an element below the signed minimum is INVALID");
+    }
+    {
+        const uint8_t bytes[] = {0x7c, 0x01, 0x80, 0x02}; /* 128 */
+        sofab::IStreamObject<I8Arr> in;
+        CHECK(in.feed(bytes, sizeof bytes).code() == sofab::Error::InvalidMessage,
+              "§7.1: an element above the signed maximum is INVALID");
+    }
+
+    /* ---- the wider narrow types, so the bound is not a byte-sized special case.
+     *      u32's maximum needs more than 32 bits of range to express. ---- */
+    {
+        struct U32Arr : sofab::IStreamMessage
+        {
+            std::array<uint32_t, 2> u{};
+            void deserialize(sofab::IStreamImpl &is, sofab::id id, size_t, size_t) noexcept override
+            { if (id == 15) is.readArray(u, 2, -1, sofab::ElemBound::of<uint32_t>()); }
+        };
+        {   /* 4294967295 = ff ff ff ff 0f */
+            const uint8_t bytes[] = {0x7b, 0x01, 0xff, 0xff, 0xff, 0xff, 0x0f};
+            sofab::IStreamObject<U32Arr> in;
+            auto r = in.feed(bytes, sizeof bytes);
+            CHECK(r.code() == sofab::Error::None && (*in).u[0] == 4294967295u,
+                  "§7.1: the largest u32 element is admitted");
+        }
+        {   /* 4294967296 = 80 80 80 80 10 */
+            const uint8_t bytes[] = {0x7b, 0x01, 0x80, 0x80, 0x80, 0x80, 0x10};
+            sofab::IStreamObject<U32Arr> in;
+            CHECK(in.feed(bytes, sizeof bytes).code() == sofab::Error::InvalidMessage,
+                  "§7.1: one past the u32 width is INVALID");
+        }
+    }
+
+    /* ---- a 64-bit element type has the accumulator's own range, so ElemBound::of
+     *      is unarmed for it and generated code may pass it unconditionally. ---- */
+    {
+        static_assert(!sofab::ElemBound::of<uint64_t>().armed, "u64 needs no width bound");
+        static_assert(!sofab::ElemBound::of<int64_t>().armed, "i64 needs no width bound");
+        struct U64Arr : sofab::IStreamMessage
+        {
+            std::array<uint64_t, 1> u{};
+            void deserialize(sofab::IStreamImpl &is, sofab::id id, size_t, size_t) noexcept override
+            { if (id == 15) is.readArray(u, 1, -1, sofab::ElemBound::of<uint64_t>()); }
+        };
+        const uint8_t bytes[] = {0x7b, 0x01, 0xff, 0xff, 0xff, 0xff, 0xff,
+                                 0xff, 0xff, 0xff, 0xff, 0x01}; /* UINT64_MAX */
+        sofab::IStreamObject<U64Arr> in;
+        auto r = in.feed(bytes, sizeof bytes);
+        CHECK(r.code() == sofab::Error::None && (*in).u[0] == UINT64_MAX,
+              "§7.1: a u64 element is unbounded, as its declared width is the whole range");
+    }
+
+    /* ---- a SURPLUS element -- one past the destination, parsed only to stay
+     *      framed -- is over-width all the same, and §7.1 does not ask whether it
+     *      had somewhere to be stored. ---- */
+    {
+        struct ShortDst : sofab::IStreamMessage
+        {
+            std::array<uint8_t, 2> u{};
+            void deserialize(sofab::IStreamImpl &is, sofab::id id, size_t, size_t) noexcept override
+            { if (id == 15) is.readArray(u, -1, -1, sofab::ElemBound::of<uint8_t>()); }
+        };
+        {   /* four elements into a two-element destination, the LAST over-width */
+            const uint8_t bytes[] = {0x7b, 0x04, 1, 2, 3, 0x80, 0x02};
+            sofab::IStreamObject<ShortDst> in;
+            CHECK(in.feed(bytes, sizeof bytes).code() == sofab::Error::InvalidMessage,
+                  "§7.1: an over-width SURPLUS element is INVALID too");
+        }
+        {   /* control: the same shape, all elements in width */
+            const uint8_t bytes[] = {0x7b, 0x04, 1, 2, 3, 4};
+            sofab::IStreamObject<ShortDst> in;
+            auto r = in.feed(bytes, sizeof bytes);
+            CHECK(r.code() == sofab::Error::None && ((*in).u == std::array<uint8_t, 2>{1, 2}),
+                  "§7.1: in-width surplus elements are still discarded, not rejected");
+        }
+    }
+
+    /* ---- ordering, unchanged: §7.3 still decides first. A signed array at the
+     *      id of a declared u8 array contradicts the declaration, so it is skipped
+     *      like an unknown id and its elements are never measured. ---- */
+    {
+        const uint8_t bytes[] = {0x7c, 0x01, 0x80, 0x02}; /* ArraySigned, element 256 */
+        sofab::IStreamObject<U8Arr> in;
+        auto r = in.feed(bytes, sizeof bytes);
+        CHECK(r.code() == sofab::Error::None && r.skipped() == 1,
+              "§7.1: a contradicting array kind is skipped, never width-checked (§7.3)");
+    }
+    /* ...and the count bound still precedes it: an over-count array is INVALID at
+     *    its count word, before any element is looked at. */
+    {
+        const uint8_t bytes[] = {0x7b, 0x06, 1, 2, 3, 4, 5, 6};
+        sofab::IStreamObject<U8Arr> in;
+        CHECK(in.feed(bytes, sizeof bytes).code() == sofab::Error::InvalidMessage,
+              "§7.1: the count bound still applies ahead of the element bound");
+    }
+
+    /* ---- a truncated array is still INCOMPLETE: the width bound rejects a value
+     *      that is present, it does not manufacture a verdict for one that is not.
+     *      The elements before the cut are in width, so nothing else fires. ---- */
+    {
+        const uint8_t bytes[] = {0x7b, 0x04, 1, 2};
+        sofab::IStreamObject<U8Arr> in;
+        CHECK(in.feed(bytes, sizeof bytes).code() == sofab::Error::Incomplete,
+              "§7.1: a truncated in-width array stays INCOMPLETE");
+    }
+    /* ...but an over-width element that IS present decides before the truncation,
+     *    the same way the count bound does (INVALID dominates INCOMPLETE). */
+    {
+        const uint8_t bytes[] = {0x7b, 0x04, 0x80, 0x02};
+        sofab::IStreamObject<U8Arr> in;
+        CHECK(in.feed(bytes, sizeof bytes).code() == sofab::Error::InvalidMessage,
+              "§7.1: an over-width element decides before the truncation");
+    }
+    /* ...and a bound rejection survives being split across feeds: the field is
+     *    re-delivered whole, so the verdict is the same as in one chunk. */
+    {
+        const uint8_t bytes[] = {0x7b, 0x04, 1, 2, 3, 0x80, 0x02};
+        sofab::IStreamObject<U8Arr> in;
+        CHECK(in.feed(bytes, 3).code() == sofab::Error::Incomplete,
+              "§7.1: the leading chunk of the array buffers as INCOMPLETE");
+        CHECK(in.feed(bytes + 3, sizeof bytes - 3).code() == sofab::Error::InvalidMessage,
+              "§7.1: the completing chunk reports the over-width element");
+    }
+
+    /* ---- a dynamic destination takes the same bound. ---- */
+    {
+        struct VecArr : sofab::IStreamMessage
+        {
+            std::vector<uint16_t> u;
+            void deserialize(sofab::IStreamImpl &is, sofab::id id, size_t, size_t) noexcept override
+            { if (id == 15) is.readArray(u, 4, -1, sofab::ElemBound::of<uint16_t>()); }
+        };
+        {   /* 65535 = ff ff 03 */
+            const uint8_t bytes[] = {0x7b, 0x02, 0xff, 0xff, 0x03, 7};
+            sofab::IStreamObject<VecArr> in;
+            auto r = in.feed(bytes, sizeof bytes);
+            CHECK((r.code() == sofab::Error::None && (*in).u == std::vector<uint16_t>{65535, 7}),
+                  "§7.1: a dynamic destination decodes its in-width elements");
+        }
+        {   /* 65536 = 80 80 04 */
+            const uint8_t bytes[] = {0x7b, 0x02, 0x80, 0x80, 0x04, 7};
+            sofab::IStreamObject<VecArr> in;
+            CHECK(in.feed(bytes, sizeof bytes).code() == sofab::Error::InvalidMessage,
+                  "§7.1: a dynamic destination rejects an over-width element");
+        }
+    }
+
+    /* ---- an explicit range, for a declared type the caller spells out itself. ---- */
+    {
+        struct RangedArr : sofab::IStreamMessage
+        {
+            std::array<int32_t, 2> i{};
+            void deserialize(sofab::IStreamImpl &is, sofab::id id, size_t, size_t) noexcept override
+            { if (id == 15) is.readArray(i, 2, -1, sofab::ElemBound{-10, 10}); }
+        };
+        {   /* -10, 10 -> zig-zag 19 (13), 20 (14) */
+            const uint8_t bytes[] = {0x7c, 0x02, 19, 20};
+            sofab::IStreamObject<RangedArr> in;
+            auto r = in.feed(bytes, sizeof bytes);
+            CHECK(r.code() == sofab::Error::None && ((*in).i == std::array<int32_t, 2>{-10, 10}),
+                  "§7.1: an explicit range admits its endpoints");
+        }
+        {   /* 11 -> zig-zag 22 */
+            const uint8_t bytes[] = {0x7c, 0x01, 22};
+            sofab::IStreamObject<RangedArr> in;
+            CHECK(in.feed(bytes, sizeof bytes).code() == sofab::Error::InvalidMessage,
+                  "§7.1: an explicit range rejects one past its top");
+        }
+        {   /* -11 -> zig-zag 21 */
+            const uint8_t bytes[] = {0x7c, 0x01, 21};
+            sofab::IStreamObject<RangedArr> in;
+            CHECK(in.feed(bytes, sizeof bytes).code() == sofab::Error::InvalidMessage,
+                  "§7.1: an explicit range rejects one below its bottom");
+        }
+    }
+}
+
 /* --- exceedLimit(): a deliver callback enforces a receiver-side policy cap the
  *     wire layer cannot know — e.g. a generated message rejecting an unbounded
  *     array whose claimed count exceeds a configured decode limit
@@ -2694,6 +2965,7 @@ int main()
     threeValuedOutcomes();
     callbackInvalidate();
     headerFirstBounds();
+    elementWidthBound();
     callbackExceedLimit();
     wireTypeGuard();
     zeroLengthForms();
