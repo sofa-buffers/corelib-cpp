@@ -94,13 +94,37 @@ void encode_typical(OStreamRaw &os)
 
 double cpu_now() { return (double)std::clock() / (double)CLOCKS_PER_SEC; }
 
+/* Block size for the timed loop: enough iterations that one clock reading is a
+ * rounding error against them. std::clock() is a real cost — on a host without
+ * a vDSO fast path for CLOCK_PROCESS_CPUTIME_ID it runs to about a microsecond,
+ * which is more than an entire `typical message` operation — so reading it once
+ * per iteration, as this loop used to, measures mostly the clock. The spec asks
+ * for a ~1 s CPU-time loop and a warmup; how often the clock is sampled inside
+ * that loop is ours to choose. */
+constexpr double kBlockSeconds = 0.01; /* clock cost lands under ~0.01% of a block */
+
+long calibrateBlock(void (*fn)())
+{
+    for (long block = 1;; block *= 2)
+    {
+        double t0 = cpu_now();
+        for (long k = 0; k < block; ++k) fn();
+        if (cpu_now() - t0 >= kBlockSeconds) return block;
+    }
+}
+
 double measure(void (*fn)(), size_t bytes)
 {
     fn(); /* warmup */
+    const long block = calibrateBlock(fn);
     double t0 = cpu_now();
     long it = 0;
     double el;
-    do { fn(); it++; el = cpu_now() - t0; } while (el < 1.0);
+    do {
+        for (long k = 0; k < block; ++k) fn();
+        it += block;
+        el = cpu_now() - t0;
+    } while (el < 1.0);
     return (double)bytes * (double)it / el / 1e6; /* MB/s, MB = 1e6 bytes */
 }
 
