@@ -2462,6 +2462,111 @@ static void overIndexSkipOrdering()
     }
 }
 
+/* --- the element-index bound is suspended inside a SKIPPED subtree (Crucible
+ *     F-0051, corelib-cpp#65).
+ *
+ * A field skipped inside a wrapper sequence -- because its wire tag contradicts
+ * the declared element type (§7.3) or because its id is simply unknown -- never
+ * became the array's value, so the fields nested INSIDE it are not the array's
+ * elements either. Their ids are child ids of that field, not array indices, and
+ * the §5.1/§7 over-index bound must not measure them: it belongs to the wrapper
+ * level alone.
+ *
+ * The control that separates this from an enter-and-bind defect is the child id:
+ * with an in-range child the element is skipped correctly, so the subtree is
+ * demonstrably never entered as an element -- only the bound leaked in. Same
+ * fixture as F-0041 above: string_array at id 200, items string, count 5. --- */
+
+static void skippedSubtreeSuspendsBound()
+{
+    auto feed = [](const char *hex) {
+        sofab::IStreamObject<F41Msg> in;
+        auto w = fromHex(hex);
+        auto r = in.feed(w.data(), w.size());
+        return std::pair<sofab::IStreamImpl::Result, F41Msg>{r, *in};
+    };
+
+    /* ---- THE ISOLATE: element index 4 (IN RANGE) opened as a sequence, which
+     *      §7.3 skips; inside it a string at child id 5. That 5 is over the
+     *      wrapper's count, but it is not an element index -- the field holding
+     *      it was never an element. ---- */
+    {
+        auto [r, m] = feed("c60c 26 2a 0a41 07 07");
+        CHECK(r.complete(), "F-0051: an over-index CHILD of a skipped element is not INVALID");
+        CHECK(m.strs.empty(), "F-0051: the skipped element leaves the array empty");
+        CHECK(r.skipped() == 1, "F-0051: only the element itself is counted as a §7.3 skip");
+    }
+
+    /* ---- CONTROL: the same bytes with an IN-RANGE child id. This is what the
+     *      isolate must decode to; it also proves the subtree is skipped rather
+     *      than entered -- were it entered, the child would bind an element. ---- */
+    {
+        auto [r, m] = feed("c60c 26 02 0a41 07 07");
+        CHECK(r.complete() && m.strs.empty(),
+              "F-0051 control: an in-range child of a skipped element decodes to the empty array");
+    }
+
+    /* ---- not specific to §7.3: an UNKNOWN id (50) skipped inside the wrapper is
+     *      a different reason to skip, same subtree shape, same verdict. ---- */
+    {
+        auto [r, m] = feed("c60c 9603 2a 0a41 07 07");
+        CHECK(r.complete() && m.strs.empty(),
+              "F-0051: the bound does not leak into an unknown id's subtree either");
+    }
+
+    /* ---- and at depth: a skipped subtree nested inside a skipped subtree. ---- */
+    {
+        auto [r, m] = feed("c60c 26 2e 2a 0a41 07 07 07");
+        CHECK(r.complete() && m.strs.empty(),
+              "F-0051: the suspension covers nested skipped subtrees");
+    }
+
+    /* ---- the bound is SUSPENDED, not dropped: it is armed again the moment the
+     *      skip ends, so a well-typed over-index element AFTER one still rejects
+     *      (§5.1/§7). ---- */
+    {
+        auto [r, m] = feed("c60c 26 2a 0a41 07 42 0a41 07");
+        (void)m;
+        CHECK(r.invalid(), "F-0051: the bound is restored after the skipped subtree");
+    }
+    {   /* ...and one BEFORE the skipped subtree is rejected as it always was */
+        auto [r, m] = feed("c60c 42 0a41 07 26 2a 0a41 07 07");
+        (void)m;
+        CHECK(r.invalid(), "F-0051: an over-index element before the skip still rejects");
+    }
+
+    /* ---- valid elements around a skipped subtree still land at their index. ---- */
+    {
+        auto [r, m] = feed("c60c 02 0a41 26 2a 0a41 07 12 0a42 07");
+        CHECK(r.complete(), "F-0051: a skipped subtree between valid elements stays COMPLETE");
+        CHECK(m.strs.size() == 3 && m.strs[0] == "A" && m.strs[1].empty() && m.strs[2] == "B",
+              "F-0051: the skipped subtree does not disturb the surrounding elements");
+    }
+
+    /* ---- format-level rejects still fire INSIDE the skipped subtree: §7.3
+     *      subordinates the schema bound only (CORELIB_PLAN §4.8). ---- */
+    {   /* an over-64-bit varint in the child of a skipped element */
+        auto [r, m] = feed("c60c 26 43 ffffffffffffffffffff7f 07 07");
+        (void)m;
+        CHECK(r.invalid(), "F-0051: an over-64-bit varint inside the skipped subtree is still INVALID");
+    }
+    {   /* a reserved fixlen subtype (word 0x0c) in the child of a skipped element */
+        auto [r, m] = feed("c60c 26 2a 0c41 07 07");
+        (void)m;
+        CHECK(r.invalid(), "F-0051: a reserved fixlen subtype inside the skipped subtree is still INVALID");
+    }
+
+    /* ---- the mirror case, unchanged: a subtree that IS read (a well-typed struct
+     *      element of the id-202 wrapper) carries the bound of its own collector,
+     *      not the outer wrapper's -- so a child field id past the outer count is
+     *      an ordinary unknown field there. ---- */
+    {
+        auto [r, m] = feed("d60c 06 4009 07 07");
+        CHECK(r.complete() && m.rows.size() == 1,
+              "F-0051: an over-count child id inside a READ element is an ordinary unknown id");
+    }
+}
+
 /* --- destination reuse across messages (MESSAGE_SPEC §2 + §5.1).
  *
  * §2 omits an all-default field, so a message that does not carry a field
@@ -2708,6 +2813,7 @@ int main()
     messageLayerFraming();
     wrapperArrayCollectors();
     overIndexSkipOrdering();
+    skippedSubtreeSuspendsBound();
     destinationReuse();
     varintWidthSweep();
 

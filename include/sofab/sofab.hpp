@@ -2277,15 +2277,39 @@ namespace sofab
                     break;
                 }
                 case Wire::SequenceStart:
+                {
                     if (seqDepth_ >= MAX_DEPTH) /* §4.9 */
                     {
                         error_ = true;
                         break;
                     }
+                    /* §7.3: this sequence is being skipped, so it is not an element
+                     * of the enclosing wrapper -- and the fields INSIDE it are not
+                     * that wrapper's elements either. Their ids are child ids of a
+                     * field that never became a value, not array indices, so the
+                     * element-index bound must not measure them: it is suspended for
+                     * the whole subtree and restored after. Without this a child id
+                     * at or past the wrapper's `count` would trip the §5.1/§7 reject
+                     * from inside a field §7.3 says is not the array's at all
+                     * (Crucible F-0051, corelib-cpp#65). The suspension is not
+                     * specific to a §7.3-mistyped element: an unknown id skipped
+                     * inside the wrapper reaches the same place and is equally not
+                     * an element. Format-level rejects (§4.9 depth, over-64-bit
+                     * varint, ...) still fire inside the subtree -- §7.3
+                     * subordinates the SCHEMA bound only. */
+                    const long outerBound = elemBound_;
+                    const int outerElemWire = elemWire_, outerElemFix = elemFix_;
+                    elemBound_ = -1;
+                    elemWire_ = -1;
+                    elemFix_ = -1;
                     ++seqDepth_;
                     dispatchLevel([](sofab::id, size_t, size_t) {}, /*stopAtEnd*/ true);
                     --seqDepth_;
+                    elemBound_ = outerBound;
+                    elemWire_ = outerElemWire;
+                    elemFix_ = outerElemFix;
                     break;
+                }
                 case Wire::SequenceEnd:
                     break;
             }
