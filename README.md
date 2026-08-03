@@ -432,6 +432,44 @@ with `ok()` false. In a build compiled `-fno-exceptions` there is nothing to
 catch and the allocation failure terminates the process, exactly as any other
 allocation in such a build does — nest below the inline depth if that matters.
 
+### Heap-free destinations
+
+The stream never allocates the *destination* — but `std::string` and
+`std::vector` do, for their own storage. Where a schema bounds a field, three
+containers hold the value inline instead, and the typed reads accept them
+alongside the growable ones:
+
+| Field | growable | heap-free |
+|---|---|---|
+| `string`, `maxlen M` | `std::string` | `sofab::FixedString<M>` |
+| `blob`, `maxlen M` | `std::vector<uint8_t>` | `sofab::FixedBytes<M>` |
+| `array`, `count N` | `std::vector<T>` | `sofab::InlineVector<T, N>` |
+
+```cpp
+sofab::FixedString<24>                       name;    // maxlen 24
+sofab::InlineVector<sofab::FixedString<8>, 4> tags;   // count 4, maxlen 8
+
+case 1: is.readString(name, 24); break;               // same call either way
+case 2: { sofab::StringSeq c{tags, 4, 8}; is.read(c); } break;
+```
+
+The call sites are spelled identically for both storage kinds — `readString`,
+`readBlob` and `readArray` pick the branch off the destination's own capabilities,
+and the collectors deduce their container — so switching a field's storage is a
+change of member type and nothing else. The wire is unaffected in both directions.
+
+Semantics are unchanged too: a payload past the declared bound is `INVALID`
+(§7.1) rather than truncated, and so is one past the container's capacity when no
+bound was declared; a wire-type mismatch still skips the field and leaves the
+destination untouched (§7.3); strict UTF-8 still rejects. What changes is only
+that a decode into fully bounded fields performs **no allocation at all** —
+`test_roundtrip.cpp`'s `heapFreeStorage()` checks that against the `operator new`
+counter rather than asserting it.
+
+These three types are deliberately identical, in name and behaviour, to
+`corelib-c-cpp`'s, so generated code for a bounded field is the same whichever C++
+corelib it targets.
+
 ## Feature flags
 
 **Almost none.** This header-only C++20 port always compiles the full wire
