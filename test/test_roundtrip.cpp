@@ -432,6 +432,79 @@ static void malformedInput()
         CHECK(r.code() == sofab::Error::InvalidMessage, "malformed: field id above ID_MAX rejected");
     }
 
+    /* --- §4.9/§6.2: the ID_MAX ceiling does NOT reach a sequence-end marker
+     * (Crucible F-0054, issue #68). The marker's id is discarded rather than used,
+     * so there is no value space to bound: an end header carrying ANY id is
+     * accepted and normalized away, and the encoder re-emits the canonical 0x07.
+     * The ceiling above still binds every value-bearing header, which the negative
+     * controls at the end of this block pin down. */
+    {
+        /* The reproducer: id 14 (undeclared) opened as a sequence, closed by an end
+         * marker whose id is 2^31 — one past ID_MAX. Accepted; nothing decodes. */
+        const uint8_t bytes[] = {0x76, 0x87, 0x80, 0x80, 0x80, 0x40};
+        sofab::IStreamObject<ScalarMsg> in;
+        auto r = in.feed(bytes, sizeof bytes);
+        CHECK(r.complete() && r.code() == sofab::Error::None,
+              "F-0054: over-ID_MAX id on a sequence end is accepted, not INVALID");
+        CHECK((*in).a == 0 && (*in).s.empty(),
+              "F-0054: the skipped subtree leaves the message empty");
+    }
+    {
+        /* Same marker, but the sequence is skipped from inside a nested one: every
+         * decode surface walks the subtree through the same header path. */
+        const uint8_t bytes[] = {0x76, 0x76, 0x87, 0x80, 0x80, 0x80, 0x40, 0x07, 0x08, 0x2a};
+        sofab::IStreamObject<ScalarMsg> in;
+        auto r = in.feed(bytes, sizeof bytes);
+        CHECK(r.complete(), "F-0054: over-ID_MAX end inside a nested skipped sequence is accepted");
+        CHECK((*in).a == 42, "F-0054: the decoder resyncs on the field after the subtree");
+    }
+    {
+        /* The marker re-encodes as the canonical single byte 0x07 (§4.9, encode
+         * direction) — the encoder has no way to express any other id. */
+        sofab::OStreamInline<64> os;
+        os.sequenceBeginLazy(14).sequenceEndKeep();
+        CHECK(os.bytesUsed() == 2 && os.data()[0] == 0x76 && os.data()[1] == 0x07,
+              "F-0054: a sequence end is always re-encoded as 0x07");
+    }
+    {
+        /* Controls — these already passed before the fix and must keep passing:
+         * a canonical end, a small non-zero id, and an id exactly AT ID_MAX. */
+        struct Ctl { const uint8_t *bytes; size_t len; const char *what; };
+        const uint8_t canonical[] = {0x76, 0x07};                         /* id 0      */
+        const uint8_t idSmall[]   = {0x76, 0x1f};                         /* id 3      */
+        const uint8_t idAtMax[]   = {0x76, 0xff, 0xff, 0xff, 0xff, 0x3f}; /* id 2^31-1 */
+        const Ctl controls[] = {
+            {canonical, sizeof canonical, "F-0054 control: canonical 0x07 sequence end accepted"},
+            {idSmall,   sizeof idSmall,   "F-0054 control: small non-zero sequence-end id accepted"},
+            {idAtMax,   sizeof idAtMax,   "F-0054 control: sequence-end id at ID_MAX accepted"},
+        };
+        for (const Ctl &c : controls)
+        {
+            sofab::IStreamObject<ScalarMsg> in;
+            auto r = in.feed(c.bytes, c.len);
+            CHECK(r.complete() && r.code() == sofab::Error::None, c.what);
+        }
+    }
+    {
+        /* Negative control: the ceiling still binds a VALUE-BEARING header, inside
+         * a skipped subtree exactly as at the top level (§6.2). Lifting it for the
+         * end marker must not lift it here. */
+        const uint8_t bytes[] = {0x76, 0x80, 0x80, 0x80, 0x80, 0x40, 0x05, 0x07};
+        sofab::IStreamObject<ScalarMsg> in;
+        auto r = in.feed(bytes, sizeof bytes);
+        CHECK(r.code() == sofab::Error::InvalidMessage,
+              "F-0054 control: over-ID_MAX id on an UNSIGNED header is still INVALID when skipped");
+    }
+    {
+        /* Negative control: a dangling end at the root stays INVALID whatever id it
+         * carries — it is rejected for having no open sequence (§5.2), not for its id. */
+        const uint8_t bytes[] = {0x87, 0x80, 0x80, 0x80, 0x40};
+        sofab::IStreamObject<ScalarMsg> in;
+        auto r = in.feed(bytes, sizeof bytes);
+        CHECK(r.code() == sofab::Error::InvalidMessage,
+              "F-0054 control: an over-ID_MAX dangling sequence-end at the root is still INVALID");
+    }
+
     /* Skip an entire unread sub-sequence, then resync on the field after it. */
     {
         sofab::OStreamInline<256> os;

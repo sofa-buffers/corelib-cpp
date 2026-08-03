@@ -2154,13 +2154,29 @@ namespace sofab
                     (ovf ? error_ : incomplete_) = true;
                     return;
                 }
+                type_ = static_cast<Wire>(header & 0x7);
+                /* §4.9/§6.2: the end marker is settled BEFORE the ID_MAX ceiling,
+                 * because the ceiling does not govern it. `ID_MAX` bounds the id of
+                 * a VALUE-BEARING header -- unsigned, signed, fixlen, the array
+                 * types and sequence START. A sequence end's id is discarded rather
+                 * than used, so there is no value space to bound: an over-`ID_MAX`
+                 * id on an end marker is accepted and normalized away (the encoder
+                 * re-emits the canonical `0x07`), exactly as a non-minimal varint is
+                 * (§4.1). §4.1's own 64-bit varint bound still applies and has
+                 * already fired above, on an end marker as anywhere else -- what is
+                 * lifted here is only the ID_MAX *value* bound (Crucible F-0054,
+                 * corelib-cpp#68). */
+                if (type_ == Wire::SequenceEnd)
+                {
+                    if (stopAtEnd) return;
+                    error_ = true; return;
+                }
                 if ((header >> 3) > ID_MAX)
                 {
                     error_ = true;
                     return;
                 }
                 auto fieldId = static_cast<sofab::id>(header >> 3);
-                type_ = static_cast<Wire>(header & 0x7);
                 /* §5.1/§7: an element index at or past the declared count is
                  * INVALID -- but §7.3 decides first. An element header whose wire
                  * type (or, for a fixlen element type, whose fixlen subtype)
@@ -2185,18 +2201,12 @@ namespace sofab
                  * the bound to itself and enforces it in its deserialize. */
                 bool skipElem = false;     /* §7.3: not an element of this array */
                 bool boundPending = false; /* over-index, subtype not yet known */
-                if (elemBound_ >= 0 && elemWire_ >= 0 && type_ != Wire::SequenceEnd &&
+                if (elemBound_ >= 0 && elemWire_ >= 0 &&
                     static_cast<long>(fieldId) >= elemBound_)
                 {
                     if (static_cast<int>(type_) != elemWire_) { skipElem = true; ++skipped_; }
                     else if (type_ != Wire::Fixlen) { error_ = true; return; }
                     else boundPending = true; /* decided at the fixlen word */
-                }
-
-                if (type_ == Wire::SequenceEnd)
-                {
-                    if (stopAtEnd) return;
-                    error_ = true; return;
                 }
 
                 /* parse the metadata that precedes the payload */
@@ -2600,13 +2610,18 @@ namespace sofab
             bool ovf = false;
             if (!getVarint(p_, end_, header, &ovf))
             { if (ovf) error_ = true; else incomplete_ = true; return false; }
-            if ((header >> 3) > ID_MAX)
+            type_ = static_cast<Wire>(header & 0x7);
+            /* §4.9/§6.2: ID_MAX bounds a value-bearing header's id only -- a
+             * sequence end's id is discarded, so the ceiling does not reach it
+             * (F-0054, #68). An end marker here is a dangling end at the root and
+             * INVALID for that reason alone (§5.2), which the switch below decides
+             * on the same grounds whatever id it carries. */
+            if (type_ != Wire::SequenceEnd && (header >> 3) > ID_MAX)
             {
                 error_ = true;
                 return false;
             }
             fieldId_ = static_cast<sofab::id>(header >> 3);
-            type_ = static_cast<Wire>(header & 0x7);
             fixLen_ = 0; count_ = 0;
             switch (type_)
             {
@@ -3277,13 +3292,15 @@ namespace sofab
                 error_ = true;
                 return;
             }
-            if ((header >> 3) > ID_MAX)
+            type_ = static_cast<Wire>(header & 0x7);
+            /* §4.9/§6.2: ID_MAX does not bound a sequence end's id, which is
+             * discarded rather than used (F-0054, #68). */
+            if (type_ != Wire::SequenceEnd && (header >> 3) > ID_MAX)
             {
                 error_ = true;
                 return;
             }
             auto fieldId = static_cast<sofab::id>(header >> 3);
-            type_ = static_cast<Wire>(header & 0x7);
 
             fixLen_ = 0; count_ = 0;
             if (type_ == Wire::Fixlen)
