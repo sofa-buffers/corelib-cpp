@@ -2838,6 +2838,218 @@ static void skippedSubtreeSuspendsBound()
     }
 }
 
+/* --- heap-free storage: FixedString / FixedBytes / InlineVector as decode
+ *     destinations.
+ *
+ * The same schema may be lowered to growable containers or to the heap-free
+ * ones. Two properties have to hold for that choice to be a STORAGE decision
+ * and nothing more:
+ *
+ *   1. the wire is identical, in both directions;
+ *   2. the heap-free decode allocates nothing at all -- which is the whole
+ *      point, and is checked here against the operator-new counter rather
+ *      than asserted.
+ *
+ * Everything else is the ordinary spec behaviour, re-checked on the new
+ * destinations because they take a different branch inside readString /
+ * readBlob: §7.1 rejects an over-capacity payload instead of truncating it,
+ * §7.3 leaves a mis-typed field untouched, §5.1 places elements at their id,
+ * and strict UTF-8 still rejects. --- */
+
+/* Same message, twice: growable storage and heap-free storage. Field ids and
+ * declared bounds are identical, so the two must agree byte for byte. */
+struct DynStoreMsg : sofab::Message
+{
+    std::string name;                            /* id 1 -- maxlen 8  */
+    std::vector<uint8_t> sig;                    /* id 2 -- maxlen 4  */
+    std::vector<uint32_t> nums;                  /* id 3 -- count 4   */
+    std::vector<std::string> tags;               /* id 4 -- count 3, maxlen 2 */
+    std::vector<std::vector<uint8_t>> parts;     /* id 5 -- count 3, maxlen 2 */
+
+    sofab::OStreamImpl::Result serialize(sofab::OStreamImpl &os) const noexcept override
+    {
+        (void)os.write(1, std::string_view{name});
+        (void)os.write(2, sig.data(), static_cast<int32_t>(sig.size()));
+        (void)os.write(3, nums);
+        (void)os.sequenceBeginLazy(4);
+        for (size_t i = 0; i < tags.size(); ++i)
+            if (!tags[i].empty() || i + 1 == tags.size())
+                (void)os.write(static_cast<sofab::id>(i), std::string_view{tags[i]});
+        (void)os.sequenceEnd();
+        (void)os.sequenceBeginLazy(5);
+        for (size_t i = 0; i < parts.size(); ++i)
+            if (!parts[i].empty() || i + 1 == parts.size())
+                (void)os.write(static_cast<sofab::id>(i), parts[i].data(),
+                               static_cast<int32_t>(parts[i].size()));
+        return os.sequenceEnd();
+    }
+    void deserialize(sofab::IStreamImpl &is, sofab::id id, size_t, size_t) noexcept override
+    {
+        switch (id)
+        {
+            case 1: is.readString(name, 8); break;
+            case 2: is.readBlob(sig, 4); break;
+            case 3: is.readArray(nums, 4); break;
+            case 4: { sofab::StringSeq c{tags, 3, 2};  is.read(c); break; }
+            case 5: { sofab::BlobSeq   c{parts, 3, 2}; is.read(c); break; }
+        }
+    }
+};
+
+struct FixedStoreMsg : sofab::Message
+{
+    sofab::FixedString<8> name;
+    sofab::FixedBytes<4> sig;
+    sofab::InlineVector<uint32_t, 4> nums;
+    sofab::InlineVector<sofab::FixedString<2>, 3> tags;
+    sofab::InlineVector<sofab::FixedBytes<2>, 3> parts;
+
+    sofab::OStreamImpl::Result serialize(sofab::OStreamImpl &os) const noexcept override
+    {
+        (void)os.write(1, std::string_view{name});
+        (void)os.write(2, sig.data(), static_cast<int32_t>(sig.size()));
+        (void)os.write(3, nums);
+        (void)os.sequenceBeginLazy(4);
+        for (size_t i = 0; i < tags.size(); ++i)
+            if (!tags[i].empty() || i + 1 == tags.size())
+                (void)os.write(static_cast<sofab::id>(i), std::string_view{tags[i]});
+        (void)os.sequenceEnd();
+        (void)os.sequenceBeginLazy(5);
+        for (size_t i = 0; i < parts.size(); ++i)
+            if (!parts[i].empty() || i + 1 == parts.size())
+                (void)os.write(static_cast<sofab::id>(i), parts[i].data(),
+                               static_cast<int32_t>(parts[i].size()));
+        return os.sequenceEnd();
+    }
+    void deserialize(sofab::IStreamImpl &is, sofab::id id, size_t, size_t) noexcept override
+    {
+        switch (id)
+        {
+            case 1: is.readString(name, 8); break;
+            case 2: is.readBlob(sig, 4); break;
+            case 3: is.readArray(nums, 4); break;
+            case 4: { sofab::StringSeq c{tags, 3, 2};  is.read(c); break; }
+            case 5: { sofab::BlobSeq   c{parts, 3, 2}; is.read(c); break; }
+        }
+    }
+};
+
+static void heapFreeStorage()
+{
+    /* --- 1. the two storage modes produce the same bytes --- */
+    DynStoreMsg d;
+    d.name = "abcdefgh";
+    d.sig = {0xde, 0xad, 0xbe, 0xef};
+    d.nums = {1, 2, 300};
+    d.tags = {"ab", "", "cd"};
+    d.parts = {{0x01, 0x02}, {}, {0x03}};
+
+    FixedStoreMsg f;
+    f.name = "abcdefgh";
+    f.sig = {0xde, 0xad, 0xbe, 0xef};
+    f.nums = {1, 2, 300};
+    f.tags = {"ab", "", "cd"};
+    f.parts = {{0x01, 0x02}, {}, {0x03}};
+
+    uint8_t db[256], fb[256];
+    sofab::OStreamView dos{db, sizeof(db)}, fos{fb, sizeof(fb)};
+    CHECK(d.serialize(dos).code() == sofab::Error::None, "heapfree: dynamic encode succeeds");
+    CHECK(f.serialize(fos).code() == sofab::Error::None, "heapfree: fixed encode succeeds");
+    const std::string dHex = toHex({db, dos.bytesUsed()});
+    const std::string fHex = toHex({fb, fos.bytesUsed()});
+    CHECK(dHex == fHex, "heapfree: fixed storage encodes the same bytes as growable storage");
+
+    /* --- 2. decode into the heap-free destination allocates NOTHING --- */
+    FixedStoreMsg in;
+    const unsigned long before = g_allocCount;
+    {
+        sofab::IStreamObject<FixedStoreMsg> is;
+        CHECK(is.feed(fb, fos.bytesUsed()).complete(), "heapfree: decode completes");
+        CHECK((*is).name == std::string_view{"abcdefgh"}, "heapfree: FixedString value");
+        CHECK((*is).sig.size() == 4 && (*is).sig[0] == 0xde && (*is).sig[3] == 0xef,
+              "heapfree: FixedBytes value");
+        CHECK((*is).nums.size() == 3 && (*is).nums[2] == 300,
+              "heapfree: InlineVector native array keeps the wire length");
+        CHECK((*is).tags.size() == 3 && (*is).tags[0] == std::string_view{"ab"} &&
+                  (*is).tags[1].empty() && (*is).tags[2] == std::string_view{"cd"},
+              "heapfree: StringSeq places elements at their id and fills the gap");
+        CHECK((*is).parts.size() == 3 && (*is).parts[0].size() == 2 &&
+                  (*is).parts[1].empty() && (*is).parts[2].size() == 1,
+              "heapfree: BlobSeq places elements at their id and fills the gap");
+        in = *is;
+    }
+    CHECK(g_allocCount == before, "heapfree: decoding into heap-free storage allocates nothing");
+
+    /* Re-encoding what was decoded reproduces the wire exactly. */
+    sofab::OStreamView ros{db, sizeof(db)};
+    (void)in.serialize(ros);
+    CHECK(toHex({db, ros.bytesUsed()}) == fHex, "heapfree: decode -> encode round-trips byte-exact");
+
+    /* --- 3. §7.1: a payload past the destination's capacity is INVALID, never
+     *     truncated. `name` is FixedString<8>; feed nine characters with the
+     *     declared bound lifted so the capacity itself is what rejects. --- */
+    {
+        struct NoBoundMsg : sofab::IStreamMessage
+        {
+            sofab::FixedString<8> name;
+            void deserialize(sofab::IStreamImpl &is, sofab::id id, size_t, size_t) noexcept override
+            {
+                if (id == 1) is.readString(name); /* no declared maxlen */
+            }
+        };
+        uint8_t buf[64];
+        sofab::OStreamView os{buf, sizeof(buf)};
+        (void)os.write(1, std::string_view{"123456789"}); /* 9 > capacity 8 */
+        sofab::IStreamObject<NoBoundMsg> is;
+        CHECK(is.feed(buf, os.bytesUsed()).invalid(),
+              "heapfree: payload past FixedString capacity is INVALID, not truncated");
+        CHECK((*is).name.empty(), "heapfree: a rejected payload leaves the destination untouched");
+    }
+
+    /* --- 4. §7.3: a field whose wire type contradicts the declared one is
+     *     skipped and the heap-free destination is left alone. --- */
+    {
+        struct TypedMsg : sofab::IStreamMessage
+        {
+            sofab::FixedString<8> name{"keep"};
+            void deserialize(sofab::IStreamImpl &is, sofab::id id, size_t, size_t) noexcept override
+            {
+                if (id == 1) is.readString(name, 8);
+            }
+        };
+        uint8_t buf[64];
+        sofab::OStreamView os{buf, sizeof(buf)};
+        (void)os.write(1, static_cast<uint64_t>(7)); /* unsigned, not a string */
+        sofab::IStreamObject<TypedMsg> is;
+        CHECK(is.feed(buf, os.bytesUsed()).complete(),
+              "heapfree: a wire-type mismatch is a skip, not an error");
+        CHECK((*is).name == std::string_view{"keep"},
+              "heapfree: the skipped field leaves the heap-free destination untouched");
+    }
+
+#if SOFAB_STRICT_UTF8
+    /* --- 5. §6.4 still applies on the heap-free branch. --- */
+    {
+        struct Utf8Msg : sofab::IStreamMessage
+        {
+            sofab::FixedString<8> s;
+            void deserialize(sofab::IStreamImpl &is, sofab::id id, size_t, size_t) noexcept override
+            {
+                if (id == 5) is.readString(s, 8);
+            }
+        };
+        /* Built by hand: the encoder refuses to emit C0 80 at all
+         * (InvalidArgument, checked in strictUtf8()), so the wire has to come
+         * from stringFieldWire, exactly as the growable-destination case does. */
+        auto w = stringFieldWire("\xC0\x80", sofab::detail::Fix::String); /* overlong NUL */
+        sofab::IStreamObject<Utf8Msg> is;
+        CHECK(is.feed(w.data(), w.size()).invalid(),
+              "heapfree: invalid UTF-8 into a FixedString is INVALID");
+        CHECK((*is).s.empty(), "heapfree: the rejected UTF-8 payload is not stored");
+    }
+#endif
+}
+
 /* --- destination reuse across messages (MESSAGE_SPEC §2 + §5.1).
  *
  * §2 omits an all-default field, so a message that does not carry a field
@@ -3086,6 +3298,7 @@ int main()
     wrapperArrayCollectors();
     overIndexSkipOrdering();
     skippedSubtreeSuspendsBound();
+    heapFreeStorage();
     destinationReuse();
     varintWidthSweep();
 

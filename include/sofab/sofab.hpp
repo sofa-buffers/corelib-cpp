@@ -430,6 +430,571 @@ namespace sofab
     }
 
     /* ---------------------------------------------------------------------- */
+    /* Heap-free containers                                                   */
+    /* ---------------------------------------------------------------------- */
+
+    /*
+     * The storage a schema-bounded field lowers to when the caller asks for
+     * static storage (generator `allow_dynamic: false`). They are the destination
+     * side of the same contract std::string / std::vector satisfy, so the typed
+     * reads below accept either and one generated header shape serves both.
+     *
+     * These three types are DELIBERATELY identical, in name and behaviour, to
+     * corelib-c-cpp's: the generator emits the same `sofab::FixedString<N>` /
+     * `sofab::FixedBytes<N>` / `sofab::InlineVector<T,N>` member for a bounded
+     * field whichever C++ corelib is selected, so the storage decision stays a
+     * property of the schema rather than of the runtime. Any behavioural change
+     * here has to land in corelib-c-cpp too, or the two profiles stop agreeing on
+     * what a schema means.
+     */
+
+    /*!
+     * @brief Fixed-capacity, heap-free string of up to @p N characters.
+     *
+     * A drop-in, embedded-friendly stand-in for @c std::string on both the encode
+     * and decode paths. The characters live in an inline @c std::array, so an
+     * instance allocates nothing, never throws (overflow clamps to @p N), and
+     * compiles cleanly under @c -fno-exceptions / @c -fno-rtti. The buffer never
+     * moves, so an instance stays a valid decode destination across every
+     * @ref IStreamImpl::feed chunk.
+     *
+     * The storage is @c N+1 bytes: one extra slot always holds a trailing NUL so
+     * @ref c_str and the @c std::string_view encode path remain valid even at full
+     * length @p N. The buffer is zero-initialised, so the NUL is present from
+     * construction and is re-placed by every length-changing operation.
+     *
+     * @par Generator integration contract
+     * Generated code is spelled exactly as for @c std::string, so this type only
+     * has to keep the surface the typed calls look for:
+     *   - decode emits @c is.readString(s, maxlen); — @ref IStreamImpl::readString
+     *     picks the heap-free branch off @ref set_len / @ref capacity, rejects an
+     *     over-@p N payload as INVALID (§7.1) rather than truncating it, and fills
+     *     @ref data before fixing @ref size;
+     *   - encode emits @c os.write(id, s); — the implicit @ref operator std::string_view
+     *     routes it through the existing string encode branch, byte-for-byte
+     *     identical to the same-content @c std::string.
+     *
+     * @tparam N  Maximum number of characters (excluding the reserved NUL slot).
+     */
+    template <std::size_t N>
+    class FixedString
+    {
+        std::array<char, N + 1> buf_{};     //!< Inline storage (+1 for the NUL).
+        std::size_t len_ = 0;               //!< Current logical length (<= N).
+
+    public:
+        /*! @brief Character type (mirrors @c std::string). */
+        using value_type = char;
+        /*! @brief Size type (mirrors @c std::string). */
+        using size_type = std::size_t;
+
+        /*! @brief Construct an empty string. */
+        FixedString() noexcept = default;
+
+        /*!
+         * @brief Construct from a NUL-terminated C string (truncated to @p N).
+         * @param s  Source string, or @c nullptr for an empty string.
+         */
+        FixedString(const char *s) noexcept
+        {
+            assign(s ? std::string_view{s} : std::string_view{});
+        }
+
+        /*!
+         * @brief Construct from a string view (truncated to @p N).
+         * @param sv  Source characters (may contain embedded NULs).
+         */
+        FixedString(std::string_view sv) noexcept
+        {
+            assign(sv);
+        }
+
+        /*!
+         * @brief Construct from a @c std::string (the easy on-ramp; truncated to @p N).
+         * @param s  Source string.
+         */
+        FixedString(const std::string &s) noexcept
+        {
+            assign(std::string_view{s});
+        }
+
+        /*! @brief Assign from a NUL-terminated C string (truncated to @p N). */
+        FixedString &operator=(const char *s) noexcept
+        {
+            assign(s ? std::string_view{s} : std::string_view{});
+            return *this;
+        }
+
+        /*! @brief Assign from a string view (truncated to @p N). */
+        FixedString &operator=(std::string_view sv) noexcept
+        {
+            assign(sv);
+            return *this;
+        }
+
+        /*! @brief Assign from a @c std::string (truncated to @p N). */
+        FixedString &operator=(const std::string &s) noexcept
+        {
+            assign(std::string_view{s});
+            return *this;
+        }
+
+        /*!
+         * @brief Replace the contents with @p sv, truncated to @p N characters.
+         * @param sv  Source characters (may contain embedded NULs).
+         * @return Reference to @c *this.
+         */
+        FixedString &assign(std::string_view sv) noexcept
+        {
+            len_ = sv.size() > N ? N : sv.size();
+            for (std::size_t i = 0; i < len_; ++i)
+            {
+                buf_[i] = sv[i];
+            }
+            buf_[len_] = '\0';
+            return *this;
+        }
+
+        /*!
+         * @brief Decode hook: set the logical length and (re)place the trailing NUL.
+         *
+         * Fixes @c size() to the decoded payload length (clamped to @p N) and
+         * writes the NUL at @c buf_[len_]. @ref IStreamImpl::readString calls it
+         * after copying @c [0, size()) and never touches @c buf_[len_], so the NUL
+         * survives and @ref c_str stays valid. Re-decoding a shorter value
+         * re-terminates here. Its presence is also what marks this type as a
+         * heap-free destination to the typed reads (@c requires { set_len(...) }).
+         *
+         * @param n  Requested logical length (clamped to @p N).
+         */
+        void set_len(std::size_t n) noexcept
+        {
+            len_ = n > N ? N : n;
+            buf_[len_] = '\0';
+        }
+
+        /*! @brief Mutable pointer to the character buffer (decode target). */
+        char *data() noexcept { return buf_.data(); }
+        /*! @brief Const pointer to the character buffer. */
+        const char *data() const noexcept { return buf_.data(); }
+        /*! @brief NUL-terminated view of the contents. */
+        const char *c_str() const noexcept { return buf_.data(); }
+
+        /*! @brief Number of characters currently stored. */
+        std::size_t size() const noexcept { return len_; }
+        /*! @brief Alias of @ref size. */
+        std::size_t length() const noexcept { return len_; }
+        /*! @brief True if the string is empty. */
+        bool empty() const noexcept { return len_ == 0; }
+        /*! @brief Maximum number of characters (the template parameter @p N). */
+        static constexpr std::size_t capacity() noexcept { return N; }
+        /*! @brief Alias of @ref capacity. */
+        static constexpr std::size_t max_size() noexcept { return N; }
+
+        /*! @brief Access the character at @p i (no bounds checking). */
+        char &operator[](std::size_t i) noexcept { return buf_[i]; }
+        /*! @brief Access the character at @p i (no bounds checking). */
+        const char &operator[](std::size_t i) const noexcept { return buf_[i]; }
+
+        /*! @brief Iterator to the first character. */
+        char *begin() noexcept { return buf_.data(); }
+        /*! @brief Iterator past the last character. */
+        char *end() noexcept { return buf_.data() + len_; }
+        /*! @brief Const iterator to the first character. */
+        const char *begin() const noexcept { return buf_.data(); }
+        /*! @brief Const iterator past the last character. */
+        const char *end() const noexcept { return buf_.data() + len_; }
+
+        /*! @brief Reset to an empty string. */
+        void clear() noexcept
+        {
+            len_ = 0;
+            buf_[0] = '\0';
+        }
+
+        /*! @brief Non-owning view over the current characters. */
+        std::string_view view() const noexcept
+        {
+            return std::string_view{buf_.data(), len_};
+        }
+
+        /*!
+         * @brief Implicit conversion to @c std::string_view.
+         *
+         * Gives a cheap non-owning view and makes the existing string encode
+         * branch (@c OStreamImpl::write) match a @c FixedString automatically.
+         */
+        operator std::string_view() const noexcept
+        {
+            return view();
+        }
+
+        /*! @brief Copy the contents into an owning @c std::string (allocates). */
+        std::string str() const
+        {
+            return std::string{buf_.data(), len_};
+        }
+
+        /*! @brief Equality against any string view-like operand. */
+        bool operator==(std::string_view rhs) const noexcept
+        {
+            return view() == rhs;
+        }
+
+        /*! @brief Inequality against any string view-like operand. */
+        bool operator!=(std::string_view rhs) const noexcept
+        {
+            return view() != rhs;
+        }
+    };
+
+    /*!
+     * @brief Fixed-capacity, heap-free byte blob of up to @p N bytes.
+     *
+     * The embedded-friendly counterpart of @c std::vector<std::uint8_t> for blob
+     * fields, mirroring @ref FixedString for bytes. The payload lives in an inline
+     * @c std::array, so an instance allocates nothing and never throws (overflow
+     * clamps to @p N). The buffer never moves, so an instance stays a valid decode
+     * destination across every @ref IStreamImpl::feed chunk.
+     *
+     * A @b logical @b length (@ref size, @c <= @p N) is tracked separately from the
+     * capacity @p N: a blob shorter than its schema @c maxlen occupies only
+     * @ref size bytes on the wire. This is exactly why the type cannot be a plain
+     * @c std::array<std::uint8_t,N> (always length @p N) and must not reintroduce
+     * the heap of @c std::vector.
+     *
+     * @par Generator integration contract
+     * Generated code is spelled exactly as for @c std::vector<std::uint8_t>:
+     *   - encode passes @ref data / @ref size to the blob write, byte-for-byte
+     *     identical to the same-content vector;
+     *   - decode emits @c is.readBlob(b, maxlen); — @ref IStreamImpl::readBlob picks
+     *     the heap-free branch off @ref set_len / @ref capacity and rejects an
+     *     over-@p N wire length as INVALID per MESSAGE_SPEC §7.1 instead of
+     *     truncating it.
+     *
+     * @tparam N  Maximum number of bytes.
+     */
+    template <std::size_t N>
+    class FixedBytes
+    {
+        std::array<std::uint8_t, N> buf_{};     //!< Inline storage.
+        std::size_t len_ = 0;                   //!< Current logical length (<= N).
+
+    public:
+        /*! @brief Element type (mirrors @c std::vector). */
+        using value_type = std::uint8_t;
+        /*! @brief Size type (mirrors @c std::vector). */
+        using size_type = std::size_t;
+
+        /*! @brief Construct an empty blob. */
+        FixedBytes() noexcept = default;
+
+        /*!
+         * @brief Construct from a brace-enclosed list of bytes (truncated to @p N).
+         *
+         * Providing this constructor makes @c FixedBytes a non-aggregate, so a
+         * brace-init such as @c b = {1, 2, 3} routes through here and sets
+         * @ref size — it cannot silently fill the buffer while leaving the logical
+         * length at zero.
+         *
+         * @param init  Source bytes (excess beyond @p N is dropped).
+         */
+        FixedBytes(std::initializer_list<std::uint8_t> init) noexcept
+        {
+            assign(init);
+        }
+
+        /*! @brief Replace the contents from a brace-enclosed list (truncated to @p N). */
+        FixedBytes &operator=(std::initializer_list<std::uint8_t> init) noexcept
+        {
+            return assign(init);
+        }
+
+        /*! @brief Replace the contents from a brace-enclosed list (truncated to @p N). */
+        FixedBytes &assign(std::initializer_list<std::uint8_t> init) noexcept
+        {
+            len_ = 0;
+            for (std::uint8_t b : init)
+            {
+                if (len_ >= N)
+                {
+                    break;
+                }
+                buf_[len_++] = b;
+            }
+            return *this;
+        }
+
+        /*! @brief Mutable pointer to the byte buffer (decode target). */
+        std::uint8_t *data() noexcept { return buf_.data(); }
+        /*! @brief Const pointer to the byte buffer. */
+        const std::uint8_t *data() const noexcept { return buf_.data(); }
+
+        /*! @brief Number of bytes currently stored. */
+        std::size_t size() const noexcept { return len_; }
+        /*! @brief True if the blob is empty. */
+        bool empty() const noexcept { return len_ == 0; }
+        /*! @brief Maximum number of bytes (the template parameter @p N). */
+        static constexpr std::size_t capacity() noexcept { return N; }
+        /*! @brief Alias of @ref capacity. */
+        static constexpr std::size_t max_size() noexcept { return N; }
+
+        /*!
+         * @brief Decode hook: set the logical length (clamped to @p N).
+         *
+         * Called by generated decode before binding the buffer, so @ref size
+         * reports the field length and @ref data over that many bytes is the
+         * fill target.
+         *
+         * @param n  Requested logical length (clamped to @p N).
+         */
+        void set_len(std::size_t n) noexcept { len_ = n < N ? n : N; }
+
+        /*! @brief Reset to an empty blob. */
+        void clear() noexcept { len_ = 0; }
+
+        /*! @brief Append one byte (no-op once at capacity @p N). */
+        void push_back(std::uint8_t b) noexcept
+        {
+            if (len_ < N)
+            {
+                buf_[len_++] = b;
+            }
+        }
+
+        /*! @brief Access the byte at @p i (no bounds checking). */
+        std::uint8_t &operator[](std::size_t i) noexcept { return buf_[i]; }
+        /*! @brief Access the byte at @p i (no bounds checking). */
+        const std::uint8_t &operator[](std::size_t i) const noexcept { return buf_[i]; }
+
+        /*! @brief Iterator to the first byte. */
+        std::uint8_t *begin() noexcept { return buf_.data(); }
+        /*! @brief Iterator past the last byte. */
+        std::uint8_t *end() noexcept { return buf_.data() + len_; }
+        /*! @brief Const iterator to the first byte. */
+        const std::uint8_t *begin() const noexcept { return buf_.data(); }
+        /*! @brief Const iterator past the last byte. */
+        const std::uint8_t *end() const noexcept { return buf_.data() + len_; }
+
+        /*! @brief Content equality (same logical length and bytes). */
+        bool operator==(const FixedBytes &o) const noexcept
+        {
+            if (len_ != o.len_)
+            {
+                return false;
+            }
+            for (std::size_t i = 0; i < len_; ++i)
+            {
+                if (buf_[i] != o.buf_[i])
+                {
+                    return false;
+                }
+            }
+            return true;
+        }
+
+        /*! @brief Negated @ref operator==. */
+        bool operator!=(const FixedBytes &o) const noexcept { return !(*this == o); }
+    };
+
+    /*!
+     * @brief Fixed-capacity, heap-free sequence of up to @p N elements of type @p T.
+     *
+     * The embedded-friendly counterpart of @c std::vector<T> for every array a
+     * schema bounds with a @c count: native scalars as well as strings, blobs,
+     * structs/unions and nested arrays. Elements live in an inline
+     * @c std::array, so the storage never reallocates and an element being filled
+     * across @ref IStreamImpl::feed chunks stays address-stable — strictly safer
+     * than a @c std::vector + @c reserve.
+     *
+     * @ref resize is what marks this type as a resizable destination to
+     * @ref IStreamImpl::readArray, which sizes it to the wire element count. That
+     * count IS the array's length (MESSAGE_SPEC §3); @p N is the schema @c count,
+     * a capacity that bounds it and never adds to it.
+     *
+     * A @b logical @b length (@ref size, @c <= @p N) is tracked separately from the
+     * capacity @p N: an array shorter than its schema @c count holds only
+     * @ref size elements. This is why the type is neither a plain
+     * @c std::array<T,N> (always length @p N) nor a heap-backed @c std::vector.
+     *
+     * @warning Historically this was an aggregate with a public, default-zero
+     * length, so a natural brace-init such as @c v = {a, b, c} silently filled the
+     * storage while leaving the logical length at 0 — the field then encoded as
+     * empty. The @c initializer_list constructor/assignment below make the type a
+     * non-aggregate, so that brace-init now sets @ref size correctly instead of
+     * corrupting the wire.
+     *
+     * @tparam T  Element type.
+     * @tparam N  Maximum number of elements.
+     */
+    template <typename T, std::size_t N>
+    class InlineVector
+    {
+        std::array<T, N> buf_{};    //!< Inline storage.
+        std::size_t len_ = 0;       //!< Current logical length (<= N).
+
+    public:
+        /*! @brief Element type (mirrors @c std::vector). */
+        using value_type = T;
+        /*! @brief Size type (mirrors @c std::vector). */
+        using size_type = std::size_t;
+
+        /*! @brief Construct an empty sequence. */
+        InlineVector() noexcept = default;
+
+        /*!
+         * @brief Construct from a brace-enclosed list of elements (truncated to @p N).
+         *
+         * The presence of this constructor makes @c InlineVector a non-aggregate:
+         * @c v = {a, b, c} routes here and sets @ref size, instead of aggregate
+         * brace-init filling the storage while leaving the length at 0.
+         *
+         * @param init  Source elements (excess beyond @p N is dropped).
+         */
+        InlineVector(std::initializer_list<T> init) noexcept
+        {
+            assign(init);
+        }
+
+        /*! @brief Replace the contents from a brace-enclosed list (truncated to @p N). */
+        InlineVector &operator=(std::initializer_list<T> init) noexcept
+        {
+            return assign(init);
+        }
+
+        /*! @brief Replace the contents from a brace-enclosed list (truncated to @p N). */
+        InlineVector &assign(std::initializer_list<T> init) noexcept
+        {
+            len_ = 0;
+            for (const T &v : init)
+            {
+                if (len_ >= N)
+                {
+                    break;
+                }
+                buf_[len_++] = v;
+            }
+            return *this;
+        }
+
+        /*! @brief Number of elements currently stored. */
+        std::size_t size() const noexcept { return len_; }
+        /*! @brief True if the sequence is empty. */
+        bool empty() const noexcept { return len_ == 0; }
+        /*! @brief Maximum number of elements (the template parameter @p N). */
+        static constexpr std::size_t capacity() noexcept { return N; }
+        /*! @brief Alias of @ref capacity. */
+        static constexpr std::size_t max_size() noexcept { return N; }
+
+        /*! @brief No-op (inline storage never reallocates); present for API parity. */
+        void reserve(std::size_t) noexcept {}
+        /*! @brief Reset to an empty sequence (logical length only). */
+        void clear() noexcept { len_ = 0; }
+
+        /*!
+         * @brief Set the logical length to @p n, value-initializing what changes.
+         *
+         * The @c std::vector member of the container API this type mirrors, and the
+         * one @ref IStreamImpl::readArray and the wrapper-array collectors probe
+         * for: readArray *resizes* a resizable destination and *value-initializes*
+         * a fixed-extent one, and without this method an @c InlineVector matched
+         * neither — it fell to the fixed-extent branch, which assigned a
+         * default-constructed container and so set the logical length to 0. The
+         * decode then bound an empty span and dropped the array silently. With
+         * @ref resize present, readArray keeps ownership of the tag / bound /
+         * reset / bind order it documents, for inline storage too.
+         *
+         * Slots that enter or leave the logical range are set to @c T{}, so the
+         * elements a shorter value no longer covers cannot be observed through a
+         * later grow. @p n above the capacity @p N is clamped to @p N — the callers
+         * that can reject an over-capacity count do so before resizing (readArray
+         * checks the schema `count` first), and a heap-free container has nowhere
+         * to put the excess.
+         *
+         * @param n  New logical length.
+         */
+        void resize(std::size_t n) noexcept
+        {
+            if (n > N)
+            {
+                n = N;
+            }
+            for (std::size_t i = n; i < len_; ++i)
+            {
+                buf_[i] = T{};
+            }
+            for (std::size_t i = len_; i < n; ++i)
+            {
+                buf_[i] = T{};
+            }
+            len_ = n;
+        }
+
+        /*!
+         * @brief Append a default-constructed element and return a reference to it.
+         *
+         * The next inline slot is (re)set to @c T{} and bound; once at capacity
+         * @p N the last slot is reused so a decode never writes out of bounds.
+         * @return Reference to the newly active element.
+         */
+        T &emplace_back() noexcept
+        {
+            std::size_t i = len_ < N ? len_++ : N - 1;
+            buf_[i] = T{};
+            return buf_[i];
+        }
+
+        /*! @brief Append a copy of @p v (no-op growth once at capacity @p N). */
+        void push_back(const T &v) noexcept { emplace_back() = v; }
+        /*! @brief Append @p v by move (no-op growth once at capacity @p N). */
+        void push_back(T &&v) noexcept { emplace_back() = static_cast<T &&>(v); }
+
+        /*! @brief Reference to the last element. */
+        T &back() noexcept { return buf_[len_ - 1]; }
+        /*! @brief Const reference to the last element. */
+        const T &back() const noexcept { return buf_[len_ - 1]; }
+
+        /*! @brief Access the element at @p i (no bounds checking). */
+        T &operator[](std::size_t i) noexcept { return buf_[i]; }
+        /*! @brief Access the element at @p i (no bounds checking). */
+        const T &operator[](std::size_t i) const noexcept { return buf_[i]; }
+
+        /*! @brief Mutable pointer to the underlying storage. */
+        T *data() noexcept { return buf_.data(); }
+        /*! @brief Const pointer to the underlying storage. */
+        const T *data() const noexcept { return buf_.data(); }
+
+        /*! @brief Iterator to the first element. */
+        T *begin() noexcept { return buf_.data(); }
+        /*! @brief Iterator past the last element. */
+        T *end() noexcept { return buf_.data() + len_; }
+        /*! @brief Const iterator to the first element. */
+        const T *begin() const noexcept { return buf_.data(); }
+        /*! @brief Const iterator past the last element. */
+        const T *end() const noexcept { return buf_.data() + len_; }
+
+        /*! @brief Content equality (same logical length and elements). */
+        bool operator==(const InlineVector &o) const noexcept
+        {
+            if (len_ != o.len_)
+            {
+                return false;
+            }
+            for (std::size_t i = 0; i < len_; ++i)
+            {
+                if (!(buf_[i] == o.buf_[i]))
+                {
+                    return false;
+                }
+            }
+            return true;
+        }
+
+        /*! @brief Negated @ref operator==. */
+        bool operator!=(const InlineVector &o) const noexcept { return !(*this == o); }
+    };
+
+    /* ---------------------------------------------------------------------- */
     /* OStream                                                                */
     /* ---------------------------------------------------------------------- */
 
@@ -3087,29 +3652,62 @@ namespace sofab
          * @ref Fix::String, otherwise the field is left unconsumed — the decoder
          * then skips it exactly like an unknown id, and @ref skipped counts it.
          *
+         * The destination is either a growable one (`std::string`) or a heap-free
+         * @ref FixedString, told apart by @ref FixedString::set_len rather than by
+         * name, so a caller's own type works too. Both spell the call identically;
+         * only where the bytes land differs.
+         *
          * @param[out] value Destination for the decoded text.
+         * @param bound Declared `maxlen`, or negative when unbounded.
          * @return `true` when the value was read; `false` when the field was left
          *         for the decoder to skip.
          */
-        bool readString(std::string &value, long bound = -1) noexcept
+        template <typename S>
+        bool readString(S &value, long bound = -1) noexcept
         {
             if (!tagMatches(Wire::Fixlen, Fix::String)) return false;      /* §7.3 */
             if (bound >= 0 && fixLen_ > static_cast<size_t>(bound))        /* §7.1/§5.2 */
             { error_ = true; return false; }
-            return read(value);
+            if constexpr (requires { value.set_len(size_t{}); S::capacity(); })
+            {
+                /* A heap-free destination is sized by the schema, so a payload past
+                 * its capacity is the §7.1 reject -- never a silent truncation, and
+                 * never a resize. Checked before any byte is written, so a rejected
+                 * field leaves the destination alone (§7.4). */
+                if (fixLen_ > S::capacity()) { error_ = true; return false; }
+                if (static_cast<size_t>(end_ - p_) < fixLen_)
+                { incomplete_ = true; return false; }
+#if SOFAB_STRICT_UTF8
+                /* §6.4, same rule as the std::string branch of read(): the subtype
+                 * is already known to be Fix::String from tagMatches above, so no
+                 * second gate is needed here. */
+                if (!detail::utf8Valid(reinterpret_cast<const char *>(p_), fixLen_))
+                { error_ = true; return false; }
+#endif
+                std::memcpy(value.data(), p_, fixLen_);
+                value.set_len(fixLen_);
+                p_ += fixLen_;
+                consumed_ = true;
+                return true;
+            }
+            else return read(value);
         }
 
         /**
          * @brief Read the current field as a `blob`, or skip it (§7.3).
          *
          * The @ref Fix::Blob counterpart of @ref readString; reads straight into
-         * the byte container, with no intermediate `std::string`.
+         * the byte container, with no intermediate `std::string`. Takes a growable
+         * `std::vector<uint8_t>` or a heap-free @ref FixedBytes, on the same
+         * @ref FixedBytes::set_len test.
          *
          * @param[out] value Destination for the decoded bytes.
+         * @param bound Declared `maxlen`, or negative when unbounded.
          * @return `true` when the value was read; `false` when the field was left
          *         for the decoder to skip.
          */
-        bool readBlob(std::vector<uint8_t> &value, long bound = -1) noexcept
+        template <typename B>
+        bool readBlob(B &value, long bound = -1) noexcept
         {
             if (!tagMatches(Wire::Fixlen, Fix::Blob)) return false;
             if (bound >= 0 && fixLen_ > static_cast<size_t>(bound)) /* §7.1 */
@@ -3122,7 +3720,14 @@ namespace sofab
                 incomplete_ = true;
                 return false;
             }
-            value.assign(p_, p_ + fixLen_);
+            if constexpr (requires { value.set_len(size_t{}); B::capacity(); })
+            {
+                /* §7.1 over-capacity reject, as in readString. */
+                if (fixLen_ > B::capacity()) { error_ = true; return false; }
+                std::memcpy(value.data(), p_, fixLen_);
+                value.set_len(fixLen_);
+            }
+            else value.assign(p_, p_ + fixLen_);
             p_ += fixLen_;
             consumed_ = true;
             return true;
@@ -3498,10 +4103,18 @@ namespace sofab
      * — at the element header for an element type the header settles, and at the
      * fixlen word for a fixlen one, which is where a `string` element's subtype
      * becomes known.
+     *
+     * @tparam C Destination container. `std::vector<std::string>` for the growable
+     *           storage mode, `InlineVector<FixedString<M>, N>` for the heap-free
+     *           one; anything with `clear`/`size`/`emplace_back`/`operator[]` whose
+     *           `value_type` @ref readString accepts will do. Class template
+     *           argument deduction makes the spelling identical either way:
+     *           `sofab::StringSeq s{dst, count, maxlen}`.
      */
+    template <typename C = std::vector<std::string>>
     struct StringSeq : IStreamMessage
     {
-        std::vector<std::string> &out;
+        C &out;
         long cap;
         long emax;
 
@@ -3528,7 +4141,7 @@ namespace sofab
          * @param elemMax Element `maxlen`, or -1. A longer element is INVALID
          *                (§7.1), never truncated.
          */
-        explicit StringSeq(std::vector<std::string> &o, long capacity = -1, long elemMax = -1) noexcept
+        explicit StringSeq(C &o, long capacity = -1, long elemMax = -1) noexcept
             : out(o), cap(capacity), emax(elemMax) {}
 
         /**
@@ -3560,20 +4173,29 @@ namespace sofab
              * rather than INVALID, since there the subtype, and with it whether the
              * field is an element at all, is not yet decidable. */
             (void)size;
-            std::string s;
+            /* Read into a temporary first, and only then place it: a §7.3-skipped
+             * or §7.1-rejected element must leave the destination untouched, and
+             * growing the container here would change the array's length (§5.1,
+             * highest present id + 1). For the heap-free element types the
+             * temporary is a stack object, so this costs no allocation. */
+            typename C::value_type s{};
             if (!is.readString(s, emax)) return;
             while (out.size() <= static_cast<size_t>(id)) out.emplace_back();
-            out[id] = std::move(s);
+            out[static_cast<size_t>(id)] = std::move(s);
         }
     };
 
     /**
      * The `blob` counterpart of @ref StringSeq; see it for the placement and bound
      * rules.
+     *
+     * @tparam C Destination container — `std::vector<std::vector<uint8_t>>` or
+     *           `InlineVector<FixedBytes<M>, N>`; deduced from the constructor.
      */
+    template <typename C = std::vector<std::vector<uint8_t>>>
     struct BlobSeq : IStreamMessage
     {
-        std::vector<std::vector<uint8_t>> &out;
+        C &out;
         long cap;
         long emax;
 
@@ -3583,7 +4205,7 @@ namespace sofab
         static constexpr int elemFix = static_cast<int>(detail::Fix::Blob);
 
         /** @copydoc StringSeq::StringSeq */
-        explicit BlobSeq(std::vector<std::vector<uint8_t>> &o, long capacity = -1, long elemMax = -1) noexcept
+        explicit BlobSeq(C &o, long capacity = -1, long elemMax = -1) noexcept
             : out(o), cap(capacity), emax(elemMax) {}
 
         /** @copydoc StringSeq::prepare */
@@ -3592,10 +4214,11 @@ namespace sofab
         void deserialize(IStreamImpl &is, sofab::id id, size_t size, size_t) noexcept override
         {
             (void)size;
-            std::vector<uint8_t> b;
+            /* Temporary first, then place -- see StringSeq::deserialize. */
+            typename C::value_type b{};
             if (!is.readBlob(b, emax)) return; /* §7.3 + §7.1, see StringSeq */
             while (out.size() <= static_cast<size_t>(id)) out.emplace_back();
-            out[id] = std::move(b);
+            out[static_cast<size_t>(id)] = std::move(b);
         }
     };
 
