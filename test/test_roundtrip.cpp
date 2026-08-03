@@ -2838,6 +2838,148 @@ static void skippedSubtreeSuspendsBound()
     }
 }
 
+/* --- a nested field that runs out of bytes is unfinished, not declined
+ *     (Crucible F-0056, corelib-cpp#71).
+ *
+ * Inside a sequence, a field the callback did not read is skipped by rewinding to
+ * its payload and consuming it by length. A field whose bytes merely ran out looks
+ * the same from the outside -- both come back unconsumed -- but it must NOT take
+ * that path: the callback has already descended THROUGH the payload, so the
+ * current-field metadata (wire type, count, element size) now describes whatever
+ * innermost field the descent stopped at, and the rewind re-reads the outer bytes
+ * under it.
+ *
+ * The visible symptom is a verdict decided by bytes no decoder may look at. A
+ * fixlen array's payload is raw -- `count x elem_len` bytes consumed by length
+ * (§4.8) -- yet re-parsed as varints its CONTENT starts to matter: twelve
+ * continuation bytes (`ff`) exceed §4.1's 10-byte varint bound and turn a
+ * truncation that is plainly INCOMPLETE into INVALID, while the same twelve bytes
+ * with bit 7 clear in every fourth do not. Truncation inside a field that must be
+ * skipped is INCOMPLETE (§7, §7.3); the whole top-level field is buffered and
+ * delivered again.
+ *
+ * Wire layout: `a6 06` opens `arrays` (id 100), `56` opens `nested` (id 10), then
+ * `05 03 20` is a 3-element fp32 array at id 0, and `04 24` a mistyped ARRAY_SIGNED
+ * at that same id -- skipped under §7.3, and truncated where the bytes end. --- */
+
+struct F56Inner : sofab::IStreamMessage
+{
+    std::vector<float> vals; /* id 0 -- fp32 array, count 5 */
+    void deserialize(sofab::IStreamImpl &is, sofab::id id, size_t, size_t) noexcept override
+    {
+        if (id == 0) is.readArray(vals, 5);
+    }
+};
+struct F56Nested : sofab::IStreamMessage
+{
+    F56Inner inner; /* id 10 */
+    void deserialize(sofab::IStreamImpl &is, sofab::id id, size_t, size_t) noexcept override
+    {
+        if (id == 10) is.read(inner);
+    }
+};
+struct F56Msg : sofab::IStreamMessage
+{
+    F56Nested nested; /* id 100 */
+    void deserialize(sofab::IStreamImpl &is, sofab::id id, size_t, size_t) noexcept override
+    {
+        if (id == 100) is.read(nested);
+    }
+};
+
+static void truncatedNestedFieldIsNotDeclined()
+{
+    auto feed = [](const char *hex) {
+        sofab::IStreamObject<F56Msg> in;
+        auto w = fromHex(hex);
+        auto r = in.feed(w.data(), w.size());
+        return std::pair<sofab::IStreamImpl::Result, F56Msg>{r, *in};
+    };
+
+    /* ---- THE ISOLATE: the fp32 payload is twelve continuation bytes. ---- */
+    {
+        auto [r, m] = feed("a606 56 05 03 20 ffffffff ffffffff ffffffff 04 24 07 07");
+        (void)m;
+        CHECK(r.incomplete(), "F-0056: truncation inside a skipped field after a fixlen array is INCOMPLETE");
+    }
+    {   /* the other all-continuation payload: the float value is irrelevant */
+        auto [r, m] = feed("a606 56 05 03 20 80808080 80808080 80808080 04 24 07 07");
+        (void)m;
+        CHECK(r.incomplete(), "F-0056: an 0x80 payload reaches the same verdict");
+    }
+
+    /* ---- CONTROLS: identical length, element count and fixlen word -- only the
+     *      payload BYTES differ, and no payload byte may change a verdict. ---- */
+    {
+        auto [r, m] = feed("a606 56 05 03 20 ffffff7f ffffff7f ffffff7f 04 24 07 07");
+        (void)m;
+        CHECK(r.incomplete(), "F-0056 control: a terminator every fourth byte is the same verdict");
+    }
+    {   /* 1.0f, an entirely ordinary value */
+        auto [r, m] = feed("a606 56 05 03 20 0000803f 0000803f 0000803f 04 24 07 07");
+        (void)m;
+        CHECK(r.incomplete(), "F-0056 control: an ordinary float payload is the same verdict");
+    }
+    {   /* two elements: eight bytes stay under §4.1's varint bound */
+        auto [r, m] = feed("a606 56 05 02 20 ffffffff ffffffff 04 24 07 07");
+        (void)m;
+        CHECK(r.incomplete(), "F-0056 control: below the varint bound is the same verdict");
+    }
+
+    /* ---- the trailing field is not what makes it INCOMPLETE: with the array
+     *      complete and nothing truncated, the same bytes decode. ---- */
+    {
+        auto [r, m] = feed("a606 56 05 03 20 0000803f 00000040 00004040 07 07");
+        CHECK(r.complete(), "F-0056 control: the untruncated message is COMPLETE");
+        CHECK(m.nested.inner.vals.size() == 3 && m.nested.inner.vals[0] == 1.0f &&
+              m.nested.inner.vals[1] == 2.0f && m.nested.inner.vals[2] == 3.0f,
+              "F-0056 control: the fp32 elements decode");
+    }
+
+    /* ---- nor is §7.3: an UNKNOWN id (7) truncated in the same place is a
+     *      different reason to skip, same shape, same verdict. ---- */
+    {
+        auto [r, m] = feed("a606 56 05 03 20 ffffffff ffffffff ffffffff 3c 24 07 07");
+        (void)m;
+        CHECK(r.incomplete(), "F-0056: an unknown id truncated after the array is INCOMPLETE too");
+    }
+
+    /* ---- INCOMPLETE means resumable: the buffered field is delivered again and
+     *      the message completes when the missing bytes arrive. ---- */
+    {
+        sofab::IStreamObject<F56Msg> in;
+        auto head = fromHex("a606 56 05 03 20 ffffffff ffffffff ffffffff 04 24 07 07");
+        /* 34 more single-byte elements finish the 36-element skipped array */
+        std::vector<uint8_t> tail(34, 0x01);
+        tail.push_back(0x07);
+        tail.push_back(0x07);
+        CHECK(in.feed(head.data(), head.size()).incomplete(),
+              "F-0056: the truncated tail is buffered, not rejected");
+        CHECK(in.feed(tail.data(), tail.size()).complete(),
+              "F-0056: the skipped array completes on the next feed");
+        CHECK((*in).nested.inner.vals.size() == 3,
+              "F-0056: the fp32 array before it survives the re-delivery");
+    }
+
+    /* ---- and byte at a time, which drives the resume path on every boundary. ---- */
+    {
+        sofab::IStreamObject<F56Msg> in;
+        auto w = fromHex("a606 56 05 03 20 0000803f 00000040 00004040 04 02 0101 0707");
+        bool sawInvalid = false;
+        sofab::DecodeStatus last = sofab::DecodeStatus::Incomplete;
+        for (uint8_t b : w)
+        {
+            auto r = in.feed(&b, 1);
+            if (r.invalid()) sawInvalid = true;
+            last = r.status();
+        }
+        CHECK(!sawInvalid, "F-0056: dribbled byte by byte, no chunk boundary is INVALID");
+        CHECK(last == sofab::DecodeStatus::Complete, "F-0056: the dribbled message ends COMPLETE");
+        CHECK((*in).nested.inner.vals.size() == 3 && (*in).nested.inner.vals[2] == 3.0f,
+              "F-0056: the dribbled decode produces the same values");
+    }
+}
+
 /* --- heap-free storage: FixedString / FixedBytes / InlineVector as decode
  *     destinations.
  *
@@ -3298,6 +3440,7 @@ int main()
     wrapperArrayCollectors();
     overIndexSkipOrdering();
     skippedSubtreeSuspendsBound();
+    truncatedNestedFieldIsNotDeclined();
     heapFreeStorage();
     destinationReuse();
     varintWidthSweep();

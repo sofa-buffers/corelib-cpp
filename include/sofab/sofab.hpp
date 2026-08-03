@@ -2712,6 +2712,7 @@ namespace sofab
                 if (maxBufferedField_ != SIZE_MAX && fieldStart_ &&
                     exceedsBuffer(static_cast<size_t>(p_ - fieldStart_), 0))
                 { limitExceeded_ = true; return; }
+                const uint8_t *fieldStart = p_;
                 uint64_t header;
                 bool ovf = false;
                 if (!getVarint(p_, end_, header, &ovf))
@@ -2835,6 +2836,23 @@ namespace sofab
                 /* a §7.3-skipped element is never delivered; leaving it unconsumed
                  * runs it through the same skip as an unknown id. */
                 if (!skipElem) cb(fieldId, fixLen_, count_);
+                /* §7: the bytes ran out INSIDE this field -- it is unfinished, not
+                 * declined, and the two must not be confused. The skip below is for
+                 * a field the callback did not want; running it here would rewind
+                 * to a payload the callback has already parsed *into* and re-read
+                 * those bytes under the metadata (@ref type_, @ref count_,
+                 * @ref fixLen_) of whatever innermost field the descent left behind
+                 * -- so a fixlen array's raw payload gets re-parsed as varints and a
+                 * truncation is reported INVALID, decided by payload bytes a
+                 * length-consuming reader must never look at (Crucible F-0056,
+                 * corelib-cpp#71). The whole top-level field is buffered and
+                 * delivered again once the rest arrives, so this level is simply
+                 * abandoned where it began. */
+                if (incomplete_)
+                {
+                    p_ = fieldStart;
+                    return;
+                }
 
                 if (!consumed_)
                 {
