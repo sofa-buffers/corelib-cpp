@@ -3836,14 +3836,23 @@ namespace sofab
          *
          * @param dst Destination buffer.
          * @param maxlen Capacity of @p dst in bytes.
-         * @return Number of bytes copied (`min(maxlen, payload length)`), or 0 on a truncated field.
+         * @return Number of bytes copied (`min(maxlen, payload length)`), or 0 when
+         *         the field was not consumed. Zero is therefore ambiguous on its own —
+         *         a zero-length blob also copies nothing — so a caller that needs to
+         *         tell them apart consults @ref consumed().
          */
         size_t read(void *dst, size_t maxlen) noexcept
         {
             size_t n = std::min(maxlen, fixLen_);
             if (static_cast<size_t>(end_ - p_) < fixLen_)
             {
-                error_ = true;
+                /* The payload has not fully arrived. That is INCOMPLETE, not an
+                 * error: more bytes may complete it, and the field is delivered
+                 * again once they do. Setting error_ here made a truncated blob
+                 * INVALID and — because the run is then condemned — unrecoverable
+                 * even after the remaining bytes arrived. Matches @ref readBlob and
+                 * @ref readString, which guard the identical condition. */
+                incomplete_ = true;
                 return 0;
             }
             std::memcpy(dst, p_, n);

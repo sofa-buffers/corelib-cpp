@@ -237,6 +237,50 @@ static void chunkedDecode()
     CHECK((*in).s == "chunked", "chunked s");
 }
 
+/* A truncated blob read through the RAW read(void*, size_t) overload is INCOMPLETE,
+ * not INVALID — and it recovers once the rest arrives.
+ *
+ * readBlob() and readString() guard the identical condition and have always set
+ * incomplete_; the raw overload set error_, which made a truncated payload INVALID
+ * *and* condemned the run, so the message never completed even after the remaining
+ * bytes were fed. Generated code never calls this overload (it uses readBlob), which
+ * is why nothing here covered it. */
+static void rawBlobReadTruncation()
+{
+    /* unsigned{0} = 7, then blob{1} = "ABCD" */
+    static const uint8_t msg[] = {0x00, 0x07, 0x0a, 0x23, 0x41, 0x42, 0x43, 0x44};
+
+    struct RawBlobMsg : sofab::IStreamMessage {
+        uint8_t dst[4];
+        size_t got = 0;
+        RawBlobMsg() { std::memset(dst, 0xEE, sizeof(dst)); }
+        void deserialize(sofab::IStreamImpl &is, sofab::id id, size_t, size_t) noexcept override
+        { if (id == 1) got = is.read(dst, sizeof(dst)); }
+    };
+
+    /* Cut after 4, 5 and 6: the header and the fixlen word are complete in the first
+     * feed, the payload is short. Cuts 2 and 3 land before the word and were already
+     * correct — they are kept as controls. */
+    for (size_t cut = 2; cut <= 6; ++cut)
+    {
+        sofab::IStreamObject<RawBlobMsg> in;
+        auto r1 = in.feed(msg, cut);
+        CHECK(!r1.ok() || cut == 2, "raw blob: a short payload is not COMPLETE");
+        CHECK(r1.incomplete() || cut == 2, "raw blob: a short payload is INCOMPLETE, not INVALID");
+
+        auto r2 = in.feed(msg + cut, sizeof(msg) - cut);
+        CHECK(r2.ok(), "raw blob: the message completes once the rest arrives");
+        CHECK((*in).got == 4, "raw blob: the whole payload is delivered after resuming");
+        CHECK(std::memcmp((*in).dst, "ABCD", 4) == 0, "raw blob: the payload bytes are correct");
+    }
+
+    /* The same field alone, truncated, in a single feed: INCOMPLETE, never INVALID. */
+    static const uint8_t lone[] = {0x0a, 0x23, 0x41, 0x42};
+    sofab::IStreamObject<RawBlobMsg> one;
+    CHECK(one.feed(lone, sizeof(lone)).incomplete(),
+          "raw blob: a lone truncated blob is INCOMPLETE");
+}
+
 static void skippingUnknownFields()
 {
     /* encode 3 fields; decode a message that only reads id 2 */
@@ -3419,6 +3463,7 @@ int main()
     roundtripArrays();
     roundtripNested();
     chunkedDecode();
+    rawBlobReadTruncation();
     skippingUnknownFields();
     malformedInput();
     threeValuedOutcomes();
