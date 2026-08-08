@@ -116,6 +116,17 @@ os.write(1, 42u)
 std::span<const uint8_t> msg{os.data(), os.bytesUsed()};
 ```
 
+An array field is written **whole**: every element the container holds reaches
+the wire, trailing default-valued ones included. A schema `count: N` is a
+capacity and the wire count `M` is the array's *length*, so `{1, 2, 3, 0, 0}`
+encodes as `M = 5` — narrowing it to its non-default prefix would send a
+different value (MESSAGE_SPEC §3, shared vector
+`array_unsigned_trailing_defaults`). Up to 0.10.0 the header also shipped a
+`sofab::trimTail` helper that performed exactly that narrowing; it implemented a
+superseded reading of §3 and has been **removed**. Neither this library nor
+generated code ever called it, so no call site needs porting — a caller that used
+it directly passes the container itself instead.
+
 ### Serialize stream
 
 When the message is larger than the buffer, give the stream a flush callback: the

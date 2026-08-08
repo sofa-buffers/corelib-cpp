@@ -4050,9 +4050,10 @@ namespace sofab
          *    schema governs and the verdict stays step 2's `INVALID`.
          * 4. **Reset, then fill.** The destination is resized (dynamic container) or
          *    value-initialized (fixed extent) only now, so an occurrence skipped at
-         *    step 1 cannot wipe a valid earlier one (§7.4). A fixed array is refilled
-         *    from the element default past the wire count, which is what the
-         *    trailing-default-run rule expects (§3).
+         *    step 1 cannot wipe a valid earlier one (§7.4). A destination pre-sized
+         *    to a declared `count: N` keeps the element default in the slots past
+         *    the wire count `M`, which is the array's length — there is no
+         *    fill-to-`N` and no trailing elision to undo (§3).
          * 5. **Declared element width** (@p elem, §7.1) → `INVALID`, per element as
          *    it is decoded. The sibling of the `count` bound at step 2: the same
          *    class of schema fact, arriving through the same call, and the reason it
@@ -4662,32 +4663,21 @@ namespace sofab
         }
     };
 
-    /**
-     * @brief Narrow a fixed-count array to its non-default prefix, for encode.
+    /* No encode-side trailing-default trim helper lives here, deliberately.
      *
-     * MESSAGE_SPEC §3: a `count: N` array's canonical encoding carries `M` = one
-     * past the last element that differs from the element default, and the decoder
-     * refills `[M, N)`. @ref OStreamImpl::write emits the whole container it is
-     * handed, so the value is narrowed to that prefix first. Only a declared
-     * `count: N` array is trimmed — a dynamic array has no N to refill from, so its
-     * trailing defaults are significant.
-     *
-     * The comparison is on the element's **byte image**, never `operator==`: a
-     * trailing `-0.0` compares equal to `0.0` but is not the default and must stay
-     * on the wire, and the same holds for any NaN payload.
-     *
-     * @param a Contiguous container of trivially-copyable elements.
-     * @return A span over `[0, M)`.
-     */
-    template <typename C>
-    std::span<const typename C::value_type> trimTail(const C &a) noexcept
-    {
-        using Elem = typename C::value_type;
-        const Elem zero{};
-        size_t n = a.size();
-        while (n > 0 && std::memcmp(&a[n - 1], &zero, sizeof(Elem)) == 0) --n;
-        return std::span<const Elem>(a.data(), n);
-    }
+     * A `trimTail` used to, narrowing a container to its non-default prefix
+     * before encode — the fill-to-`N` reading of MESSAGE_SPEC §3 that
+     * count-is-capacity superseded. Under the rule as it stands, a `count: N` is
+     * a capacity and the wire count `M` IS the array's length, so §3 states the
+     * opposite: "A default-valued element stays on the wire, trailing ones
+     * included — `M` is the length, so eliding one would shorten the array:
+     * `[1, 2, 3, 0, 0]` and `[1, 2, 3]` are different values and encode
+     * differently (`M = 5` and `M = 3`)." Trimming was therefore not a size
+     * optimization but silent data loss, and @ref OStreamImpl::write emitting the
+     * whole container it is handed is exactly right. The shared vector
+     * `array_unsigned_trailing_defaults` and trailingDefaultsStayOnTheWire() in
+     * test/test_roundtrip.cpp pin this; the latter also fails if such a helper is
+     * ever reintroduced into this namespace. */
 
 } // namespace sofab
 

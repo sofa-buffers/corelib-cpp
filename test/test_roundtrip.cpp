@@ -22,6 +22,8 @@
 #include <new>
 #include <span>
 #include <string>
+#include <type_traits>
+#include <utility>
 #include <vector>
 
 static int g_failures = 0;
@@ -3801,6 +3803,78 @@ static void varintWidthSweep()
     CHECK((*inc).v == vals, "varint sweep: byte-at-a-time decode recovers every value");
 }
 
+/* --- MESSAGE_SPEC §3: a compact scalar array carries EVERY element ---------
+ *
+ * "A default-valued element stays on the wire, trailing ones included — `M` is
+ * the length, so eliding one would shorten the array: `[1, 2, 3, 0, 0]` and
+ * `[1, 2, 3]` are different values and encode differently (`M = 5` and
+ * `M = 3`)." The shared vector `array_unsigned_trailing_defaults` pins the same
+ * rule; the encode assertions below restate it where a reader of this file will
+ * look for it.
+ *
+ * This header once shipped `sofab::trimTail`, a public helper that narrowed a
+ * container to its non-default prefix before encode — the fill-to-`N` reading of
+ * §3 that count-is-capacity superseded. Encoding through it turned a five-element
+ * array into a three-element one: silent data loss on the wire, not a size
+ * optimization. The probe below detects any such helper coming back: the
+ * variadic fallback is strictly less specialized than a real
+ * `trimTail(const C &)`, so partial ordering picks the real one whenever it
+ * exists and the return type stops being TrimTailAbsent. */
+
+namespace sofab {
+struct TrimTailAbsent {};
+template <typename... Ts> TrimTailAbsent trimTail(Ts &&...) noexcept { return {}; }
+} // namespace sofab
+
+struct TrailMsg : sofab::IStreamMessage
+{
+    std::vector<uint32_t> u;
+    std::vector<float> f;
+    void deserialize(sofab::IStreamImpl &is, sofab::id id, size_t, size_t count) noexcept override
+    {
+        /* `count` is the wire count M — the array's length. Sizing the
+         * destination from it is what makes a shortened M observable here. */
+        switch (id)
+        {
+            case 0: u.assign(count, 0); is.read(u); break;
+            case 1: f.assign(count, 0.0f); is.read(f); break;
+        }
+    }
+};
+
+static void trailingDefaultsStayOnTheWire()
+{
+    const bool trimHelperGone =
+        std::is_same_v<decltype(sofab::trimTail(std::declval<const std::vector<uint32_t> &>())),
+                       sofab::TrimTailAbsent>;
+    CHECK(trimHelperGone,
+          "MESSAGE_SPEC §3: no encode-side trailing-default trim helper exists");
+
+    /* [1, 2, 3, 0, 0] is M = 5, not M = 3 (the §3 example itself). */
+    checkEncode("array_trailing_defaults", "03050102030000", [](auto &os){
+        std::vector<uint32_t> a{1, 2, 3, 0, 0}; os.write(0, a); });
+    /* The shared vector array_unsigned_trailing_defaults, byte for byte. */
+    checkEncode("array_unsigned_trailing_defaults", "030401020000", [](auto &os){
+        std::vector<uint32_t> a{1, 2, 0, 0}; os.write(0, a); });
+    /* An all-default array is still its own length, never the empty array. */
+    checkEncode("array_all_defaults", "0303000000", [](auto &os){
+        std::vector<uint32_t> a{0, 0, 0}; os.write(0, a); });
+    /* Same for a fixlen element type: the trailing 0.0f slots keep their bytes. */
+    checkEncode("array_fp32_trailing_defaults", "0d03200000803f0000000000000000", [](auto &os){
+        std::vector<float> a{1.0f, 0.0f, 0.0f}; os.write(1, a); });
+
+    /* End to end: the peer recovers five elements, not three. */
+    sofab::OStreamInline<64> os;
+    std::vector<uint32_t> u{1, 2, 3, 0, 0};
+    std::vector<float> f{1.0f, 0.0f, 0.0f};
+    os.write(0, u).write(1, f);
+    sofab::IStreamObject<TrailMsg> in;
+    CHECK(in.feed(os.data(), os.bytesUsed()).complete(),
+          "trailing defaults: the message decodes COMPLETE");
+    CHECK((*in).u == u, "trailing defaults: the unsigned array keeps its length");
+    CHECK((*in).f == f, "trailing defaults: the fp32 array keeps its length");
+}
+
 /* --- ARRAY_MAX binds a fixlen array's element_count at EVERY nesting level
  *     (CORELIB_PLAN §4.8 step 1, §6.2). The top-level header path always
  *     enforced it; the nested one (dispatchLevel) did not, and the omission was
@@ -4456,6 +4530,7 @@ int main()
     heapFreeStorage();
     destinationReuse();
     varintWidthSweep();
+    trailingDefaultsStayOnTheWire();
     nestedArrayCountCeiling();
     minOutputBuffer();
     negativeBlobSize();
