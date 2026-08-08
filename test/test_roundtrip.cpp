@@ -3456,6 +3456,73 @@ static void varintWidthSweep()
     CHECK((*inc).v == vals, "varint sweep: byte-at-a-time decode recovers every value");
 }
 
+/* --- ARRAY_MAX binds a fixlen array's element_count at EVERY nesting level
+ *     (CORELIB_PLAN §4.8 step 1, §6.2). The top-level header path always
+ *     enforced it; the nested one (dispatchLevel) did not, and the omission was
+ *     not merely a missing INVALID: the skip computes `count * element_size`,
+ *     which wraps size_t for a large enough count, so the array was skipped as
+ *     though it were empty and a message that must be INVALID decoded COMPLETE.
+ *     The integer-array types were never affected — they carry no element size
+ *     to multiply by — which is why the two branches drifted apart. --- */
+
+static void nestedArrayCountCeiling()
+{
+    struct Nested : sofab::IStreamMessage {
+        void deserialize(sofab::IStreamImpl &, sofab::id, size_t, size_t) noexcept override {}
+    };
+    auto outcome = [](const std::vector<uint8_t> &b) {
+        sofab::IStreamObject<Nested> in;
+        return in.feed(b.data(), b.size()).code();
+    };
+
+    /* seq id1 { id0 = fixlen array, count = 2^31, fp32 elements } */
+    {
+        std::vector<uint8_t> b = {0x0e, 0x05};
+        appendVarint(b, uint64_t{1} << 31);          /* one past ARRAY_MAX */
+        b.push_back((4u << 3) | 0u);                 /* fp32, 4-byte elements */
+        b.push_back(0x07);
+        CHECK(outcome(b) == sofab::Error::InvalidMessage,
+              "nested fixlen array: count above ARRAY_MAX is INVALID");
+    }
+    /* The dangerous one: 2^62 elements x 4 bytes is exactly 2^64, so the byte
+     * span wraps to zero and the payload skip becomes a no-op. */
+    {
+        std::vector<uint8_t> b = {0x0e, 0x05};
+        appendVarint(b, uint64_t{1} << 62);
+        b.push_back((4u << 3) | 0u);
+        b.push_back(0x07);
+        CHECK(outcome(b) == sofab::Error::InvalidMessage,
+              "nested fixlen array: a count whose byte span wraps size_t is INVALID");
+    }
+    /* Same shape one level deeper, so the check is not merely on the first
+     * nested level. */
+    {
+        std::vector<uint8_t> b = {0x0e, 0x0e, 0x05};
+        appendVarint(b, uint64_t{1} << 62);
+        b.push_back((8u << 3) | 1u);                 /* fp64 */
+        b.push_back(0x07); b.push_back(0x07);
+        CHECK(outcome(b) == sofab::Error::InvalidMessage,
+              "nested fixlen array: the ceiling binds at depth 2 as well");
+    }
+    /* Control: a legal nested fixlen array is untouched by the new check. */
+    {
+        std::vector<uint8_t> b = {0x0e, 0x05, 0x02, (4u << 3) | 0u};
+        for (int i = 0; i < 8; ++i) b.push_back(0x00);
+        b.push_back(0x07);
+        CHECK(outcome(b) == sofab::Error::None,
+              "nested fixlen array: a legal two-element fp32 array still decodes");
+    }
+    /* Control: ARRAY_MAX itself is legal as a count -- the reject is above it,
+     * not at it. The payload never arrives, so this is INCOMPLETE, not INVALID. */
+    {
+        std::vector<uint8_t> b = {0x0e, 0x05};
+        appendVarint(b, sofab::ARRAY_MAX);
+        b.push_back((4u << 3) | 0u);
+        CHECK(outcome(b) == sofab::Error::Incomplete,
+              "nested fixlen array: a count of exactly ARRAY_MAX is not itself INVALID");
+    }
+}
+
 int main()
 {
     encodeVectors();
@@ -3489,6 +3556,7 @@ int main()
     heapFreeStorage();
     destinationReuse();
     varintWidthSweep();
+    nestedArrayCountCeiling();
 
     std::printf("\n%d checks, %d failures\n", g_checks, g_failures);
     return g_failures ? 1 : 0;
