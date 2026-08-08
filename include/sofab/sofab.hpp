@@ -3594,11 +3594,16 @@ namespace sofab
          * @brief Read the current field's value, dispatching on @p value's type.
          *
          * Call from inside a deliver callback. Handles integers (signed values are un-zig-zagged),
-         * `bool`, `float`, `double`, `std::string`, `std::string_view` (a view into
-         * the source bytes, valid while they live), nested @ref sofab::IStreamMessage objects,
-         * and writable contiguous ranges of integers or floats (excess wire
+         * `bool`, `float`, `double`, `std::string`, nested @ref sofab::IStreamMessage
+         * objects, and writable contiguous ranges of integers or floats (excess wire
          * elements past the span's capacity are read and discarded). On a malformed
          * or truncated field the stream's error flag is set.
+         *
+         * Every destination **owns** what it receives. There is deliberately no
+         * borrowing destination: a fed chunk is the caller's for the duration of
+         * @ref feed only (CORELIB_PLAN §6), so a decoded value must survive the
+         * caller reusing, overwriting or freeing that memory the moment `feed`
+         * returns.
          *
          * @tparam T Type to decode into.
          * @param[out] value Destination for the decoded value.
@@ -3650,33 +3655,29 @@ namespace sofab
             }
             else if constexpr (std::is_same_v<T, std::string_view>)
             {
-                /* §7.3: `string` and `blob` share Wire::Fixlen and both materialise
-                 * into this type, so only the wire type is checked here; a caller
-                 * that must separate the two calls @ref readString / @ref readBlob. */
-                if (!tagMatches(Wire::Fixlen)) return false;
-                /* the view points into the source buffer, valid as long as that
-                 * buffer (or this stream's accumulator) lives. */
-                if (static_cast<size_t>(end_ - p_) < fixLen_)
-                {
-                    incomplete_ = true;
-                    return false;
-                }
-#if SOFAB_STRICT_UTF8
-                /* §6.4: a materialised `string` (fixlen subtype String) whose
-                 * complete payload is not valid UTF-8 is the INVALID outcome —
-                 * surfaced via the sticky decode-error flag (same channel as
-                 * @ref invalidate), never a throw. The whole payload is present
-                 * here (an incomplete field is buffered, not delivered), so a
-                 * cross-chunk split stays INCOMPLETE and only a truncated-at-end
-                 * or malformed payload reaches this check. `blob` is never
-                 * validated; a skipped field never reaches read(). */
-                if (fixType_ == Fix::String &&
-                    !detail::utf8Valid(reinterpret_cast<const char *>(p_), fixLen_))
-                { error_ = true; return false; }
-#endif
-                value = std::string_view(reinterpret_cast<const char *>(p_), fixLen_);
-                p_ += fixLen_;
-                consumed_ = true;
+                /* Rejected on purpose, and rejected HERE so the diagnostic names
+                 * the replacement instead of surfacing as a span-deduction failure
+                 * further down (std::string_view satisfies the contiguous-range
+                 * branch below, whose error message would explain nothing).
+                 *
+                 * This destination used to exist and handed back a view into the
+                 * bytes just parsed. CORELIB_PLAN §6 borrows a fed chunk for the
+                 * duration of `feed` only: the caller may reuse or free it the
+                 * moment `feed` returns, and the decoded message MUST NOT be
+                 * affected — so a decoder that binds a `string`/`blob` destination
+                 * to chunk memory has to copy out before returning. The spec
+                 * exempts a one-shot `decode(buffer)`, where the caller keeps the
+                 * whole buffer alive across the call; this port has no such
+                 * separate entry point — `feed` is the only way in, and a one-shot
+                 * decode is just a single `feed` — so the exemption never applies
+                 * and there is no configuration in which the view is safe. */
+                static_assert(always_false_v<T>,
+                              "IStream::read() does not decode into std::string_view: a fed chunk is "
+                              "borrowed only for the duration of feed() (CORELIB_PLAN §6), so a view "
+                              "into it dangles as soon as feed() returns. Read into an owning "
+                              "destination instead — std::string, std::vector<uint8_t>, "
+                              "sofab::FixedString<N>, sofab::FixedBytes<N> — via read(), readString() "
+                              "or readBlob().");
             }
             else if constexpr (std::is_same_v<T, std::string>)
             {
