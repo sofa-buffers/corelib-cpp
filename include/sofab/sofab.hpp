@@ -1917,13 +1917,23 @@ namespace sofab
 
         /**
          * @brief Write a raw byte blob field.
+         *
+         * @p size is signed for symmetry with the generated accessors, but §6.2
+         * bounds a fixlen payload to `0 .. 2,147,483,647`: a negative length is
+         * outside the format and is refused with @ref Error::InvalidArgument
+         * (§6.3), emitting nothing, exactly as an unencodable `string` is. The
+         * guard has to sit here, before the conversion — `static_cast<size_t>`
+         * would turn `-1` into `SIZE_MAX` and the encoder would copy from
+         * @p value until the buffer filled, reading past the caller's object.
+         *
          * @param fieldId Field identifier; must not exceed @ref ID_MAX.
          * @param value Pointer to the bytes to copy.
-         * @param size Number of bytes to copy.
+         * @param size Number of bytes to copy; must not be negative.
          * @return A @ref Result carrying @ref Error::None on success, or the error encountered.
          */
         Result write(sofab::id fieldId, const void *value, int32_t size) noexcept
         {
+            if (size < 0) [[unlikely]] return Result{*this, Error::InvalidArgument};
             return Result{*this, writeFixlen(fieldId, Fix::Blob,
                           static_cast<const uint8_t *>(value), static_cast<size_t>(size))};
         }

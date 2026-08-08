@@ -3599,6 +3599,73 @@ static void minOutputBuffer()
     }
 }
 
+/* --- Negative blob length (§6.2/§6.3). The raw-blob overload takes a SIGNED
+ *     length, and §6.2 bounds a fixlen payload to 0 .. 2,147,483,647 — so a
+ *     negative argument is outside the format and §6.3 gives the encoder
+ *     InvalidArgument to refuse it with, exactly as the strict-UTF-8 check
+ *     refuses a string it cannot honour. Nothing in the contract lets the
+ *     encoder read memory the caller did not hand it.
+ *
+ *     Before the guard existed the size was cast straight to size_t: -1 became
+ *     SIZE_MAX, the contiguous-room test failed, and the byte-by-byte fallback
+ *     copied from the caller's object until the buffer filled — an
+ *     out-of-bounds read reported as BufferFull, with unrelated stack bytes
+ *     landing on the wire. --- */
+
+static void negativeBlobSize()
+{
+    /* The payload is deliberately tiny and the buffer large, so a copy that
+     * ignores the sign walks off the end of `payload` immediately. */
+    const char payload[] = "abc";
+
+    for (int32_t bad : {int32_t{-1}, int32_t{-4}, INT32_MIN})
+    {
+        sofab::OStreamInline<64> os;
+        auto r = os.write(sofab::id(1), static_cast<const void *>(payload), bad);
+        CHECK(r.code() == sofab::Error::InvalidArgument,
+              "negative blob size: refused with InvalidArgument, not BufferFull");
+        CHECK(os.bytesUsed() == 0,
+              "negative blob size: the rejected field emits nothing");
+        CHECK(os.ok(),
+              "negative blob size: the rejection is per-field, it does not condemn the stream");
+
+        /* The stream stays usable, and the next field is the FIRST field on the
+         * wire — proof that no header or payload byte of the rejected blob was
+         * emitted. */
+        auto r2 = os.write(sofab::id(1), static_cast<const void *>(payload), int32_t{3});
+        CHECK(r2.code() == sofab::Error::None && os.bytesUsed() == 5,
+              "negative blob size: a following valid blob encodes normally");
+        CHECK(toHex({os.data(), os.bytesUsed()}) == "0a1b616263",
+              "negative blob size: the following blob is the only field on the wire");
+    }
+
+    /* The same argument through a STREAMING installation. With a sink the
+     * byte-by-byte fallback never runs out of room, so an unguarded size_t
+     * conversion asks it for SIZE_MAX bytes: it reads the caller's object to
+     * destruction instead of stopping at BufferFull. */
+    {
+        std::vector<uint8_t> out;
+        uint8_t buf[32];
+        sofab::OStreamView os([&out](std::span<const uint8_t> d){ out.insert(out.end(), d.begin(), d.end()); },
+                              buf, sizeof buf, 0);
+        auto r = os.write(sofab::id(2), static_cast<const void *>(payload), int32_t{-1});
+        CHECK(r.code() == sofab::Error::InvalidArgument,
+              "negative blob size: refused on a streaming installation too");
+        os.flush();
+        CHECK(os.ok() && out.empty(),
+              "negative blob size: nothing is handed to the sink");
+    }
+
+    /* A zero length is legal and still emits the empty blob — the guard must
+     * reject `< 0`, not `<= 0`. */
+    {
+        sofab::OStreamInline<16> os;
+        auto r = os.write(sofab::id(1), static_cast<const void *>(nullptr), int32_t{0});
+        CHECK(r.code() == sofab::Error::None && toHex({os.data(), os.bytesUsed()}) == "0a03",
+              "negative blob size: a zero-length blob is still written");
+    }
+}
+
 /* --- The returning-flush-callback contract (§5.1). A sink either COPIES the
  *     bytes it was handed -- it returns without installing anything, and the
  *     encoder resumes in the same buffer at offset 0 -- or it TAKES the buffer
@@ -3829,6 +3896,7 @@ int main()
     varintWidthSweep();
     nestedArrayCountCeiling();
     minOutputBuffer();
+    negativeBlobSize();
     flushHandover();
     chunkLifetime();
 
