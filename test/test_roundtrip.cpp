@@ -493,6 +493,170 @@ static void malformedInput()
     }
 }
 
+/* --- INVALID and LimitExceeded are TERMINAL (CORELIB_PLAN §5.2, §6.3; #79).
+ *
+ *     §5.2's outcome table answers "can more bytes change it?" with "no —
+ *     terminal" for INVALID, and §6.3 calls LimitExceeded "a terminal,
+ *     receiver-local policy rejection". §7.2 item 4 turns that into a testable
+ *     property: feeding the same input one byte at a time, or in odd-sized
+ *     chunks, must produce a result IDENTICAL to feeding it all at once.
+ *
+ *     The verdict therefore belongs to the STREAM, not to the feed() that
+ *     happened to see the bad byte. Without a stream-level latch the two feed()
+ *     paths disagree: on the fast path (nothing buffered) the offending bytes
+ *     are not retained, so the next feed() starts from a clean slate and the
+ *     stream "recovers"; on the continuation path the same bytes sit in the
+ *     accumulator, are re-parsed and the verdict sticks. Whether a stream is
+ *     condemned then depends on where the chunk boundaries fell — and a sender
+ *     can prefix garbage and still be reported COMPLETE. --- */
+
+/* Feed `w` in fixed-size chunks and report the LAST feed's status plus what the
+ * message ended up holding. chunk == w.size() is the one-shot reference run. */
+static sofab::Error feedInChunks(const std::vector<uint8_t> &w, size_t chunk,
+                                 sofab::Limits limits, uint64_t &aOut)
+{
+    sofab::IStreamObject<ScalarMsg> in(limits);
+    sofab::Error last = sofab::Error::None;
+    for (size_t i = 0; i < w.size(); i += chunk)
+    {
+        const size_t n = w.size() - i < chunk ? w.size() - i : chunk;
+        last = in.feed(w.data() + i, n).code();
+    }
+    aOut = (*in).a;
+    return last;
+}
+
+static void terminalVerdictsAreLatched()
+{
+    /* id 1, unsigned = 42: perfectly good bytes appended after the bad ones. A
+     * decoder that forgets its verdict decodes them and reports COMPLETE. */
+    static const std::vector<uint8_t> good = {0x08, 0x2a};
+
+    /* ---- A: the bad byte lands on the fast path (nothing buffered). ---- */
+    {
+        sofab::IStreamObject<ScalarMsg> in;
+        const uint8_t bad[] = {0x0f}; /* id 1, sequence-end: stray end at the root */
+        CHECK(in.feed(bad, sizeof bad).code() == sofab::Error::InvalidMessage,
+              "terminal: a stray sequence-end is INVALID");
+        auto r = in.feed(good.data(), good.size());
+        CHECK(r.code() == sofab::Error::InvalidMessage,
+              "terminal: INVALID survives the next feed (§5.2 'no — terminal')");
+        CHECK(!r.complete() && !r.incomplete() && r.invalid(),
+              "terminal: the latched status is still INVALID, not COMPLETE");
+        CHECK((*in).a == 0, "terminal: no field is delivered after INVALID");
+    }
+
+    /* ---- B: the same bytes, bad byte on the continuation path. Both paths must
+     *         agree — this leg already passed before #79 and is the control. ---- */
+    {
+        sofab::IStreamObject<ScalarMsg> in;
+        const uint8_t head[] = {0x08};
+        const uint8_t tail[] = {0x2a, 0x0f};
+        CHECK(in.feed(head, sizeof head).code() == sofab::Error::Incomplete,
+              "terminal: a lone header buffers as INCOMPLETE");
+        CHECK(in.feed(tail, sizeof tail).code() == sofab::Error::InvalidMessage,
+              "terminal: the stray end is INVALID on the continuation path");
+        CHECK(in.feed(good.data(), good.size()).code() == sofab::Error::InvalidMessage,
+              "terminal: the continuation path also stays INVALID");
+    }
+
+    /* ---- C: LimitExceeded is terminal too (§6.3). ---- */
+    {
+        sofab::IStreamObject<ScalarMsg> in(sofab::Limits{8});
+        /* id 5, fixlen, (100 << 3) | String(2) = 802 -> a2 06: a 100-byte string
+         * declared over an 8-byte reassembly cap, payload never arrives. */
+        const uint8_t oversize[] = {0x2a, 0xa2, 0x06};
+        CHECK(in.feed(oversize, sizeof oversize).code() == sofab::Error::LimitExceeded,
+              "terminal: the claimed-oversize header is LimitExceeded");
+        auto r = in.feed(good.data(), good.size());
+        CHECK(r.code() == sofab::Error::LimitExceeded,
+              "terminal: LimitExceeded survives the next feed (§6.3 'terminal')");
+        CHECK(r.limitExceeded() && !r.complete(),
+              "terminal: the latched status is still LimitExceeded");
+        CHECK((*in).a == 0, "terminal: no field is delivered after LimitExceeded");
+    }
+
+    /* ---- D: reset() is the documented way back to a usable stream. ---- */
+    {
+        sofab::IStreamObject<ScalarMsg> in;
+        const uint8_t bad[] = {0x07};
+        CHECK(in.feed(bad, sizeof bad).invalid(), "terminal: bare stray end is INVALID");
+        in.reset();
+        auto r = in.feed(good.data(), good.size());
+        CHECK(r.complete(), "terminal: reset() clears the latched verdict");
+        CHECK((*in).a == 42, "terminal: the stream decodes again after reset()");
+    }
+    {
+        sofab::IStreamObject<ScalarMsg> in(sofab::Limits{8});
+        const uint8_t oversize[] = {0x2a, 0xa2, 0x06};
+        CHECK(in.feed(oversize, sizeof oversize).limitExceeded(), "terminal: oversize is LimitExceeded");
+        in.reset();
+        CHECK(in.feed(good.data(), good.size()).complete(),
+              "terminal: reset() clears the latched LimitExceeded too");
+        CHECK((*in).a == 42, "terminal: the capped stream decodes again after reset()");
+    }
+
+    /* ---- E: §7.2 item 4 as a property — for every malformed prefix, EVERY
+     *         chunking of `prefix ++ good` must agree with the one-shot run. ---- */
+    struct Bad { const char *name; std::vector<uint8_t> bytes; sofab::Limits limits; };
+
+    std::vector<uint8_t> overlong = {0x08};
+    for (int i = 0; i < 12; ++i) overlong.push_back(0x80);
+    overlong.push_back(0x01);
+
+    std::vector<uint8_t> unterminated = {0x08};
+    for (int i = 0; i < 11; ++i) unterminated.push_back(0x80);
+
+    std::vector<uint8_t> highBits = {0x08};
+    for (int i = 0; i < 9; ++i) highBits.push_back(0xff);
+    highBits.push_back(0x7f);
+
+    std::vector<uint8_t> tooDeep;
+    for (int i = 0; i <= 255; ++i) tooDeep.push_back(0x0e); /* 256 opens > MAX_DEPTH */
+
+    const std::vector<Bad> corpus = {
+        {"stray sequence-end (id 0)",        {0x07},                   {}},
+        {"stray sequence-end (id 1)",        {0x0f},                   {}},
+        {"dangling end after a field",       {0x08, 0x00, 0x7f},       {}},
+        {"overlong varint",                  overlong,                 {}},
+        {"unterminated overlong varint",     unterminated,             {}},
+        {"overlong varint, high 10th byte",  highBits,                 {}},
+        {"fp64 fixlen of length 11",         {0x56, 0x0a, 0x59},       {}},
+        {"reserved fixlen subtype",          {0x2a, 0x2c},             {}},
+        {"nesting past MAX_DEPTH",           tooDeep,                  {}},
+        {"claimed-oversize field",           {0x2a, 0xa2, 0x06},       sofab::Limits{8}},
+    };
+
+    for (const Bad &c : corpus)
+    {
+        std::vector<uint8_t> w = c.bytes;
+        w.insert(w.end(), good.begin(), good.end());
+
+        uint64_t aWhole = 0;
+        const sofab::Error whole = feedInChunks(w, w.size(), c.limits, aWhole);
+        CHECK(whole == sofab::Error::InvalidMessage || whole == sofab::Error::LimitExceeded,
+              "terminal: the one-shot verdict is terminal");
+        CHECK(aWhole == 0, "terminal: the trailing good field is not delivered one-shot");
+
+        bool agree = true;
+        for (size_t chunk = 1; chunk < w.size(); ++chunk)
+        {
+            uint64_t a = 0;
+            const sofab::Error got = feedInChunks(w, chunk, c.limits, a);
+            if (got != whole || a != aWhole)
+            {
+                agree = false;
+                std::printf("  %s: chunk %zu -> status %d (a=%llu), one-shot %d (a=%llu)\n",
+                            c.name, chunk, static_cast<int>(got),
+                            static_cast<unsigned long long>(a), static_cast<int>(whole),
+                            static_cast<unsigned long long>(aWhole));
+                break;
+            }
+        }
+        CHECK(agree, "terminal: every chunking agrees with the one-shot verdict (§7.2 item 4)");
+    }
+}
+
 /* --- three-valued decode outcome (spec §7): COMPLETE / INCOMPLETE / INVALID.
  *     There is no finish/finalize step — the same call reports all three, and
  *     INCOMPLETE is a first-class, non-error result, never folded into either
@@ -3871,6 +4035,7 @@ int main()
     rawBlobReadTruncation();
     skippingUnknownFields();
     malformedInput();
+    terminalVerdictsAreLatched();
     threeValuedOutcomes();
     callbackInvalidate();
     headerFirstBounds();

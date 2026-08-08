@@ -727,13 +727,37 @@ int main()
         if (nv.req & ~caps) { ++negSkipped; continue; }
 #if SOFAB_STRICT_UTF8
         ++negRun;
-        /* decode: the whole wire message must be rejected as INVALID. */
+        /* §5.2 makes INVALID terminal and §7.2 item 4 makes the chunked result
+         * identical to the one-shot one. So each negative vector is decoded twice —
+         * whole, and one byte at a time, which puts the offending payload on the
+         * other feed() path — and both runs then get a well-formed field appended:
+         * a rejected stream must not recover, whichever path condemned it
+         * (corelib-cpp#79). */
+        static const uint8_t goodTail[] = {0x08, 0x2a}; /* id 1, unsigned = 42 */
         {
             sofab::IStreamObject<NegReadMsg> in;
             auto r = in.feed(nv.serialized.data(), nv.serialized.size());
             run(r.code() == sofab::Error::InvalidMessage && r.status() == sofab::DecodeStatus::Invalid,
                 named(nv.name.c_str()), "utf8-decode-invalid",
                 "expected INVALID, got code " + std::to_string(static_cast<int>(r.code())));
+            auto r2 = in.feed(goodTail, sizeof goodTail);
+            run(r2.code() == sofab::Error::InvalidMessage,
+                named(nv.name.c_str()), "utf8-decode-invalid-terminal",
+                "an INVALID stream recovered when valid bytes followed, got code " +
+                    std::to_string(static_cast<int>(r2.code())));
+        }
+        {
+            sofab::IStreamObject<NegReadMsg> in;
+            sofab::Error last = sofab::Error::None;
+            for (uint8_t b : nv.serialized) last = in.feed(&b, 1).code();
+            run(last == sofab::Error::InvalidMessage,
+                named(nv.name.c_str()), "utf8-decode-invalid-chunked",
+                "expected INVALID byte-at-a-time, got code " + std::to_string(static_cast<int>(last)));
+            auto r2 = in.feed(goodTail, sizeof goodTail);
+            run(r2.code() == sofab::Error::InvalidMessage,
+                named(nv.name.c_str()), "utf8-decode-invalid-chunked-terminal",
+                "an INVALID chunked stream recovered when valid bytes followed, got code " +
+                    std::to_string(static_cast<int>(r2.code())));
         }
         /* encode: writing the raw payload as a string field must be refused. */
         {
