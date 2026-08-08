@@ -434,6 +434,35 @@ namespace sofab
             }
             return state == 0;
         }
+
+        /**
+         * @brief The element ceiling a decode destination @p T publishes, or `-1`
+         *        when it publishes none.
+         *
+         * The bound @ref IStreamImpl::readArray compares the wire count against
+         * before it fills anything (MESSAGE_SPEC §3): a heap-free destination that
+         * cannot reach the count must reject it, never truncate into it.
+         *
+         * Told apart by the destination's own capabilities rather than by name, so
+         * a caller's own container works too — a **static `capacity()`** is the
+         * ceiling (@ref InlineVector and friends: `resize` exists but clamps to
+         * `N`), everything else is treated as growable. `T::capacity()` is
+         * deliberately spelled as an unqualified static call: `std::vector`'s
+         * `capacity()` is a non-static member, so naming it this way is ill-formed
+         * and the requirement fails — exactly the growable / heap-free split
+         * @ref IStreamImpl::readString already keys on.
+         *
+         * A destination of **fixed extent that publishes nothing** (`std::array`,
+         * a bound span) is not covered here: that is @ref IStreamImpl::read's
+         * low-level contract, where the leading elements land in the destination
+         * and the rest is parsed only to stay framed.
+         */
+        template <typename T>
+        constexpr long destCapacity() noexcept
+        {
+            if constexpr (requires { T::capacity(); }) return static_cast<long>(T::capacity());
+            else                                       return -1;
+        }
     } // namespace detail
 
     /**
@@ -3959,8 +3988,14 @@ namespace sofab
          *    id; nothing else runs, so neither bound below can be applied to a field
          *    that is not this field's value.
          * 2. **Schema `count`** (§7.1/§5.2) → `INVALID`. Malformed input.
-         * 3. **Policy cap** (@p dynCap, generator#102) → `LimitExceeded`. A
-         *    receiver-side policy, deliberately *not* INVALID: the bytes are fine.
+         * 3. **Receiver capacity** → `LimitExceeded`. Two ceilings of one kind: the
+         *    configured policy cap (@p dynCap, generator#102), and — for a
+         *    destination that publishes one — its own capacity, so a count it
+         *    cannot hold is refused instead of silently truncated into it
+         *    (MESSAGE_SPEC §3). Deliberately *not* INVALID: the bytes are fine and
+         *    the same message decodes into a growable destination. The one
+         *    exception is a capacity passed *under* a declared `count`, where the
+         *    schema governs and the verdict stays step 2's `INVALID`.
          * 4. **Reset, then fill.** The destination is resized (dynamic container) or
          *    value-initialized (fixed extent) only now, so an occurrence skipped at
          *    step 1 cannot wipe a valid earlier one (§7.4). A fixed array is refilled
@@ -4008,6 +4043,34 @@ namespace sofab
             {
                 limitExceeded_ = true;
                 return false;
+            }
+            /* Step 3's second ceiling: the destination's own capacity. MESSAGE_SPEC
+             * §3 has a decoder materialize exactly the M elements the wire carries,
+             * "the same value on a pre-sized target and on a growable one", so a
+             * count a heap-free destination cannot hold is rejected here rather
+             * than truncated into it. Nothing downstream can catch it: an
+             * InlineVector's resize clamps to N and the fill then binds
+             * min(size, count) elements, parsing the surplus only to stay framed —
+             * the field is consumed and the decode reports COMPLETE with elements
+             * silently missing (issue #81). The same gate readString / readBlob
+             * already apply to a FixedString / FixedBytes payload.
+             *
+             * Which category depends on where the ceiling comes from. With no
+             * declared `count` the capacity is the receiver's own technical limit
+             * and the message is well-formed — the same bytes decode into a
+             * growable destination — so §6.2.1 / §6.3 make it LimitExceeded and
+             * forbid folding it into INVALID. With a `count` declared the schema
+             * governs (§7.1): a destination narrower than the bound it was
+             * generated for cannot hold a legal value either way, and the verdict
+             * stays the INVALID that the same field's over-count payload gets at
+             * step 2. */
+            if constexpr (constexpr long destCap = detail::destCapacity<T>(); destCap >= 0)
+            {
+                if (count_ > static_cast<size_t>(destCap))
+                {
+                    (schemaCount >= 0 ? error_ : limitExceeded_) = true;
+                    return false;
+                }
             }
             if constexpr (requires { dst.resize(count_); }) dst.resize(count_);
             else                                            dst = T{};

@@ -529,8 +529,26 @@ and the collectors deduce their container — so switching a field's storage is 
 change of member type and nothing else. The wire is unaffected in both directions.
 
 Semantics are unchanged too: a payload past the declared bound is `INVALID`
-(§7.1) rather than truncated, and so is one past the container's capacity when no
-bound was declared; a wire-type mismatch still skips the field and leaves the
+(§7.1) rather than truncated, and one past the container's own capacity is
+refused as well — a decode never drops what it cannot store and never reports
+`COMPLETE` with elements missing (MESSAGE_SPEC §3: a decoder materializes
+*exactly* the `M` elements the wire carries, "the same value on a pre-sized
+target and on a growable one"). The two refusals are terminal and leave the
+destination untouched, but they stay in **different categories**, because they
+say different things:
+
+| ceiling that was passed | outcome | why |
+|---|---|---|
+| a declared `maxlen` / `count` | `INVALID` | the schema makes the message malformed (§7.1) |
+| the destination's capacity, nothing declared | `readArray`: `LimitExceeded`<br>`readString` / `readBlob`: `INVALID` | the bytes are well-formed — the same message decodes into a growable destination — so an unbounded array reports the receiver-side category of CORELIB_PLAN §6.2.1, the one the configured `max_dyn_array_count` cap already uses |
+
+The check keys on the destination *publishing* a capacity, as the table's
+storage kinds do. A raw fixed-extent destination that publishes none — a plain
+`std::array`, a bound `std::span` — is the low-level `read()` contract instead:
+the leading elements land in it and the surplus is parsed only to keep the
+framing.
+
+A wire-type mismatch still skips the field and leaves the
 destination untouched (§7.3); strict UTF-8 still rejects. What changes is only
 that a decode into fully bounded fields performs **no allocation at all** —
 `test_roundtrip.cpp`'s `heapFreeStorage()` checks that against the `operator new`
