@@ -427,6 +427,17 @@ schema is unbounded. None of the three grows: at the buffer end the stream calls
 the flush callback with the filled bytes and continues; **without** a callback a
 full buffer yields `Error::BufferFull`.
 
+**A rejected argument never reaches the buffer.** A write the format cannot carry
+returns `Error::InvalidArgument` and emits *nothing* — a field ID above `ID_MAX`,
+nesting past `MAX_DEPTH`, a non-UTF-8 `string` under the strict check (above),
+and a **negative** length handed to the raw-blob overload
+`write(id, const void*, int32_t)`. That length is signed for symmetry with the
+generated accessors, but CORELIB_PLAN §6.2 bounds a fixlen payload to
+`0 .. 2,147,483,647`, so the sign is checked *before* the value is widened: the
+encoder never turns `-1` into a huge unsigned length and never reads past the
+object you handed it. Unlike the sticky `BufferFull`, such a rejection is
+per field — `ok()` stays true and the next write encodes normally.
+
 **`MIN_OUTPUT_BUFFER` is `1`.** That is the smallest buffer this port accepts
 **for streaming**, and it binds a buffer installed **together with a flush sink**
 — `buflen - offset` must be at least that much, checked where the buffer is
