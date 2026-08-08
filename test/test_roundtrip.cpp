@@ -3710,6 +3710,90 @@ static void flushHandover()
     }
 }
 
+/* --- Chunk lifetime (CORELIB_PLAN §6, §7.2 item 4): a fed chunk is borrowed
+ *     ONLY for the duration of the feed() call. Once it returns, the caller may
+ *     reuse, overwrite or free that memory and the decoded message must be
+ *     unaffected — so a decode copies every string and blob out before returning
+ *     rather than binding a destination to chunk memory.
+ *
+ *     Each chunk here is therefore handed in from a throwaway buffer that is
+ *     scrubbed with a fill byte the instant feed() returns. A decoder holding a
+ *     slice into it reads back the fill pattern, and nothing else in this file
+ *     would notice: the ordinary chunked tests feed from one long-lived buffer,
+ *     so a borrowed view stays accidentally valid there.
+ *
+ *     This is the property that cost read(std::string_view&) its place. That
+ *     destination handed back a view into the bytes just parsed, which §6 permits
+ *     only for a one-shot decode(buffer) whose buffer the caller keeps alive —
+ *     and this port has no such separate entry point, since feed() is the only
+ *     way in. It is now a compile error, so the guarantee below holds for every
+ *     destination the API still offers. --- */
+
+static void chunkLifetime()
+{
+    struct Payload : sofab::IStreamMessage
+    {
+        std::string s;
+        std::vector<uint8_t> b;
+        std::vector<uint64_t> a;
+        sofab::FixedString<32> fs;
+        void deserialize(sofab::IStreamImpl &is, sofab::id id, size_t, size_t) noexcept override
+        {
+            switch (id)
+            {
+                case 1: is.readString(s); break;
+                case 2: is.readBlob(b); break;
+                case 3: is.readArray(a); break;
+                case 4: is.readString(fs, 32); break;
+            }
+        }
+    };
+
+    /* Long enough that every field straddles several chunks at the small sizes
+     * below, so both the in-place path and the reassembly path are exercised. */
+    const std::string text(70, 'w');
+    std::vector<uint8_t> blob(90);
+    for (size_t i = 0; i < blob.size(); ++i) blob[i] = static_cast<uint8_t>(i * 7 + 1);
+    std::vector<uint64_t> nums;
+    for (uint64_t i = 0; i < 40; ++i) nums.push_back(i * 1234567u + i);
+
+    sofab::OStreamInline<1024> os;
+    os.write(1, text);
+    os.write(2, blob.data(), static_cast<int32_t>(blob.size()));   /* raw-blob overload: not chainable */
+    os.write(3, std::span<const uint64_t>(nums.data(), nums.size()))
+      .write(4, std::string_view{"fixed-storage destination"});
+    CHECK(os.ok(), "chunk lifetime: the reference message encodes");
+    const std::vector<uint8_t> msg(os.data(), os.data() + os.bytesUsed());
+
+    for (size_t chunk : {size_t{1}, size_t{3}, size_t{17}, msg.size()})
+    {
+        sofab::IStreamObject<Payload> in;
+        sofab::DecodeStatus last = sofab::DecodeStatus::Incomplete;
+        for (size_t i = 0; i < msg.size(); i += chunk)
+        {
+            const size_t n = std::min(chunk, msg.size() - i);
+            /* A fresh allocation per chunk, so the scrub cannot be optimised away
+             * and ASan flags a decoder that keeps the pointer past the call. */
+            std::vector<uint8_t> tmp(msg.begin() + static_cast<long>(i),
+                                     msg.begin() + static_cast<long>(i + n));
+            last = in.feed(tmp.data(), tmp.size()).status();
+            std::memset(tmp.data(), 0xDD, tmp.size());   /* the chunk is ours again */
+        }
+
+        const auto &m = *in;
+        const bool ok = last == sofab::DecodeStatus::Complete &&
+                        m.s == text &&
+                        m.b == blob &&
+                        m.a == nums &&
+                        m.fs == "fixed-storage destination";
+        if (!ok)
+            std::printf("  chunk size %zu: status=%d s=%zu/%zu b=%zu/%zu a=%zu/%zu\n",
+                        chunk, static_cast<int>(last), m.s.size(), text.size(),
+                        m.b.size(), blob.size(), m.a.size(), nums.size());
+        CHECK(ok, "chunk lifetime: the decoded message survives every chunk being scrubbed after feed");
+    }
+}
+
 int main()
 {
     encodeVectors();
@@ -3746,6 +3830,7 @@ int main()
     nestedArrayCountCeiling();
     minOutputBuffer();
     flushHandover();
+    chunkLifetime();
 
     std::printf("\n%d checks, %d failures\n", g_checks, g_failures);
     return g_failures ? 1 : 0;

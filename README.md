@@ -89,7 +89,7 @@ where the whole message is already in contiguous memory.
 | Goal | How |
 |------|-----|
 | Fast encode | Payloads written with a single `memcpy`; a field's header + value varints emitted as one write; whole float arrays copied in one shot on little-endian. |
-| Fast decode | The common case parses **without allocating** — the cursor walks the caller's buffer in place; float arrays bulk-`memcpy`'d; `std::string_view` reads return views into the parsed bytes (the caller's buffer, or the stream's accumulator for a field reassembled across `feed()`s). |
+| Fast decode | The *parse* allocates nothing — the cursor walks the caller's buffer in place, and only an incomplete trailing field is ever buffered; float arrays are bulk-`memcpy`'d; a `string`/`blob` payload is copied straight into the destination, with no intermediate representation. |
 | Still streamable | `OStream`/`OStreamInline` flush a small buffer via callback; `feed()` dispatches each complete top-level field and buffers only an incomplete tail. |
 | Modern C++ | `std::span`, `std::bit_cast`, concepts, `if constexpr` `write()`/`read()` deduction, `[[nodiscard]]`. Little-endian handled explicitly. |
 
@@ -241,7 +241,8 @@ A SofaBuffers `string` carries UTF-8 text; `blob` is the type for opaque bytes
 
 - **encode** — `write(id, string_view)` for a non-UTF-8 value returns
   `Error::InvalidArgument` and emits nothing;
-- **decode** — a materialised (`read` into `std::string` / `std::string_view`)
+- **decode** — a materialised (`read` / `readString` into `std::string` or
+  `sofab::FixedString<N>`)
   `string` whose complete payload is not valid UTF-8 is the `INVALID` outcome
   (`Error::InvalidMessage` / `DecodeStatus::Invalid`), surfaced through the same
   sticky-error channel as `invalidate()`.
@@ -395,20 +396,24 @@ of the C (`corelib-c-cpp`) port.
 message handed in at once) the cursor walks straight over the caller's contiguous
 `buf`, allocating and copying nothing.
 
-- `read(std::string_view&)` returns a view that **points directly into `buf`** —
-  valid only while that buffer stays alive and unmodified; outliving it is a
-  dangling-view bug. Use `read(std::string&)` for an owning copy.
+- **A fed chunk is yours again the moment `feed()` returns.** Every destination
+  owns what it receives: a `string` or `blob` is copied out before the call
+  returns, so you may reuse, overwrite or free the chunk immediately and the
+  decoded message is unaffected. There is deliberately **no** borrowing
+  destination — `read(std::string_view&)` does not exist, and asking for one is a
+  compile error that names the owning alternatives.
 - Integer/float arrays decode into the caller-provided `span`/container (float
   arrays via a single `memcpy` on little-endian); `read(void* dst, size_t maxlen)`
   copies a blob out. The stream never allocates the destination.
 - If a `feed()` chunk ends mid-field, only that trailing field is copied into an
-  internal accumulator and re-parsed on the next `feed()`; views from a stitched
-  field then point into that accumulator.
+  internal accumulator and re-parsed on the next `feed()`. That accumulator is the
+  one piece of library-owned heap on the decode path, and
+  `Limits::max_buffered_field` is what bounds it.
 
 This inverts the C port's deferred-copy model (where `read()` binds an
 address-stable destination that a later `feed()` fills). Here `read()` pulls the
-value out immediately, so no per-field destination must stay stable — but the
-**input buffer must outlive any returned view**.
+value out immediately, so no per-field destination has to stay stable across
+chunks — and no input buffer has to outlive the call it was passed to.
 
 **Encode (`OStream` / `OStreamView` / `OStreamInline`) — writes into a
 caller-supplied, fixed-size buffer; flushes, never grows.** The library
@@ -588,8 +593,9 @@ SofaBuffers ships **two** C++ implementations of the same wire format, tuned for
 opposite ends of the spectrum:
 
 - **`corelib-cpp` (this library)** — pure C++20, no C backend. Optimised for
-  **throughput** on desktop/server targets. Decodes in place and returns
-  `std::string_view`s into the bytes it parsed (valid while the stream/input lives).
+  **throughput** on desktop/server targets. Parses in place over the caller's
+  buffer and pulls each value straight into its destination, so no per-field
+  destination has to stay alive across chunks.
 - **[`corelib-c-cpp`](https://github.com/sofa-buffers/corelib-c-cpp)** — a C
   object API with a thin C++ wrapper (`sofab.hpp`). Optimised for **minimal code
   size and RAM** on bare-metal / microcontroller targets, using a deferred-copy
