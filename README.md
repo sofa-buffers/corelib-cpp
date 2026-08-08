@@ -161,7 +161,8 @@ A decoder cannot see a message boundary: a message has no framing on the wire, a
 since MESSAGE_SPEC §2 an all-default message is the *empty byte string*. Successive
 `feed()` calls therefore continue **one** message. To decode a second message into
 the same object, call `reset()` — it re-initialises the wrapped message **and** the
-decoder (reassembly buffer, sticky flags, `skipped()` counter) together:
+decoder (reassembly buffer, sticky flags, the latched terminal verdict,
+`skipped()` counter) together:
 
 ```cpp
 sofab::IStreamObject<Sensor> in;
@@ -210,6 +211,28 @@ buffer and to chunked streaming:
 caller reads it as "feed me more bytes", while a caller that has delivered all its
 bytes and still sees `Incomplete` knows the message was truncated. A truncated tail
 is therefore never silently accepted as `Complete`, nor rejected as `Invalid`.
+
+`Invalid` — and the `LimitExceeded` policy code below — are **terminal**, and the
+decoder latches them on the *stream*. Spec §5.2 answers "can more bytes change it?"
+with *"no — terminal"* for `INVALID`, and §6.3 calls `LimitExceeded` *"a terminal,
+receiver-local policy rejection"*. So once a `feed()` has returned either code,
+every later `feed()` returns the same code immediately: no further bytes are
+parsed, no field is delivered, nothing is buffered. `reset()` is the way back —
+which is the documented start of a new message anyway.
+
+```cpp
+sofab::IStreamObject<Sensor> in;
+in.feed(garbage.data(), garbage.size());  // Invalid
+in.feed(wire.data(), wire.size());        // still Invalid — the stream is condemned
+in.reset();                               // ← the only way back
+in.feed(wire.data(), wire.size());        // Complete
+```
+
+That is what makes the outcome **chunk-independent** (spec §7.2 item 4): the same
+bytes fed whole, in odd-sized chunks or one at a time all end on the same verdict.
+Without the latch it would depend on where the chunk boundaries happened to fall,
+and a sender could prefix garbage to a valid message and still have the receiver
+report `Complete`.
 
 #### Streaming buffer limit (opt-in)
 
@@ -544,7 +567,9 @@ Two suites run under CTest:
 - **`test_roundtrip`** — encode/decode/nested/chunked/skip checks plus the
   three-valued decode outcome (§7: COMPLETE / INCOMPLETE / INVALID), malformed-input
   handling (truncated tails held as `Incomplete`; overlong varints, oversized
-  lengths and stray markers rejected as `InvalidMessage`), resync after a
+  lengths and stray markers rejected as `InvalidMessage`), the terminal latch
+  (§5.2/§6.3: every chunking of a malformed stream ends on the same verdict, and
+  valid bytes appended after it never revive the stream), resync after a
   skipped sub-sequence, and the §2 sequence framing above (an all-default
   sequence omitted, a kept element frame, hold-back at full `MAX_DEPTH`, and
   identical bytes when a run is committed across a flush boundary).

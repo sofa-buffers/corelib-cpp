@@ -2486,6 +2486,22 @@ namespace sofab
         bool consumed_ = false;        /**< Set once the callback has read the current field's value. */
         bool error_ = false;           /**< Sticky decode-error flag for the current @ref feed. */
         bool limitExceeded_ = false;   /**< Sticky flag: a field crossed @ref maxBufferedField_ this @ref feed. */
+        /**
+         * @brief The stream's latched terminal verdict, or @ref Error::None while
+         *        the stream is still usable (§5.2, §6.3).
+         *
+         * @ref error_ and @ref limitExceeded_ live for exactly one @ref feed; this
+         * outlives it. `INVALID` is terminal — §5.2 answers "can more bytes change
+         * it?" with "no — terminal" — and `LimitExceeded` is "a terminal,
+         * receiver-local policy rejection" (§6.3). So once either is the answer it
+         * stays the answer for every later @ref feed, until @ref reset starts a new
+         * message. Without the latch the verdict would depend on where the chunk
+         * boundaries fell: feed()'s fast path returns before the offending bytes
+         * reach @ref acc_ and the next call starts from a clean slate, while the
+         * continuation path re-parses them out of @ref acc_ and keeps failing —
+         * exactly the divergence §7.2 item 4 forbids.
+         */
+        Error terminal_ = Error::None;
         int seqDepth_ = 0;             /**< Current nested-sequence depth during dispatch (§4.9 @ref MAX_DEPTH). */
         size_t skipped_ = 0;           /**< §7.3 type-mismatch skips seen so far (@ref skipped). */
         bool incomplete_ = false;      /**< The field being delivered needs more bytes (§7 INCOMPLETE, not malformed). */
@@ -3128,6 +3144,21 @@ namespace sofab
          *         with an open sequence — the partial tail is buffered for the next
          *         @ref feed and is **not** an error; or @ref Error::InvalidMessage
          *         (`INVALID`) when the bytes are malformed regardless of what follows.
+         *         @ref Error::LimitExceeded is the fourth, receiver-policy outcome
+         *         (§6.2.1) — well-formed bytes this receiver refuses to buffer.
+         *
+         * @note **INVALID and LimitExceeded are terminal.** §5.2 answers "can more
+         *       bytes change it?" with "no — terminal" for `INVALID`, and §6.3 calls
+         *       `LimitExceeded` "a terminal, receiver-local policy rejection". Once
+         *       @ref feed has returned either, the verdict is latched on the
+         *       *stream*: every later call returns the same code without parsing a
+         *       byte, no further field is delivered, and the input after the fault
+         *       is neither buffered nor inspected. @ref reset is the way back — it
+         *       is the documented start of a new message anyway. This is what makes
+         *       the outcome chunk-independent (§7.2 item 4): the same bytes fed
+         *       whole, in odd-sized chunks or one at a time all end on the same
+         *       verdict, and garbage prefixed to a valid message can never be
+         *       reported as `COMPLETE`.
          *
          * @warning **One message per destination.** Successive @ref feed calls
          *          continue the *same* message — a decoder cannot see a message
@@ -3144,6 +3175,15 @@ namespace sofab
          */
         Result feed(const uint8_t *buffer, size_t buflen) noexcept
         {
+            /* §5.2/§6.3: INVALID and LimitExceeded are TERMINAL. Once the stream has
+             * returned one, no later chunk can change it — the bytes were malformed
+             * regardless of what follows, or the receiver's policy already refused
+             * them. Answering from the latch before parsing is also what keeps the
+             * two paths below in agreement: the fast path returns without retaining
+             * the offending bytes, so re-parsing would silently "recover" and the
+             * outcome would depend on where the chunk boundaries fell (#79). */
+            if (terminal_ != Error::None) [[unlikely]] return Result{terminal_, skipped_};
+
             /* Fast path: nothing buffered. Parse straight over the caller's
              * memory — no copy, no allocation. This is the common case (a whole
              * message handed in at once). Only an incomplete trailing field is
@@ -3156,8 +3196,8 @@ namespace sofab
                 /* #26: a field over the buffering cap fails as policy — checked
                  * before the incomplete tail is copied into acc_, so a claimed
                  * oversize is rejected even though its payload never arrived. */
-                if (limitExceeded_) return Result{Error::LimitExceeded, skipped_};
-                if (error_) return Result{Error::InvalidMessage, skipped_};
+                if (limitExceeded_) { terminal_ = Error::LimitExceeded; return Result{terminal_, skipped_}; }
+                if (error_) { terminal_ = Error::InvalidMessage; return Result{terminal_, skipped_}; }
                 if (stop != buffer + buflen)
                 {
                     /* §7: bytes remain that begin but do not finish a field (or an
@@ -3177,8 +3217,8 @@ namespace sofab
             const uint8_t *stop = parseTopLevel(base + topPos_, base + acc_.size());
             /* #26: re-checked from the buffered tail, so the cap is chunk-independent —
              * the same field crosses it whether fed whole or dribbled byte by byte. */
-            if (limitExceeded_) return Result{Error::LimitExceeded, skipped_};
-            if (error_) return Result{Error::InvalidMessage, skipped_};
+            if (limitExceeded_) { terminal_ = Error::LimitExceeded; return Result{terminal_, skipped_}; }
+            if (error_) { terminal_ = Error::InvalidMessage; return Result{terminal_, skipped_}; }
             topPos_ = static_cast<size_t>(stop - base);
             if (topPos_ == acc_.size()) /* fully drained: COMPLETE */
             {
@@ -3193,7 +3233,9 @@ namespace sofab
          *        brand-new message.
          *
          * Discards the buffered partial field, the sticky error/limit flags, the
-         * nesting depth and the §7.3 @ref skipped counter. The reassembly buffer's
+         * latched terminal verdict (§5.2/§6.3 — this is the only way to clear an
+         * `INVALID` or `LimitExceeded` stream), the nesting depth and the §7.3
+         * @ref skipped counter. The reassembly buffer's
          * *capacity* is deliberately kept: this is the message-loop call, and
          * handing the allocation back only to take it again next message is the one
          * thing it must not cost (`Limits::max_buffered_field` is what bounds that
@@ -3224,6 +3266,7 @@ namespace sofab
             consumed_ = false;
             error_ = false;
             limitExceeded_ = false;
+            terminal_ = Error::None;
             incomplete_ = false;
             declined_ = false;
             seqDepth_ = 0;
