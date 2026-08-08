@@ -3971,12 +3971,13 @@ static void negativeBlobSize()
               "negative blob size: refused with InvalidArgument, not BufferFull");
         CHECK(os.bytesUsed() == 0,
               "negative blob size: the rejected field emits nothing");
-        CHECK(os.ok(),
-              "negative blob size: the rejection is per-field, it does not condemn the stream");
+        CHECK(!os.ok() && os.error() == sofab::Error::InvalidArgument,
+              "negative blob size: the refusal reaches the stream verdict (§5.1)");
 
-        /* The stream stays usable, and the next field is the FIRST field on the
-         * wire — proof that no header or payload byte of the rejected blob was
-         * emitted. */
+        /* The stream still encodes what it is given afterwards — the verdict is
+         * a report, not a shutdown — and the next field is the FIRST field on
+         * the wire, proof that no header or payload byte of the rejected blob
+         * was emitted. */
         auto r2 = os.write(sofab::id(1), static_cast<const void *>(payload), int32_t{3});
         CHECK(r2.code() == sofab::Error::None && os.bytesUsed() == 5,
               "negative blob size: a following valid blob encodes normally");
@@ -3997,8 +3998,10 @@ static void negativeBlobSize()
         CHECK(r.code() == sofab::Error::InvalidArgument,
               "negative blob size: refused on a streaming installation too");
         os.flush();
-        CHECK(os.ok() && out.empty(),
+        CHECK(out.empty(),
               "negative blob size: nothing is handed to the sink");
+        CHECK(!os.ok() && os.error() == sofab::Error::InvalidArgument,
+              "negative blob size: the streaming refusal reaches the verdict too");
     }
 
     /* A zero length is legal and still emits the empty blob — the guard must
@@ -4206,6 +4209,126 @@ static void chunkLifetime()
     }
 }
 
+/* --- §5.1: the stream verdict covers EVERY refused write, not just overflow.
+ *
+ *     "An encoder that could not write what it was asked to write reports it,
+ *     and a one-shot helper that ignores that report is non-conformant" — and
+ *     ok()/error() are that report for the way generated code encodes: one
+ *     write at a time with each Result discarded. Only BufferFull used to reach
+ *     the sticky verdict, so a message that silently lost a field — a string
+ *     the encoder refused under §6.4, a field id past §6.2's ID_MAX, a
+ *     sub-message past MAX_DEPTH — came back ok() == true and was shipped as if
+ *     it were complete.
+ *
+ *     Every case below therefore checks the STREAM verdict, never the per-call
+ *     Result: the per-call code was already right, it is the aggregate that
+ *     lied. --- */
+
+static void encodeFailuresAreLatched()
+{
+    /* A healthy encode is the control: the verdict only moves on a failure. */
+    {
+        sofab::OStreamInline<64> os;
+        os.write(sofab::id(1), uint64_t{1});
+        os.write(sofab::id(2), std::string_view("ok"));
+        CHECK(os.ok() && os.error() == sofab::Error::None,
+              "latched encode failure: a stream that wrote everything stays ok()");
+    }
+
+#if SOFAB_STRICT_UTF8
+    /* §6.4: the refused string. The Result is discarded exactly as a generated
+     * serialize() body discards it, so the verdict is all the caller has. */
+    {
+        sofab::OStreamInline<64> os;
+        const std::string bad = "a\xC0\x80";   /* overlong NUL */
+        os.write(sofab::id(1), uint64_t{1});
+        os.write(sofab::id(2), std::string_view(bad));
+        os.write(sofab::id(3), uint64_t{3});
+        CHECK(!os.ok() && os.error() == sofab::Error::InvalidArgument,
+              "latched encode failure: a refused UTF-8 string turns the verdict false");
+        CHECK(toHex(std::span<const uint8_t>(os.data(), os.bytesUsed())) == "08011803",
+              "latched encode failure: the refused string emits nothing at all");
+    }
+#endif
+
+    /* §6.2's ID_MAX, through each of the five writers that guard it. Each gets
+     * a fresh stream, so bytesUsed() == 0 proves the refusal emitted nothing. */
+    {
+        const sofab::id tooBig = sofab::id(0x80000000u);
+        const float f32[] = {1.0f, 2.0f};
+        const uint32_t ints[] = {1u, 2u};
+
+        {   /* writeScalar */
+            sofab::OStreamInline<64> os;
+            os.write(tooBig, uint64_t{7});
+            CHECK(!os.ok() && os.error() == sofab::Error::InvalidArgument && os.bytesUsed() == 0,
+                  "latched encode failure: a scalar past ID_MAX turns the verdict false");
+        }
+        {   /* writeFixlen, via the string overload */
+            sofab::OStreamInline<64> os;
+            os.write(tooBig, std::string_view("text"));
+            CHECK(!os.ok() && os.error() == sofab::Error::InvalidArgument && os.bytesUsed() == 0,
+                  "latched encode failure: a string past ID_MAX turns the verdict false");
+        }
+        {   /* writeFloatScalar */
+            sofab::OStreamInline<64> os;
+            os.write(tooBig, 1.5);
+            CHECK(!os.ok() && os.error() == sofab::Error::InvalidArgument && os.bytesUsed() == 0,
+                  "latched encode failure: a float past ID_MAX turns the verdict false");
+        }
+        {   /* writeIntArray */
+            sofab::OStreamInline<64> os;
+            os.write(tooBig, std::span<const uint32_t>(ints, 2));
+            CHECK(!os.ok() && os.error() == sofab::Error::InvalidArgument && os.bytesUsed() == 0,
+                  "latched encode failure: an integer array past ID_MAX turns the verdict false");
+        }
+        {   /* writeFloatArray */
+            sofab::OStreamInline<64> os;
+            os.write(tooBig, std::span<const float>(f32, 2));
+            CHECK(!os.ok() && os.error() == sofab::Error::InvalidArgument && os.bytesUsed() == 0,
+                  "latched encode failure: a float array past ID_MAX turns the verdict false");
+        }
+        {   /* sequenceBeginLazy's own id guard */
+            sofab::OStreamInline<64> os;
+            os.sequenceBeginLazy(tooBig);
+            CHECK(!os.ok() && os.error() == sofab::Error::InvalidArgument && os.bytesUsed() == 0,
+                  "latched encode failure: a sub-message past ID_MAX turns the verdict false");
+        }
+    }
+
+    /* §6.2's fixlen bound from the other side: a negative raw-blob length is
+     * outside the format, and refusing it drops a field like any other refusal
+     * (the byte-level proof that nothing is emitted lives in negativeBlobSize). */
+    {
+        sofab::OStreamInline<64> os;
+        const char payload[] = "abc";
+        os.write(sofab::id(1), static_cast<const void *>(payload), int32_t{-1});
+        CHECK(!os.ok() && os.error() == sofab::Error::InvalidArgument,
+              "latched encode failure: a negative blob length turns the verdict false");
+    }
+
+    /* §4.9/§6.2's MAX_DEPTH: the 256th open is refused, and the refusal is a
+     * dropped sub-message like any other. */
+    {
+        sofab::OStreamInline<2048> os;
+        for (int i = 0; i < sofab::MAX_DEPTH; ++i) os.sequenceBeginLazy(sofab::id(1));
+        CHECK(os.ok(), "latched encode failure: MAX_DEPTH opens leave the verdict alone");
+        os.sequenceBeginLazy(sofab::id(1));
+        CHECK(!os.ok() && os.error() == sofab::Error::InvalidArgument,
+              "latched encode failure: the 256th sub-message turns the verdict false");
+    }
+
+    /* First failure wins, as it already did for BufferFull: a later overflow
+     * must not rewrite the code that condemned the stream. */
+    {
+        sofab::OStreamInline<8> os;
+        os.write(sofab::id(0x80000000u), uint64_t{7});
+        for (int i = 0; i < 16; ++i) os.write(sofab::id(1), uint64_t{1});
+        CHECK(!os.ok() && os.error() == sofab::Error::InvalidArgument,
+              "latched encode failure: the first failure wins over a later overflow");
+    }
+}
+
 int main()
 {
     encodeVectors();
@@ -4243,6 +4366,7 @@ int main()
     nestedArrayCountCeiling();
     minOutputBuffer();
     negativeBlobSize();
+    encodeFailuresAreLatched();
     flushHandover();
     chunkLifetime();
 

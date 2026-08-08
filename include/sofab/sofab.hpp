@@ -1172,13 +1172,22 @@ namespace sofab
         /**
          * @brief Sticky first failure of this stream (see @ref ok, @ref error).
          *
-         * @ref Error::None while the encode is healthy. Latches
-         * @ref Error::BufferFull on an overflow with no sink (and on a hold-back
-         * the run could not grow), or @ref Error::InvalidArgument when a buffer
-         * installation was rejected (§5.1 — an out-of-range offset, or less than
-         * @ref MIN_OUTPUT_BUFFER usable bytes behind a sink). Only the first is
-         * kept: once condemned, the stream stays condemned for the reason it was
-         * condemned for.
+         * @ref Error::None while the encode is healthy, and one of §6.3's codes
+         * from the moment a write could not be honoured: @ref Error::BufferFull
+         * on an overflow with no sink (and on a hold-back run that could not
+         * grow), @ref Error::InvalidArgument when a buffer installation was
+         * rejected (§5.1 — an out-of-range offset, or less than
+         * @ref MIN_OUTPUT_BUFFER usable bytes behind a sink) or when a field the
+         * caller asked for was refused (a field id past @ref ID_MAX, a
+         * sub-message past @ref MAX_DEPTH, a string that is not valid UTF-8
+         * under §6.4, a negative raw-blob length past §6.2's fixlen bound).
+         * Only the first is kept: once condemned, the stream stays
+         * condemned for the reason it was condemned for.
+         *
+         * Everything that turns this non-None goes through @ref latch, so that
+         * the set of failures the verdict covers is the set of failures the
+         * write path can report — §5.1's "an encoder that could not write what
+         * it was asked to write reports it".
          */
         Error failure_ = Error::None;
         /**
@@ -1196,6 +1205,30 @@ namespace sofab
 
         /** Construct an unattached stream; a derived class must call @ref initBuffer. */
         OStreamImpl() noexcept = default;
+
+        /**
+         * @brief Record a failure in the sticky verdict and hand it straight back.
+         *
+         * The one place @ref failure_ is written, so every refusal the write path
+         * can return also reaches @ref ok / @ref error. That matters because the
+         * per-call @ref Result is routinely discarded — a generated `serialize()`
+         * issues its writes one at a time and checks nothing — and without this
+         * an encode that dropped a field would come back indistinguishable from a
+         * complete one (§5.1: an encoder MUST NOT return partial output as if it
+         * were complete).
+         *
+         * First failure wins: a stream stays condemned for the reason it was
+         * condemned for, so a later overflow cannot paper over the refusal that
+         * actually cost the message a field.
+         *
+         * @param e The failure to report; must not be @ref Error::None.
+         * @return @p e, unchanged, whatever the verdict already held.
+         */
+        Error latch(Error e) noexcept
+        {
+            if (failure_ == Error::None) failure_ = e;
+            return e;
+        }
 
         /**
          * @brief Point the stream at a buffer and position the write cursor.
@@ -1222,7 +1255,7 @@ namespace sofab
             {
                 buffer_ = cursor_ = end_ = buffer;
                 offset_ = 0;
-                if (failure_ == Error::None) failure_ = Error::InvalidArgument;
+                (void)latch(Error::InvalidArgument);
                 return;
             }
             buffer_ = buffer;
@@ -1315,8 +1348,7 @@ namespace sofab
                     // Sticky, because a caller may issue writes one at a time and
                     // discard each Result — generated serialize() bodies do — and
                     // then nothing would record that the output was cut short.
-                    failure_ = Error::BufferFull;
-                    return Error::BufferFull;
+                    return latch(Error::BufferFull);
                 }
                 /* §5.1, the returning-callback contract. The sink either copied —
                  * it returns without installing anything, and the same buffer is
@@ -1472,7 +1504,7 @@ namespace sofab
          */
         [[nodiscard]] Error writeScalar(sofab::id fieldId, Wire type, uint64_t value) noexcept
         {
-            if (fieldId > ID_MAX) return Error::InvalidArgument;
+            if (fieldId > ID_MAX) [[unlikely]] return latch(Error::InvalidArgument);
             if (Error e = beforeContent(); e != Error::None) return e;
             /* Header and value are each at most VARINT_MAX_BYTES, so with room for
              * two of them the field is composed straight into the buffer: no
@@ -1503,7 +1535,7 @@ namespace sofab
          */
         [[nodiscard]] Error writeFixlen(sofab::id fieldId, Fix ft, const uint8_t *data, size_t len) noexcept
         {
-            if (fieldId > ID_MAX) return Error::InvalidArgument;
+            if (fieldId > ID_MAX) [[unlikely]] return latch(Error::InvalidArgument);
             if (Error e = beforeContent(); e != Error::None) return e;
             /* As in @ref writeScalar, plus the payload. The room test is split so
              * it cannot overflow on a huge @p len. */
@@ -1538,7 +1570,7 @@ namespace sofab
         [[nodiscard]] Error writeFloatScalar(sofab::id fieldId, F value) noexcept
         {
             constexpr Fix ft = (sizeof(F) == 4) ? Fix::Fp32 : Fix::Fp64;
-            if (fieldId > ID_MAX) return Error::InvalidArgument;
+            if (fieldId > ID_MAX) [[unlikely]] return latch(Error::InvalidArgument);
             if (Error e = beforeContent(); e != Error::None) return e;
             auto bits = detail::floatBits(value);
             if (static_cast<size_t>(end_ - cursor_) >= 2 * detail::VARINT_MAX_BYTES + sizeof(F)) [[likely]]
@@ -1573,7 +1605,7 @@ namespace sofab
         [[nodiscard]] Error writeIntArray(sofab::id fieldId, std::span<const E> elems) noexcept
         {
             constexpr bool isSigned = std::is_signed_v<E>;
-            if (fieldId > ID_MAX) return Error::InvalidArgument;
+            if (fieldId > ID_MAX) [[unlikely]] return latch(Error::InvalidArgument);
             if (Error e = beforeContent(); e != Error::None) return e;
             const uint64_t head = (static_cast<uint64_t>(fieldId) << 3) |
                         static_cast<uint64_t>(isSigned ? Wire::ArraySigned : Wire::ArrayUnsigned);
@@ -1640,7 +1672,7 @@ namespace sofab
         [[nodiscard]] Error writeFloatArray(sofab::id fieldId, std::span<const F> elems) noexcept
         {
             constexpr Fix ft = (sizeof(F) == 4) ? Fix::Fp32 : Fix::Fp64;
-            if (fieldId > ID_MAX) return Error::InvalidArgument;
+            if (fieldId > ID_MAX) [[unlikely]] return latch(Error::InvalidArgument);
             if (Error e = beforeContent(); e != Error::None) return e;
             /* §4.8: a fixlen array always carries its fixlen_word, even when empty
              * (count == 0), so an empty fp32 and fp64 array stay distinguishable. */
@@ -1821,21 +1853,32 @@ namespace sofab
          *
          * Sticky and independent of how the writes were issued — chained, or one
          * at a time with each Result discarded, which is what a generated
-         * `serialize()` does. It turns false on an overflow with no flush callback
-         * set (and, rarely, when @ref sequenceBeginLazy cannot allocate room to
-         * hold a header back), so it is the verdict to check after encoding into a
-         * buffer that may be smaller than the message (@ref OStreamView).
+         * `serialize()` does — so it is **the** verdict to check after encoding:
+         * §5.1 forbids handing on partial output as if it were complete, and this
+         * is what tells the two apart.
          *
-         * @return true while no write has overflowed.
+         * It turns false whenever a field the caller asked for did not reach the
+         * output: an overflow with no flush callback set (@ref OStreamView with a
+         * buffer smaller than the message), a rejected buffer installation, a
+         * field id past @ref ID_MAX, a sub-message past @ref MAX_DEPTH, a string
+         * that is not valid UTF-8 under §6.4, a negative raw-blob length, and —
+         * rarely — a
+         * @ref sequenceBeginLazy that cannot allocate room to hold a header back.
+         *
+         * @return true while every write this stream was given has been honoured.
          */
         [[nodiscard]] bool ok() const noexcept { return failure_ == Error::None; }
 
         /**
-         * @return The latched first failure: @ref Error::BufferFull once a write
-         *         has overflowed, @ref Error::InvalidArgument when a buffer
-         *         installation was rejected (§5.1 — an out-of-range offset, or
-         *         fewer than @ref MIN_OUTPUT_BUFFER usable bytes behind a sink),
-         *         else @ref Error::None.
+         * @brief The code behind @ref ok, latched first-failure-wins.
+         *
+         * @return @ref Error::BufferFull once a write has overflowed with no sink
+         *         (or a hold-back run could not grow), @ref Error::InvalidArgument
+         *         when a buffer installation was rejected (§5.1 — an out-of-range
+         *         offset, or fewer than @ref MIN_OUTPUT_BUFFER usable bytes behind
+         *         a sink) or a field was refused as unencodable (§6.2's
+         *         @ref ID_MAX and @ref MAX_DEPTH, §6.4's UTF-8 rule), else
+         *         @ref Error::None.
          */
         [[nodiscard]] Error error() const noexcept { return failure_; }
 
@@ -1880,7 +1923,7 @@ namespace sofab
                  * producer-side MUST NOT. `blob` (the pointer+size overload) is
                  * never validated. Folds away when the check is compiled out. */
                 if (!detail::utf8Valid(sv.data(), sv.size()))
-                    err = Error::InvalidArgument;
+                    err = latch(Error::InvalidArgument);
                 else
 #endif
                     err = writeFixlen(fieldId, Fix::String,
@@ -1955,6 +1998,10 @@ namespace sofab
          * would turn `-1` into `SIZE_MAX` and the encoder would copy from
          * @p value until the buffer filled, reading past the caller's object.
          *
+         * Like every other refusal it also reaches @ref ok / @ref error: the
+         * field the caller asked for is not on the wire, and §5.1 does not let a
+         * stream missing a field report success (@ref latch).
+         *
          * @param fieldId Field identifier; must not exceed @ref ID_MAX.
          * @param value Pointer to the bytes to copy.
          * @param size Number of bytes to copy; must not be negative.
@@ -1962,7 +2009,7 @@ namespace sofab
          */
         Result write(sofab::id fieldId, const void *value, int32_t size) noexcept
         {
-            if (size < 0) [[unlikely]] return Result{*this, Error::InvalidArgument};
+            if (size < 0) [[unlikely]] return Result{*this, latch(Error::InvalidArgument)};
             return Result{*this, writeFixlen(fieldId, Fix::Blob,
                           static_cast<const uint8_t *>(value), static_cast<size_t>(size))};
         }
@@ -2017,10 +2064,10 @@ namespace sofab
          */
         Result sequenceBeginLazy(sofab::id fieldId) noexcept
         {
-            if (seqDepth_ >= static_cast<size_t>(MAX_DEPTH))
-                return Result{*this, Error::InvalidArgument};
-            if (fieldId > ID_MAX)
-                return Result{*this, Error::InvalidArgument};
+            if (seqDepth_ >= static_cast<size_t>(MAX_DEPTH)) [[unlikely]]
+                return Result{*this, latch(Error::InvalidArgument)};
+            if (fieldId > ID_MAX) [[unlikely]]
+                return Result{*this, latch(Error::InvalidArgument)};
             /* The run grows on demand — no window, no eager fallback. The only
              * ceiling is the MAX_DEPTH just checked, so the hold-back is
              * canonical at every legal depth (CORELIB_PLAN §6). Past the run's
@@ -2029,10 +2076,7 @@ namespace sofab
              * @ref failure_), because the caller's matching close would otherwise
              * end an enclosing sequence instead of this one. */
             if (!pending_.push(fieldId))
-            {
-                if (failure_ == Error::None) failure_ = Error::BufferFull;
-                return Result{*this, Error::BufferFull};
-            }
+                return Result{*this, latch(Error::BufferFull)};
             ++seqDepth_;
             return Result{*this, Error::None};
         }
