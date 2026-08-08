@@ -2806,6 +2806,20 @@ namespace sofab
                         (ovf ? error_ : incomplete_) = true;
                         return;
                     }
+                    /* §4.8 step 1: the FORMAT ceiling fires on the count word
+                     * whatever the subtype turns out to be, so an absurd count is
+                     * rejected before anything is sized from it. Without this the
+                     * `count_ * fixLen_` byte-span below wraps size_t — a count of
+                     * 2^62 with 4-byte elements wraps to zero and the array is
+                     * skipped as if it were empty, so a message that must be
+                     * INVALID decodes COMPLETE. The top-level path
+                     * (@ref parseFieldHeader) has always checked this; this
+                     * nested one did not. */
+                    if (n > ARRAY_MAX) /* §6.2/§7 */
+                    {
+                        error_ = true;
+                        return;
+                    }
                     count_ = static_cast<size_t>(n);
                     /* §4.8: the fixlen_word is always present, even for an empty array. */
                     uint64_t sub;
