@@ -101,6 +101,30 @@ namespace sofab
     inline constexpr int MAX_DEPTH = 255;
 
     /**
+     * @brief Smallest output buffer this port accepts **for streaming** (§5.1).
+     *
+     * This implementation writes byte-at-a-time whenever the buffer is tight —
+     * every write funnels through @ref OStreamImpl::pushBytes, which falls back to
+     * a per-byte push that flushes across the boundary — so it splits **atomic
+     * units** too and declares the smallest value §5.1 admits, `1`. A caller
+     * therefore never has to reserve headroom: any non-empty buffer streams a
+     * message of any size, and the bytes are identical to the one-shot path.
+     *
+     * **It binds a buffer installed together with a flush sink**, and only such a
+     * buffer: `buflen - offset >= MIN_OUTPUT_BUFFER` is checked where the buffer is
+     * handed over — a constructor or @ref OStream::setBuffer — and never partway
+     * through a message. A buffer installed **without** a sink is subject to no
+     * minimum at all: no flush can occur, so it either holds the message or reports
+     * @ref Error::BufferFull, and a two-byte message still encodes into two bytes.
+     *
+     * A rejected installation leaves the stream inert and latched at
+     * @ref Error::InvalidArgument (@ref OStreamImpl::ok is false,
+     * @ref OStreamImpl::error reports it); no write it is then asked for touches
+     * the buffer.
+     */
+    inline constexpr size_t MIN_OUTPUT_BUFFER = 1;
+
+    /**
      * @brief Always-false trait used to trigger `static_assert` in the
      *        otherwise-unreachable branch of an `if constexpr` chain.
      *
@@ -1026,6 +1050,20 @@ namespace sofab
         uint8_t *buffer_ = nullptr;   /**< Start of the active buffer. */
         uint8_t *cursor_ = nullptr;   /**< Current write position. */
         uint8_t *end_ = nullptr;      /**< One past the end of the buffer. */
+        /**
+         * @brief Start offset of the **current installation** (§5.1).
+         *
+         * Where this installation's writable region begins, so `cursor_ - (buffer_
+         * + offset_)` is the number of *message* bytes buffered — as opposed to
+         * @ref bytesUsed, which counts from the buffer start because the reserved
+         * head is part of the packet a sink is handed. @ref flush uses the former:
+         * a freshly installed buffer holding nothing but its own reservation has
+         * nothing to drain, and must not be pushed at the sink as an empty packet.
+         *
+         * The offset is **consumed** by the first flush that returns without an
+         * installation, which is why it drops to zero there alongside the cursor.
+         */
+        size_t offset_ = 0;
         flushCallback flushCallback_; /**< Invoked when the buffer fills; may be empty. */
         size_t seqDepth_ = 0;         /**< Number of currently-open nested sequences (§4.9 @ref MAX_DEPTH). */
         /**
@@ -1102,22 +1140,66 @@ namespace sofab
             void clear() noexcept { n_ = 0; spill_.clear(); }
         };
         PendingRun pending_;
-        bool failed_ = false;         /**< Sticky: a write has overflowed (see @ref ok). */
+        /**
+         * @brief Sticky first failure of this stream (see @ref ok, @ref error).
+         *
+         * @ref Error::None while the encode is healthy. Latches
+         * @ref Error::BufferFull on an overflow with no sink (and on a hold-back
+         * the run could not grow), or @ref Error::InvalidArgument when a buffer
+         * installation was rejected (§5.1 — an out-of-range offset, or less than
+         * @ref MIN_OUTPUT_BUFFER usable bytes behind a sink). Only the first is
+         * kept: once condemned, the stream stays condemned for the reason it was
+         * condemned for.
+         */
+        Error failure_ = Error::None;
+        /**
+         * @brief Set by @ref initBuffer, cleared right before a flush callback runs.
+         *
+         * This is how the stream tells the two halves of §5.1's returning-callback
+         * contract apart: a sink that returns **without** installing a buffer
+         * copied, and the encoder resumes in the same buffer at offset 0; a sink
+         * that **took** the buffer installed a replacement, and that installation's
+         * own start offset is the cursor. Without it a taking sink's offset would
+         * be overwritten the moment the callback returned, so per-packet header
+         * room could not be re-armed.
+         */
+        bool installed_ = false;
 
         /** Construct an unattached stream; a derived class must call @ref initBuffer. */
         OStreamImpl() noexcept = default;
 
         /**
          * @brief Point the stream at a buffer and position the write cursor.
+         *
+         * This is the one place a buffer is handed over, so it is where §5.1's
+         * preconditions are checked and where a bad buffer is rejected — never
+         * partway through a message. On rejection the stream is left **inert**
+         * (cursor at the end, nothing writable) with @ref failure_ latched, so no
+         * subsequent write can touch storage that cannot hold it.
+         *
          * @param buffer Storage to encode into.
          * @param buflen Capacity of @p buffer in bytes.
          * @param offset Number of leading bytes to leave untouched before the cursor.
          */
         void initBuffer(uint8_t *buffer, size_t buflen, size_t offset) noexcept
         {
+            installed_ = true;
+            /* §5.1: the minimum binds a buffer installed WITH a sink and no other.
+             * Without a sink no flush can occur, so nothing can be split and the
+             * buffer either holds the message or reports BufferFull — a two-byte
+             * message must still encode into a two-byte buffer. */
+            if (offset > buflen ||
+                (flushCallback_ && buflen - offset < MIN_OUTPUT_BUFFER))
+            {
+                buffer_ = cursor_ = end_ = buffer;
+                offset_ = 0;
+                if (failure_ == Error::None) failure_ = Error::InvalidArgument;
+                return;
+            }
             buffer_ = buffer;
             cursor_ = buffer + offset;
             end_ = buffer + buflen;
+            offset_ = offset;
         }
 
         /**
@@ -1191,6 +1273,12 @@ namespace sofab
          */
         [[nodiscard]] Error pushByte(uint8_t b) noexcept
         {
+            /* A condemned stream writes nothing more. Besides keeping a truncated
+             * encode a byte-exact prefix of the full one, this is what makes a
+             * rejected installation safe: the inert buffer left behind by
+             * @ref initBuffer has cursor == end, and without this test the flush
+             * path below would fall through to the store and run off it. */
+            if (failure_ != Error::None) [[unlikely]] return failure_;
             if (cursor_ == end_)
             {
                 if (!flushCallback_)
@@ -1198,11 +1286,18 @@ namespace sofab
                     // Sticky, because a caller may issue writes one at a time and
                     // discard each Result — generated serialize() bodies do — and
                     // then nothing would record that the output was cut short.
-                    failed_ = true;
+                    failure_ = Error::BufferFull;
                     return Error::BufferFull;
                 }
+                /* §5.1, the returning-callback contract. The sink either copied —
+                 * it returns without installing anything, and the same buffer is
+                 * reused from offset 0 — or it took the buffer and installed a
+                 * replacement, whose own start offset is already the cursor and
+                 * must not be overwritten here. */
+                installed_ = false;
                 flushCallback_(std::span<const uint8_t>(buffer_, static_cast<size_t>(cursor_ - buffer_)));
-                cursor_ = buffer_;
+                if (failure_ != Error::None) [[unlikely]] return failure_; /* the sink installed a rejected buffer */
+                if (!installed_) { cursor_ = buffer_; offset_ = 0; }        /* the offset is consumed */
             }
             *cursor_++ = b;
             return Error::None;
@@ -1274,7 +1369,7 @@ namespace sofab
          * The run is dropped even when a header write fails partway, and that is
          * deliberate: the only way to fail here is @ref Error::BufferFull, which
          * is unreachable while a flush callback is set and otherwise latches the
-         * sticky @ref failed_ with the cursor parked at the buffer end — so every
+         * sticky @ref failure_ with the cursor parked at the buffer end — so every
          * later push fails too and @ref ok is already false. Keeping the leftover
          * ids could therefore only ever emit them into an output that is already
          * condemned. `bufferFullCondemnsTheRun()` in test/test_roundtrip.cpp
@@ -1667,10 +1762,23 @@ namespace sofab
          */
         size_t flush() noexcept
         {
-            size_t used = static_cast<size_t>(cursor_ - buffer_);
-            if (flushCallback_ && used)
+            const size_t used = static_cast<size_t>(cursor_ - buffer_);
+            /* Only *message* bytes are worth draining. A buffer that was just
+             * installed holds nothing but its own reserved head, and handing the
+             * sink that head as a packet of its own would invent an empty packet —
+             * which the destructor's flush would then do after every taking sink's
+             * last handover. */
+            if (flushCallback_ && used > offset_)
+            {
+                /* Same contract as in @ref pushByte: an explicit flush is a flush
+                 * like any other, so a sink that takes the buffer here installs a
+                 * replacement and that installation's offset stands. */
+                installed_ = false;
                 flushCallback_(std::span<const uint8_t>(buffer_, used));
-            cursor_ = buffer_;
+                if (!installed_) { cursor_ = buffer_; offset_ = 0; }
+            }
+            else if (!flushCallback_)
+                cursor_ = buffer_;
             return used;
         }
 
@@ -1691,13 +1799,16 @@ namespace sofab
          *
          * @return true while no write has overflowed.
          */
-        [[nodiscard]] bool ok() const noexcept { return !failed_; }
+        [[nodiscard]] bool ok() const noexcept { return failure_ == Error::None; }
 
-        /** @return @ref Error::BufferFull once a write has overflowed, else @ref Error::None. */
-        [[nodiscard]] Error error() const noexcept
-        {
-            return failed_ ? Error::BufferFull : Error::None;
-        }
+        /**
+         * @return The latched first failure: @ref Error::BufferFull once a write
+         *         has overflowed, @ref Error::InvalidArgument when a buffer
+         *         installation was rejected (§5.1 — an out-of-range offset, or
+         *         fewer than @ref MIN_OUTPUT_BUFFER usable bytes behind a sink),
+         *         else @ref Error::None.
+         */
+        [[nodiscard]] Error error() const noexcept { return failure_; }
 
         /**
          * @brief Write a field, dispatching on the value's type.
@@ -1876,11 +1987,11 @@ namespace sofab
              * canonical at every legal depth (CORELIB_PLAN §6). Past the run's
              * inline depth that growth allocates; if the allocation fails the
              * sequence is NOT opened and the stream is condemned (sticky
-             * @ref failed_), because the caller's matching close would otherwise
+             * @ref failure_), because the caller's matching close would otherwise
              * end an enclosing sequence instead of this one. */
             if (!pending_.push(fieldId))
             {
-                failed_ = true;
+                if (failure_ == Error::None) failure_ = Error::BufferFull;
                 return Result{*this, Error::BufferFull};
             }
             ++seqDepth_;
@@ -1944,30 +2055,30 @@ namespace sofab
     };
 
     /**
-     * @brief Output stream backed by a heap buffer held in a `shared_ptr`.
+     * @brief Output stream over a caller-supplied buffer whose lifetime is shared.
      *
-     * The buffer can be allocated by the stream, adopted from the caller, or
-     * swapped at runtime via @ref setBuffer, and retrieved with @ref getBuffer
-     * so it may be shared with whatever consumes the encoded bytes.
+     * The buffer is adopted from the caller, swappable at runtime via
+     * @ref setBuffer, and retrievable with @ref getBuffer so it may be shared with
+     * whatever consumes the encoded bytes.
+     *
+     * @note This stream does **not** allocate the buffer, and no stream in this
+     * library does: §5.1 puts every output buffer on the caller's side, so that
+     * there is one buffer-ownership model rather than two and a heap-less profile
+     * is the plain reading of it rather than a special case. Sizing the storage is
+     * the job of the layer that knows the schema — the generated code, which
+     * allocates `MAX_SIZE` and installs it without a sink for a bounded schema, or
+     * a scratch buffer with an appending sink for an unbounded one. A caller that
+     * simply wants a heap buffer writes
+     * `sofab::OStream os{std::make_shared<uint8_t[]>(n), n};`.
      */
     class OStream : public OStreamImpl
     {
     protected:
-        std::shared_ptr<uint8_t[]> bufferOwner_; /**< Owned backing storage. */
+        std::shared_ptr<uint8_t[]> bufferOwner_; /**< Caller storage, kept alive. */
         /** Construct without a buffer; one must be set via @ref setBuffer. */
         OStream() noexcept = default;
 
     public:
-        /**
-         * @brief Construct with a freshly allocated buffer.
-         * @param buflen Buffer capacity in bytes.
-         * @param offset Number of leading bytes to reserve before the write cursor.
-         */
-        explicit OStream(size_t buflen, size_t offset = 0) noexcept
-        {
-            bufferOwner_ = std::make_shared<uint8_t[]>(buflen);
-            initBuffer(bufferOwner_.get(), buflen, offset);
-        }
         /**
          * @brief Construct over a caller-supplied buffer.
          * @param buffer Backing storage to adopt.
@@ -1993,7 +2104,24 @@ namespace sofab
             initBuffer(bufferOwner_.get(), buflen, offset);
         }
         /**
-         * @brief Replace the backing buffer and reset the write cursor.
+         * @brief Install a buffer, mid-stream if need be (§5.1's buffer-set).
+         *
+         * This is what a flush sink that **takes** the buffer — hands it to a
+         * transport, queues it for an asynchronous write, gives it to DMA — must
+         * call before returning; returning without calling it means the sink
+         * copied, and the encoder reuses the same buffer from offset 0.
+         *
+         * **The start offset belongs to this installation, not to the buffer**,
+         * and it is consumed: passing the *same* buffer again is a new
+         * installation like any other, which is how a sink re-arms header room in
+         * every flushed packet where a bare return would not.
+         *
+         * With a sink installed the buffer must leave at least
+         * @ref MIN_OUTPUT_BUFFER writable bytes (`buflen - offset`); an undersized
+         * one — or an offset past @p buflen — is rejected **here** rather than
+         * partway through a message, leaving the stream inert with @ref ok false
+         * and @ref error reporting @ref Error::InvalidArgument.
+         *
          * @param buffer New backing storage to adopt.
          * @param buflen Capacity of @p buffer in bytes.
          * @param offset Number of leading bytes to reserve before the write cursor.

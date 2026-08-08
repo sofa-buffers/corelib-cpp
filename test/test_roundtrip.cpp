@@ -3523,6 +3523,193 @@ static void nestedArrayCountCeiling()
     }
 }
 
+/* --- MIN_OUTPUT_BUFFER (§5.1): the smallest buffer this port accepts FOR
+ *     STREAMING, declared so a caller can size a streaming buffer from the API
+ *     instead of finding out at runtime. It binds a buffer installed together
+ *     with a flush sink and no other buffer at all, and it is enforced where the
+ *     buffer is handed over rather than partway through a message. Before the
+ *     check existed, a zero-room buffer behind a sink drove pushByte past the
+ *     end of the allocation. --- */
+
+static void minOutputBuffer()
+{
+    static_assert(sofab::MIN_OUTPUT_BUFFER >= 1 && sofab::MIN_OUTPUT_BUFFER <= 20,
+                  "§5.1: the declaration must be at least 1 and at most 20");
+
+    const size_t min = sofab::MIN_OUTPUT_BUFFER;
+
+    /* One byte short of the minimum, WITH a sink: rejected at installation. The
+     * buffer is deliberately larger than the room granted, so an encoder that
+     * ignored the rejection would still have somewhere to scribble and the
+     * failure would show up as bytes rather than as a crash. */
+    {
+        std::vector<uint8_t> buf(min + 8, 0xAA);
+        size_t handed = 0;
+        sofab::OStreamView os([&handed](std::span<const uint8_t> d){ handed += d.size(); },
+                              buf.data(), buf.size(), buf.size() - (min - 1));
+        CHECK(!os.ok() && os.error() == sofab::Error::InvalidArgument,
+              "MIN_OUTPUT_BUFFER: an undersized buffer with a sink is rejected where it is handed over");
+        auto r = os.write(1, uint64_t{5});
+        CHECK(r.code() == sofab::Error::InvalidArgument,
+              "MIN_OUTPUT_BUFFER: a write on a rejected installation reports the rejection");
+        CHECK(handed == 0 && os.bytesUsed() == 0,
+              "MIN_OUTPUT_BUFFER: a rejected installation writes and flushes nothing");
+    }
+
+    /* An offset past the buffer end goes through the same mechanism. */
+    {
+        std::vector<uint8_t> buf(4);
+        sofab::OStreamView os(buf.data(), buf.size(), 9);
+        CHECK(!os.ok() && os.error() == sofab::Error::InvalidArgument,
+              "MIN_OUTPUT_BUFFER: an out-of-range start offset is rejected the same way");
+    }
+
+    /* The converse, and the reason the constant is confined to the streaming
+     * case: the same undersized buffer WITHOUT a sink is accepted, and a message
+     * that fits encodes into it. A two-byte message must encode into two bytes
+     * whatever this port declares. */
+    {
+        uint8_t buf[2];
+        sofab::OStreamView os(buf, sizeof buf);
+        auto r = os.write(0, uint64_t{0});
+        CHECK(os.ok() && r.code() == sofab::Error::None && os.bytesUsed() == 2,
+              "MIN_OUTPUT_BUFFER: no minimum applies without a sink (2-byte message, 2-byte buffer)");
+        CHECK(buf[0] == 0x00 && buf[1] == 0x00,
+              "MIN_OUTPUT_BUFFER: the sink-less two-byte encode produces the canonical bytes");
+    }
+
+    /* Encode into EXACTLY the declared minimum, over a payload far longer than
+     * the buffer, so the divisible run of a string is split across many flushes
+     * (§5.1). The concatenation must be byte-identical to the one-shot output. */
+    {
+        const std::string payload(3000, 'q');
+        std::vector<uint8_t> one(4096);
+        sofab::OStreamView oneShot(one.data(), one.size());
+        oneShot.write(1, payload);
+        CHECK(oneShot.ok(), "MIN_OUTPUT_BUFFER: the one-shot reference encode succeeds");
+        one.resize(oneShot.bytesUsed());
+
+        std::vector<uint8_t> out, buf(min, 0xAA);
+        sofab::OStreamView os([&out](std::span<const uint8_t> d){ out.insert(out.end(), d.begin(), d.end()); },
+                              buf.data(), buf.size(), 0);
+        os.write(1, payload);
+        os.flush();
+        CHECK(os.ok() && out == one,
+              "MIN_OUTPUT_BUFFER: encoding into exactly the minimum equals the one-shot bytes");
+    }
+}
+
+/* --- The returning-flush-callback contract (§5.1). A sink either COPIES the
+ *     bytes it was handed -- it returns without installing anything, and the
+ *     encoder resumes in the same buffer at offset 0 -- or it TAKES the buffer
+ *     and must install a replacement before returning. The encoder cannot tell
+ *     the two apart by inspection, so the callback states it by what it does.
+ *
+ *     The start offset belongs to the INSTALLATION, not to the buffer, and is
+ *     consumed: that is how a sink re-arms header room in every packet, where a
+ *     bare return would not. Previously the cursor was reset to the buffer start
+ *     unconditionally after the callback returned, which silently discarded a
+ *     replacement's offset -- so only the very first packet ever got its
+ *     reservation. --- */
+
+static void flushHandover()
+{
+    constexpr size_t kCap = 16, kHdr = 4;
+    const std::string payload(40, 'x');
+
+    /* The reference: the same message encoded in one pass. */
+    std::vector<uint8_t> one(256);
+    sofab::OStreamView oneShot(one.data(), one.size());
+    oneShot.write(1, payload);
+    one.resize(oneShot.bytesUsed());
+
+    /* A TAKING sink: it hands each filled buffer onward, scrubs the storage it
+     * gave away, and installs the other buffer with kHdr bytes of header room.
+     * An encoder that kept writing into the buffer it gave away would read back
+     * the fill pattern; one that dropped the replacement's offset would produce
+     * packets with no room in them. */
+    {
+        auto b1 = std::shared_ptr<uint8_t[]>(new uint8_t[kCap]);
+        auto b2 = std::shared_ptr<uint8_t[]>(new uint8_t[kCap]);
+        std::vector<std::vector<uint8_t>> packets;
+        sofab::OStream *osp = nullptr;
+        int taken = 0;
+        auto sink = [&](std::span<const uint8_t> d) {
+            packets.emplace_back(d.begin(), d.end());
+            std::memset((taken % 2) ? b2.get() : b1.get(), 0xEE, kCap); /* scrub what was taken */
+            ++taken;
+            osp->setBuffer((taken % 2) ? b2 : b1, kCap, kHdr);
+        };
+        sofab::OStream os{sink, b1, kCap, kHdr};
+        osp = &os;
+        os.write(1, payload);
+        os.flush();
+
+        bool everyPacketHasRoom = !packets.empty();
+        std::vector<uint8_t> joined;
+        for (const auto &p : packets)
+        {
+            if (p.size() < kHdr) { everyPacketHasRoom = false; continue; }
+            joined.insert(joined.end(), p.begin() + kHdr, p.end());
+        }
+        CHECK(os.ok(), "flush handover: an encode across a taking sink succeeds");
+        CHECK(everyPacketHasRoom,
+              "flush handover: a taking sink gets its start offset back in every packet");
+        CHECK(joined == one,
+              "flush handover: a taking sink's concatenated payload equals the one-shot bytes");
+        CHECK(packets.size() > 1,
+              "flush handover: the buffer really was handed over more than once");
+    }
+
+    /* A COPYING sink: it returns without installing anything, so the same buffer
+     * is reused from offset 0. The reservation belongs to the first installation
+     * only, so it appears in the first packet and nowhere else. */
+    {
+        std::vector<uint8_t> buf(kCap, 0xAA), out;
+        size_t firstPacket = 0;
+        sofab::OStreamView os([&](std::span<const uint8_t> d) {
+                                  if (out.empty()) firstPacket = d.size();
+                                  out.insert(out.end(), d.begin(), d.end());
+                              },
+                              buf.data(), kCap, kHdr);
+        os.write(1, payload);
+        os.flush();
+        CHECK(os.ok(), "flush handover: an encode across a copying sink succeeds");
+        CHECK(firstPacket == kCap,
+              "flush handover: a copying sink's first packet carries the reserved head");
+        CHECK(out.size() == one.size() + kHdr &&
+              std::memcmp(out.data() + kHdr, one.data(), one.size()) == 0,
+              "flush handover: a copying sink resumes at offset 0, so the head is reserved once");
+    }
+
+    /* A sink that takes the buffer on its LAST handover is left holding a fresh
+     * buffer that contains nothing but its own reservation. Draining that as a
+     * packet of its own would invent an empty packet, so the closing flush (and
+     * the destructor's) must stay silent. */
+    {
+        auto b1 = std::shared_ptr<uint8_t[]>(new uint8_t[kCap]);
+        auto b2 = std::shared_ptr<uint8_t[]>(new uint8_t[kCap]);
+        int calls = 0, afterExplicitFlush = 0;
+        {
+            sofab::OStream *osp = nullptr;
+            int taken = 0;
+            auto sink = [&](std::span<const uint8_t>) {
+                ++calls;
+                ++taken;
+                osp->setBuffer((taken % 2) ? b2 : b1, kCap, kHdr);
+            };
+            sofab::OStream os{sink, b1, kCap, kHdr};
+            osp = &os;
+            os.write(1, payload);
+            os.flush();
+            afterExplicitFlush = calls;
+        }
+        CHECK(afterExplicitFlush > 1, "flush handover: the closing taking sink ran");
+        CHECK(calls == afterExplicitFlush,
+              "flush handover: a freshly installed buffer holding only its reservation is not flushed");
+    }
+}
+
 int main()
 {
     encodeVectors();
@@ -3557,6 +3744,8 @@ int main()
     destinationReuse();
     varintWidthSweep();
     nestedArrayCountCeiling();
+    minOutputBuffer();
+    flushHandover();
 
     std::printf("\n%d checks, %d failures\n", g_checks, g_failures);
     return g_failures ? 1 : 0;

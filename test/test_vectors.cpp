@@ -23,6 +23,7 @@
 #include <cstdio>
 #include <cstring>
 #include <limits>
+#include <memory>
 #include <span>
 #include <string>
 #include <vector>
@@ -458,7 +459,7 @@ bool encode(const Vector &v, size_t tiny, std::string &err)
     std::vector<uint8_t> out;
     if (tiny == 0)
     {
-        sofab::OStream os(4096);
+        sofab::OStream os(std::make_shared<uint8_t[]>(4096), 4096);
         for (const Op &op : v.ops)
             if (replay(os, op) != sofab::Error::None) { err = "encode error"; return false; }
         out.assign(os.data(), os.data() + os.bytesUsed());
@@ -491,7 +492,7 @@ bool encodeDropping(const Vector &v, std::string &err)
     if (v.contentless && !v.hasSparse)
     { err = "vector has an empty sequence but no serialized_sparse column"; return false; }
 
-    sofab::OStream os(4096);
+    sofab::OStream os(std::make_shared<uint8_t[]>(4096), 4096);
     for (const Op &op : v.ops)
         if (replay(os, op, /*keepFrames=*/false) != sofab::Error::None) { err = "encode error"; return false; }
     if (os.bytesUsed() != want.size() ||
@@ -640,7 +641,7 @@ bool decode(const Vector &v, bool oneByte, std::string &err, const std::vector<u
 
 bool roundtrip(const Vector &v, std::string &err)
 {
-    sofab::OStream os(4096);
+    sofab::OStream os(std::make_shared<uint8_t[]>(4096), 4096);
     for (const Op &op : v.ops)
         if (replay(os, op) != sofab::Error::None) { err = "rt encode"; return false; }
     Vector tmp = v;
@@ -736,7 +737,7 @@ int main()
         }
         /* encode: writing the raw payload as a string field must be refused. */
         {
-            sofab::OStream os(256);
+            sofab::OStream os(std::make_shared<uint8_t[]>(256), 256);
             std::string_view sv(reinterpret_cast<const char *>(nv.payload.data()), nv.payload.size());
             auto w = os.write(nv.id, sv);
             run(w.code() == sofab::Error::InvalidArgument,
