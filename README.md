@@ -428,6 +428,11 @@ message handed in at once) the cursor walks straight over the caller's contiguou
 - Integer/float arrays decode into the caller-provided `span`/container (float
   arrays via a single `memcpy` on little-endian); `read(void* dst, size_t maxlen)`
   copies a blob out. The stream never allocates the destination.
+- `read(void* dst, size_t maxlen)` **declares a `blob`**, the way every typed read
+  declares its type: it compares the whole wire tag first, so a field that is not a
+  `blob` — an integer, an array, a sequence, an `fp32`, a `string` — is left for the
+  decoder to skip (§7.3), `dst` is untouched and the call returns 0. A zero-length
+  blob also copies 0 bytes, so `consumed()` is what tells the two apart.
 - If a `feed()` chunk ends mid-field, only that trailing field is copied into an
   internal accumulator and re-parsed on the next `feed()`. That accumulator is the
   one piece of library-owned heap on the decode path, and

@@ -1460,6 +1460,85 @@ static void wireTypeGuard()
         }
     }
 
+    /* The RAW read(void*, size_t) overload is a typed read too (issue #80).
+     *
+     * It binds a `blob`, so §7.3 applies to it exactly as to readBlob(): a field
+     * whose tag contradicts must be SKIPPED — destination untouched, decode still
+     * COMPLETE, the following fields still delivered. Without the tag check the
+     * overload used fixLen_ blindly, which is 0 for an integer field (cursor does
+     * not move, payload re-parsed as headers -> phantom fields / InvalidMessage)
+     * and the ELEMENT width for a fixlen array (cursor lands mid-payload -> the
+     * remaining elements are re-parsed as phantom id-0 fields, reported COMPLETE
+     * over corrupt structure). */
+    {
+        struct RawBlobBinder : sofab::IStreamMessage
+        {
+            std::vector<sofab::id> ids;
+            uint8_t dst[8];
+            size_t got = 0;
+            bool consumed = false;
+            RawBlobBinder() { std::memset(dst, 0xEE, sizeof dst); }
+            void deserialize(sofab::IStreamImpl &is, sofab::id id, size_t, size_t) noexcept override
+            {
+                ids.push_back(id);
+                if (id != 1) return;
+                got = is.read(dst, sizeof dst);
+                consumed = is.consumed();
+            }
+        };
+
+        struct RawCase
+        {
+            const char *what;
+            std::vector<uint8_t> bytes;
+            std::vector<sofab::id> ids; /* ids the decode must deliver, in order */
+            size_t got;                 /* bytes the raw read must report */
+        };
+
+        const RawCase cases[] = {
+            /* id1 unsigned 42, then id3 unsigned 7 — the read must not consume it. */
+            {"raw-read: an unsigned scalar is skipped",
+             {0x08, 0x2a, 0x18, 0x07}, {1, 3}, 0},
+            /* id1 signed -21 (zig-zag 0x29), then id2 unsigned 5. */
+            {"raw-read: a signed scalar is skipped",
+             {0x09, 0x29, 0x10, 0x05}, {1, 2}, 0},
+            /* id1 varint array {1,2}, then id2 unsigned 5. */
+            {"raw-read: a varint array is skipped",
+             {0x0b, 0x02, 0x01, 0x02, 0x10, 0x05}, {1, 2}, 0},
+            /* id1 fp32 array of 2 (fixlen word 0x20 = len4|Fp32), then id2 unsigned 5. */
+            {"raw-read: a fixlen array is skipped",
+             {0x0d, 0x02, 0x20, 0, 0, 0, 0, 0, 0, 0, 0, 0x10, 0x05}, {1, 2}, 0},
+            /* id1 fp32 scalar — Fixlen, but the wrong subtype. */
+            {"raw-read: an fp32 scalar is skipped",
+             {0x0a, 0x20, 0, 0, 0, 0, 0x10, 0x05}, {1, 2}, 0},
+            /* id1 string "hi" (0x12 = len2|String) — Fixlen, wrong subtype. */
+            {"raw-read: a string is skipped",
+             {0x0a, 0x12, 'h', 'i', 0x10, 0x05}, {1, 2}, 0},
+            /* id1 sequence (0x0e = id1|SequenceStart, 0x07 = SequenceEnd). */
+            {"raw-read: a sequence is skipped",
+             {0x0e, 0x07, 0x10, 0x05}, {1, 2}, 0},
+            /* CONTROL — a real blob (0x23 = len4|Blob) is read, whole. */
+            {"raw-read: a blob is read",
+             {0x0a, 0x23, 'A', 'B', 'C', 'D', 0x10, 0x05}, {1, 2}, 4},
+        };
+
+        for (const auto &c : cases)
+        {
+            sofab::IStreamObject<RawBlobBinder> in;
+            auto r = in.feed(c.bytes.data(), c.bytes.size());
+            CHECK(r.code() == sofab::Error::None, c.what);
+            CHECK((*in).ids == c.ids, c.what);
+            CHECK((*in).got == c.got, c.what);
+            CHECK((*in).consumed == (c.got != 0), c.what);
+            /* Every skipped case leaves the destination untouched; the control
+             * writes exactly its four payload bytes and nothing past them. */
+            const uint8_t *d = (*in).dst;
+            const bool untouched = d[0] == 0xEE && d[1] == 0xEE && d[2] == 0xEE && d[3] == 0xEE;
+            CHECK(c.got == 0 ? untouched : std::memcmp(d, "ABCD", 4) == 0, c.what);
+            CHECK(d[4] == 0xEE && d[5] == 0xEE && d[6] == 0xEE && d[7] == 0xEE, c.what);
+        }
+    }
+
     /* Direct accessor readout: wire()/fixType() report the delivered form through
      * the public sofab::Wire / sofab::Fix names (the promoted enums). */
     {

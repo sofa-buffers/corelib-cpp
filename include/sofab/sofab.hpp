@@ -4030,15 +4030,26 @@ namespace sofab
          * Copies up to @p maxlen bytes; the field is consumed regardless of how
          * much fit. Call from inside a deliver callback.
          *
+         * Declares a `blob` like @ref readBlob, so it compares the whole tag first
+         * (§7.3): any other field — an integer, a sequence, an array, or another
+         * fixlen subtype — is left for the decoder to skip, with @p dst untouched.
+         * That check is what keeps the cursor sane, because @ref fixLen_ only means
+         * "payload length" for a scalar fixlen field: it is 0 for a varint field and
+         * the per-ELEMENT width for a fixlen array, so consuming on those tags left
+         * the parser standing inside the payload and re-reading it as field headers
+         * (issue #80).
+         *
          * @param dst Destination buffer.
          * @param maxlen Capacity of @p dst in bytes.
          * @return Number of bytes copied (`min(maxlen, payload length)`), or 0 when
          *         the field was not consumed. Zero is therefore ambiguous on its own —
-         *         a zero-length blob also copies nothing — so a caller that needs to
-         *         tell them apart consults @ref consumed().
+         *         a zero-length blob also copies nothing, and so does a skipped
+         *         mismatch — so a caller that needs to tell them apart consults
+         *         @ref consumed().
          */
         size_t read(void *dst, size_t maxlen) noexcept
         {
+            if (!tagMatches(Wire::Fixlen, Fix::Blob)) return 0; /* §7.3 */
             size_t n = std::min(maxlen, fixLen_);
             if (static_cast<size_t>(end_ - p_) < fixLen_)
             {
