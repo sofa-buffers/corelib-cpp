@@ -3477,6 +3477,108 @@ static void heapFreeStorage()
         CHECK((*is).s.empty(), "heapfree: the rejected UTF-8 payload is not stored");
     }
 #endif
+
+    /* --- 6. MESSAGE_SPEC §3: a decoder materializes exactly the M elements the
+     *     wire carries, "the same value on a pre-sized target and on a growable
+     *     one". A count past a heap-free destination's capacity therefore MUST
+     *     NOT be truncated into it — and the truncation would be invisible, since
+     *     the surplus elements are still parsed and the field still consumed.
+     *
+     *     The two rejection categories stay distinguishable (§6.2.1): with no
+     *     declared `count` the capacity is a receiver-side technical limit, so a
+     *     well-formed message is LimitExceeded; with a `count` declared the schema
+     *     bound governs and its violation is INVALID (§7.1). --- */
+    {
+        struct UnboundedArrayMsg : sofab::IStreamMessage
+        {
+            sofab::InlineVector<uint32_t, 4> v;
+            void deserialize(sofab::IStreamImpl &is, sofab::id id, size_t, size_t) noexcept override
+            {
+                if (id == 1) is.readArray(v); /* no declared count */
+            }
+        };
+        struct BoundedArrayMsg : sofab::IStreamMessage
+        {
+            sofab::InlineVector<uint32_t, 4> v;
+            void deserialize(sofab::IStreamImpl &is, sofab::id id, size_t, size_t) noexcept override
+            {
+                if (id == 1) is.readArray(v, 4); /* count: 4 */
+            }
+        };
+        struct GrowableArrayMsg : sofab::IStreamMessage
+        {
+            std::vector<uint32_t> v;
+            void deserialize(sofab::IStreamImpl &is, sofab::id id, size_t, size_t) noexcept override
+            {
+                if (id == 1) is.readArray(v);
+            }
+        };
+
+        const uint32_t ten[10] = {1, 2, 3, 4, 5, 6, 7, 8, 9, 10};
+        uint8_t buf[64];
+        sofab::OStreamView os{buf, sizeof(buf)};
+        (void)os.write(1, std::span<const uint32_t>{ten, 10});
+        CHECK(os.ok(), "heapfree: the ten-element array encodes");
+
+        {
+            sofab::IStreamObject<UnboundedArrayMsg> is;
+            auto r = is.feed(buf, os.bytesUsed());
+            CHECK(r.limitExceeded() && !r.complete() && !r.invalid() && !r.incomplete(),
+                  "heapfree: an unbounded array past InlineVector capacity is LimitExceeded");
+            CHECK(r.code() == sofab::Error::LimitExceeded,
+                  "heapfree: the over-capacity array reports LimitExceeded, not InvalidMessage");
+            CHECK((*is).v.empty(),
+                  "heapfree: the rejected array leaves the destination untouched, not truncated");
+        }
+        {
+            sofab::IStreamObject<BoundedArrayMsg> is;
+            auto r = is.feed(buf, os.bytesUsed());
+            CHECK(r.invalid() && !r.complete() && !r.limitExceeded(),
+                  "heapfree: a count past the declared bound stays INVALID (§7.1)");
+            CHECK((*is).v.empty(), "heapfree: the INVALID array leaves the destination untouched");
+        }
+        {
+            /* Control: the growable destination materializes all ten, so the
+             * rejection above is about capacity and nothing else. */
+            sofab::IStreamObject<GrowableArrayMsg> is;
+            auto r = is.feed(buf, os.bytesUsed());
+            CHECK(r.complete(), "heapfree: the growable destination decodes the same bytes COMPLETE");
+            CHECK((*is).v.size() == 10 && (*is).v[9] == 10,
+                  "heapfree: the growable destination keeps every wire element");
+        }
+        {
+            /* The fp32 array form truncates through a memcpy rather than through
+             * the varint loop, so it needs its own case. */
+            struct FloatArrayMsg : sofab::IStreamMessage
+            {
+                sofab::InlineVector<float, 4> v;
+                void deserialize(sofab::IStreamImpl &is, sofab::id id, size_t, size_t) noexcept override
+                {
+                    if (id == 2) is.readArray(v);
+                }
+            };
+            const float six[6] = {1.f, 2.f, 3.f, 4.f, 5.f, 6.f};
+            uint8_t fbuf[64];
+            sofab::OStreamView fos{fbuf, sizeof(fbuf)};
+            (void)fos.write(2, std::span<const float>{six, 6});
+            sofab::IStreamObject<FloatArrayMsg> is;
+            auto r = is.feed(fbuf, fos.bytesUsed());
+            CHECK(r.limitExceeded() && !r.complete(),
+                  "heapfree: an over-capacity fp32 array is rejected, not memcpy-truncated");
+            CHECK((*is).v.empty(), "heapfree: the rejected fp32 array leaves the destination untouched");
+        }
+        {
+            /* A count that fits is unaffected by the gate. */
+            uint8_t small[32];
+            sofab::OStreamView sos{small, sizeof(small)};
+            (void)sos.write(1, std::span<const uint32_t>{ten, 4});
+            sofab::IStreamObject<UnboundedArrayMsg> is;
+            CHECK(is.feed(small, sos.bytesUsed()).complete(),
+                  "heapfree: a count at the capacity still decodes COMPLETE");
+            CHECK((*is).v.size() == 4 && (*is).v[3] == 4,
+                  "heapfree: the exactly-fitting array keeps every element");
+        }
+    }
 }
 
 /* --- destination reuse across messages (MESSAGE_SPEC §2 + §5.1).
