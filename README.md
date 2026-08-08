@@ -463,8 +463,20 @@ and a **negative** length handed to the raw-blob overload
 generated accessors, but CORELIB_PLAN §6.2 bounds a fixlen payload to
 `0 .. 2,147,483,647`, so the sign is checked *before* the value is widened: the
 encoder never turns `-1` into a huge unsigned length and never reads past the
-object you handed it. Unlike the sticky `BufferFull`, such a rejection is
-per field — `ok()` stays true and the next write encodes normally.
+object you handed it. The stream keeps working after such a rejection: the next
+write encodes normally, and the refused field is simply absent from the wire.
+
+**`ok()` / `error()` is the verdict for the whole encode.** Every refusal above
+is sticky, exactly as `BufferFull` is: the code comes back in that call's
+`Result` *and* latches on the stream, first failure wins. That is what makes the
+verdict usable from generated code, which issues its writes one at a time and
+discards each `Result` — check `os.ok()` once, after the last write, and it is
+false if *anything* the encoder was asked to write did not reach the output
+(CORELIB_PLAN §5.1: an encoder must not hand on partial output as if it were
+complete, and a helper that ignores the report is non-conformant). `error()`
+names the first thing that went wrong: `Error::BufferFull` for an overflow with
+no sink, `Error::InvalidArgument` for a rejected buffer installation or for a
+field the format cannot carry.
 
 **`MIN_OUTPUT_BUFFER` is `1`.** That is the smallest buffer this port accepts
 **for streaming**, and it binds a buffer installed **together with a flush sink**
