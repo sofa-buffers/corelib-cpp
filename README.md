@@ -410,12 +410,38 @@ address-stable destination that a later `feed()` fills). Here `read()` pulls the
 value out immediately, so no per-field destination must stay stable — but the
 **input buffer must outlive any returned view**.
 
-**Encode (`OStream` / `OStreamInline`) — writes into an owned, fixed-size buffer;
-flushes, never grows.** `OStream` owns its buffer through a
-`std::shared_ptr<uint8_t[]>`; `OStreamInline<N>` owns an `N`-byte `std::array` on
-the stack (the *buffer* costs no heap). Neither grows: at the buffer end it calls
-the flush callback with the filled bytes and rewinds; **without** a callback a
+**Encode (`OStream` / `OStreamView` / `OStreamInline`) — writes into a
+caller-supplied, fixed-size buffer; flushes, never grows.** The library
+**allocates no output buffer**: `OStreamView` writes into memory the caller
+already owns, `OStream` adopts a `std::shared_ptr<uint8_t[]>` the caller hands
+it, and `OStreamInline<N>` carries an `N`-byte `std::array` inside the stream
+object itself (so the *buffer* costs no heap). Sizing the storage belongs to the
+layer that knows the schema — generated code allocates `MAX_SIZE` and installs it
+without a sink, or installs a scratch buffer with an appending sink when the
+schema is unbounded. None of the three grows: at the buffer end the stream calls
+the flush callback with the filled bytes and continues; **without** a callback a
 full buffer yields `Error::BufferFull`.
+
+**`MIN_OUTPUT_BUFFER` is `1`.** That is the smallest buffer this port accepts
+**for streaming**, and it binds a buffer installed **together with a flush sink**
+— `buflen - offset` must be at least that much, checked where the buffer is
+handed over (a constructor or `OStream::setBuffer`), never partway through a
+message. A rejected installation leaves the stream inert with `ok() == false` and
+`error() == Error::InvalidArgument`. A buffer installed **without** a sink is
+subject to no minimum at all: no flush can occur, so a two-byte message still
+encodes into a two-byte buffer. Every write funnels through a per-byte fallback
+that flushes across the boundary, so no write has to land contiguously and a
+one-byte buffer streams a message of any size — byte-identical to the one-shot
+output.
+
+**Flush handover.** A sink either *copies* what it is handed — it returns without
+installing anything, and the encoder resumes in the same buffer at offset 0 — or
+it *takes* the buffer, in which case it **must** call `setBuffer` before
+returning. The start offset belongs to the *installation*, not to the buffer, and
+is consumed by the first flush that returns without one; re-installing is how a
+sink re-arms header room in every packet. This port does **not** implement
+pass-through of a `string`/`blob` run, so a sink is only ever handed the buffer it
+installed — never memory belonging to the caller's payload.
 
 The one allocation an encoder can still make is the held-back sequence run (see
 [Sequence framing](#sequence-framing-an-all-default-sub-message-is-omitted)): the
