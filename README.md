@@ -499,6 +499,17 @@ sink re-arms header room in every packet. This port does **not** implement
 pass-through of a `string`/`blob` run, so a sink is only ever handed the buffer it
 installed — never memory belonging to the caller's payload.
 
+**`flush()` without a sink is a no-op.** There is nowhere to drain to, so it
+touches neither the cursor nor the reserved head: it reports the byte count and
+leaves the encoded message exactly where it is, readable through `data()` /
+`bytesUsed()`, with the next write appending after it. Only a *handover the
+callback returned from* moves the cursor back to offset 0, and without a callback
+none happens. That is what makes the one-shot path safe — `OStreamObject::serialize()`
+flushes internally, and a default-constructed one has no sink — and it is why
+`flush()` is not a way to reuse a buffer: there is no reset operation, and a
+stream starts over by installing a buffer (`OStream::setBuffer`) or by being
+constructed anew.
+
 The one allocation an encoder can still make is the held-back sequence run (see
 [Sequence framing](#sequence-framing-an-all-default-sub-message-is-omitted)): the
 list of open-but-unwritten sequence ids. The first eight levels of nesting live

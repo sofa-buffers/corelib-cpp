@@ -4125,6 +4125,99 @@ static void flushHandover()
     }
 }
 
+/* --- A SINK-LESS flush drains nothing, so it must keep everything (§5.1).
+ *
+ *     §5.1 makes flush "drain any remaining buffered bytes at the end", and ties
+ *     the cursor's return to offset 0 to a handover the callback returned from.
+ *     With no callback installed there is no handover and nowhere to drain to,
+ *     so the only conformant thing flush can do to the cursor is nothing:
+ *     rewinding it discards the message the caller just encoded (§5.1 also
+ *     forbids presenting partial output as complete) AND drops the
+ *     installation's start offset, so the next write overwrites the reserved
+ *     head. The bundled one-shot helper hit that unconditionally — a
+ *     default-constructed OStreamObject has no sink, and its serialize() flushes
+ *     — leaving the encoded message unreachable through data()/bytesUsed(). --- */
+
+/* A minimal generated-style message, so the one-shot OStreamObject path can be
+ * exercised the way generated code uses it. */
+struct SinklessProbe : sofab::OStreamMessage
+{
+    static constexpr std::size_t _maxSize = 16;
+    uint64_t value = 7;
+
+    /* public, as generated messages declare it: OStreamObject::serialize calls
+     * it from outside the OStreamImpl friendship. */
+    sofab::OStreamImpl::Result serialize(sofab::OStreamImpl &os) const noexcept override
+    {
+        return os.write(sofab::id(1), value);
+    }
+};
+
+static void sinklessFlush()
+{
+    /* (a) a caller-supplied buffer with a reserved head and no sink */
+    {
+        uint8_t buf[16];
+        std::memset(buf, 0xEE, sizeof buf);
+        sofab::OStreamView os(buf, sizeof buf, 4);
+        os.write(sofab::id(1), uint64_t{1});
+        CHECK(os.bytesUsed() == 6, "sink-less flush: the reserved head counts toward bytesUsed");
+
+        const size_t drained = os.flush();
+        CHECK(drained == 6, "sink-less flush: flush reports what was buffered");
+        CHECK(os.bytesUsed() == 6, "sink-less flush: the buffered message survives the flush");
+        CHECK(toHex({os.data(), os.bytesUsed()}) == "eeeeeeee0801",
+              "sink-less flush: head and message bytes are both still in place");
+
+        /* and the next write appends after the message rather than over it */
+        os.write(sofab::id(2), uint64_t{2});
+        CHECK(os.ok() && os.bytesUsed() == 8,
+              "sink-less flush: a later write appends instead of restarting");
+        CHECK(toHex({os.data(), os.bytesUsed()}) == "eeeeeeee08011002",
+              "sink-less flush: the reserved head is not overwritten by the next write");
+    }
+
+    /* (b) repeated flushes change nothing, and the buffer-full verdict still
+     *     stands after one — flush is not a reset. */
+    {
+        sofab::OStreamInline<4> os;
+        os.write(sofab::id(1), uint64_t{1});
+        os.flush();
+        os.flush();
+        CHECK(os.bytesUsed() == 2 && toHex({os.data(), os.bytesUsed()}) == "0801",
+              "sink-less flush: flushing twice is still a no-op");
+        os.write(sofab::id(2), "abcdefgh");
+        CHECK(!os.ok() && os.error() == sofab::Error::BufferFull,
+              "sink-less flush: a sink-less overflow is still BufferFull");
+        os.flush();
+        CHECK(!os.ok() && os.error() == sofab::Error::BufferFull,
+              "sink-less flush: the verdict is not cleared by a flush");
+    }
+
+    /* (c) the bundled one-shot helper: serialize() flushes internally, and the
+     *     encoded message must still be readable through the documented
+     *     accessors afterwards. */
+    {
+        sofab::OStreamObject<SinklessProbe> obj;
+        auto r = obj.serialize();
+        CHECK(r.code() == sofab::Error::None && obj.ok(),
+              "sink-less flush: OStreamObject::serialize succeeds");
+        CHECK(obj.bytesUsed() == 2,
+              "sink-less flush: OStreamObject::serialize leaves bytesUsed at the encoded length");
+        CHECK(toHex({obj.data(), obj.bytesUsed()}) == "0807",
+              "sink-less flush: the one-shot helper's bytes are reachable after serialize");
+    }
+    {
+        /* the same with a reserved head, which the helper must also keep */
+        sofab::OStreamObject<SinklessProbe, SinklessProbe::_maxSize, 4> obj;
+        auto r = obj.serialize();
+        CHECK(r.code() == sofab::Error::None && obj.ok() && obj.bytesUsed() == 6,
+              "sink-less flush: the one-shot helper keeps its reserved head");
+        CHECK(toHex({obj.data() + 4, 2}) == "0807",
+              "sink-less flush: the one-shot helper's message sits behind the head");
+    }
+}
+
 /* --- Chunk lifetime (CORELIB_PLAN §6, §7.2 item 4): a fed chunk is borrowed
  *     ONLY for the duration of the feed() call. Once it returns, the caller may
  *     reuse, overwrite or free that memory and the decoded message must be
@@ -4368,6 +4461,7 @@ int main()
     negativeBlobSize();
     encodeFailuresAreLatched();
     flushHandover();
+    sinklessFlush();
     chunkLifetime();
 
     std::printf("\n%d checks, %d failures\n", g_checks, g_failures);

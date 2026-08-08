@@ -1819,6 +1819,16 @@ namespace sofab
 
         /**
          * @brief Hand any buffered bytes to the flush callback and rewind the cursor.
+         *
+         * **With no flush callback installed this is a no-op** and the buffered
+         * message stays exactly where it is, reachable through @ref data /
+         * @ref bytesUsed. There is nowhere to drain to, so §5.1's "drain any
+         * remaining buffered bytes" has nothing to do, and the cursor only
+         * returns to offset 0 after a *handover* the callback returned from —
+         * which never happened. Rewinding here would discard the encode and drop
+         * the installation's reserved head, so the next write would overwrite
+         * both.
+         *
          * @return Number of bytes that were buffered before the flush.
          */
         size_t flush() noexcept
@@ -1838,8 +1848,6 @@ namespace sofab
                 flushCallback_(std::span<const uint8_t>(buffer_, used));
                 if (!installed_) { cursor_ = buffer_; offset_ = 0; }
             }
-            else if (!flushCallback_)
-                cursor_ = buffer_;
             return used;
         }
 
