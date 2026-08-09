@@ -698,7 +698,11 @@ Two suites run under CTest:
   three vectors whose sparse form is *pure sequence omission* (the rest of that
   column encodes per-field defaults, which needs a schema and belongs to the
   **generator's** conformance drivers). For every other vector the same replay
-  must reproduce `serialized` unchanged.
+  must reproduce `serialized` unchanged. The file is read and JSON-parsed
+  **once** per run and every group in it (`vectors`, `invalid_utf8`) is walked
+  off that one parse; since the envelope is generated upstream and has grown a
+  top-level key before, each walker demands its own key and the run fails loudly
+  when it is absent, renamed or empty, instead of quietly testing nothing.
 
 ### Coverage and API docs
 

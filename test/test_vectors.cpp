@@ -253,23 +253,82 @@ bool loadOp(const sofab_json_t *fj, Op &op)
     return true;
 }
 
-bool loadVectors(const char *path, std::vector<Vector> &out, std::string &err)
+/* --- the shared vector file -------------------------------------------------
+ *
+ * Read and JSON-parsed ONCE per run: the file holds several top-level groups
+ * ("vectors", "invalid_utf8", …) and each group walker below takes the parsed
+ * root, never a path.
+ *
+ * The envelope is owned upstream (corelib-c-cpp generates it) and has already
+ * grown a key once, so every walker DEMANDS its own top-level array through
+ * group(): a renamed or dropped key is a loud failure instead of an empty list,
+ * which would otherwise read as "nothing to test". */
+struct VectorFile
+{
+    std::string text;
+    sofab_json_t *root = nullptr;
+
+    /*! How often the file has been read this run — the run-once guard in main()
+     *  asserts exactly one (corelib-cpp#100). */
+    static int reads;
+
+    VectorFile() = default;
+    VectorFile(const VectorFile &) = delete;
+    VectorFile &operator=(const VectorFile &) = delete;
+    ~VectorFile() { if (root) sofab_json_free(root); }
+};
+int VectorFile::reads = 0;
+
+bool loadVectorFile(const char *path, VectorFile &vf, std::string &err)
 {
     FILE *f = std::fopen(path, "rb");
     if (!f) { err = "cannot open vector file"; return false; }
+    ++VectorFile::reads;
     std::fseek(f, 0, SEEK_END);
     long n = std::ftell(f);
     std::fseek(f, 0, SEEK_SET);
-    std::string text(static_cast<size_t>(n), '\0');
-    size_t rd = std::fread(text.data(), 1, static_cast<size_t>(n), f);
+    vf.text.assign(static_cast<size_t>(n), '\0');
+    size_t rd = std::fread(vf.text.data(), 1, static_cast<size_t>(n), f);
     std::fclose(f);
-    text.resize(rd);
+    vf.text.resize(rd);
 
     char perr[128];
-    sofab_json_t *root = sofab_json_parse(text.data(), text.size(), perr, sizeof(perr));
-    if (!root) { err = std::string("json parse: ") + perr; return false; }
+    vf.root = sofab_json_parse(vf.text.data(), vf.text.size(), perr, sizeof(perr));
+    if (!vf.root) { err = std::string("json parse: ") + perr; return false; }
+    return true;
+}
 
-    const sofab_json_t *vectors = sofab_json_get(root, "vectors");
+/* The top-level array a group walker consumes. Absent, not an array or empty is
+ * an ERROR — see the VectorFile note on envelope drift. */
+const sofab_json_t *group(const sofab_json_t *root, const char *key, std::string &err)
+{
+    const sofab_json_t *g = root ? sofab_json_get(root, key) : nullptr;
+    if (!g || sofab_json_type(g) != SOFAB_JSON_ARRAY || sofab_json_array_size(g) == 0)
+    {
+        err = std::string("vector file has no non-empty \"") + key + "\" array";
+        return nullptr;
+    }
+    return g;
+}
+
+/* The capability mask from a vector's "requires" tags (both groups carry it). */
+uint32_t reqMask(const sofab_json_t *vj)
+{
+    uint32_t mask = 0;
+    const sofab_json_t *req = sofab_json_get(vj, "requires");
+    size_t nr = sofab_json_array_size(req);
+    for (size_t k = 0; k < nr; k++)
+    {
+        size_t tl; const char *tn = sofab_json_string(sofab_json_array_at(req, k), &tl);
+        if (tn) mask |= capFromName(tn);
+    }
+    return mask;
+}
+
+bool loadVectors(const sofab_json_t *root, std::vector<Vector> &out, std::string &err)
+{
+    const sofab_json_t *vectors = group(root, "vectors", err);
+    if (!vectors) return false;
     size_t nv = sofab_json_array_size(vectors);
     for (size_t i = 0; i < nv; i++)
     {
@@ -282,20 +341,14 @@ bool loadVectors(const char *path, std::vector<Vector> &out, std::string &err)
         for (size_t k = 0; k < nf; k++)
         {
             Op op;
-            if (!loadOp(sofab_json_array_at(fields, k), op)) { err = v.name + ": bad field"; sofab_json_free(root); return false; }
+            if (!loadOp(sofab_json_array_at(fields, k), op)) { err = v.name + ": bad field"; return false; }
             v.ops.push_back(std::move(op));
         }
         const sofab_json_t *skip = sofab_json_get(vj, "skip_ids");
         size_t nsk = sofab_json_array_size(skip);
         for (size_t k = 0; k < nsk; k++)
             v.skip.push_back(static_cast<uint32_t>(sofab_json_u64(sofab_json_array_at(skip, k))));
-        const sofab_json_t *req = sofab_json_get(vj, "requires");
-        size_t nr = sofab_json_array_size(req);
-        for (size_t k = 0; k < nr; k++)
-        {
-            size_t tl; const char *tn = sofab_json_string(sofab_json_array_at(req, k), &tl);
-            if (tn) v.req |= capFromName(tn);
-        }
+        v.req = reqMask(vj);
         /* WHICH COLUMNS THIS REPO ASSERTS.
          *
          * `serialized` -- the primitive-layer ground truth: the exact bytes this
@@ -327,17 +380,16 @@ bool loadVectors(const char *path, std::vector<Vector> &out, std::string &err)
          * directly in test_roundtrip.cpp's lazySequenceFraming() and
          * deepHoldBack(). */
         size_t hl; const char *hex = sofab_json_string(sofab_json_get(sofab_json_get(vj, "serialized"), "hex"), &hl);
-        if (!hex || !hex2bin(hex, hl, v.bytes)) { err = v.name + ": bad hex"; sofab_json_free(root); return false; }
+        if (!hex || !hex2bin(hex, hl, v.bytes)) { err = v.name + ": bad hex"; return false; }
         if (const sofab_json_t *sp = sofab_json_get(vj, "serialized_sparse"))
         {
             size_t sl2; const char *shex = sofab_json_string(sofab_json_get(sp, "hex"), &sl2);
-            if (!shex || !hex2bin(shex, sl2, v.sparse)) { err = v.name + ": bad sparse hex"; sofab_json_free(root); return false; }
+            if (!shex || !hex2bin(shex, sl2, v.sparse)) { err = v.name + ": bad sparse hex"; return false; }
             v.hasSparse = true;
         }
         v.contentless = hasContentlessSequence(v.ops);
         out.push_back(std::move(v));
     }
-    sofab_json_free(root);
     return true;
 }
 
@@ -355,23 +407,10 @@ struct NegVec
     uint32_t req = 0;
 };
 
-bool loadNegVectors(const char *path, std::vector<NegVec> &out, std::string &err)
+bool loadNegVectors(const sofab_json_t *root, std::vector<NegVec> &out, std::string &err)
 {
-    FILE *f = std::fopen(path, "rb");
-    if (!f) { err = "cannot open vector file"; return false; }
-    std::fseek(f, 0, SEEK_END);
-    long n = std::ftell(f);
-    std::fseek(f, 0, SEEK_SET);
-    std::string text(static_cast<size_t>(n), '\0');
-    size_t rd = std::fread(text.data(), 1, static_cast<size_t>(n), f);
-    std::fclose(f);
-    text.resize(rd);
-
-    char perr[128];
-    sofab_json_t *root = sofab_json_parse(text.data(), text.size(), perr, sizeof(perr));
-    if (!root) { err = std::string("json parse: ") + perr; return false; }
-
-    const sofab_json_t *arr = sofab_json_get(root, "invalid_utf8");
+    const sofab_json_t *arr = group(root, "invalid_utf8", err);
+    if (!arr) return false;
     size_t nv = sofab_json_array_size(arr);
     for (size_t i = 0; i < nv; i++)
     {
@@ -381,21 +420,47 @@ bool loadNegVectors(const char *path, std::vector<NegVec> &out, std::string &err
         v.name.assign(nm ? nm : "", nm ? nl : 0);
         const sofab_json_t *idn = sofab_json_get(vj, "id");
         v.id = idn ? static_cast<uint32_t>(sofab_json_u64(idn)) : 0;
-        const sofab_json_t *req = sofab_json_get(vj, "requires");
-        size_t nr = sofab_json_array_size(req);
-        for (size_t k = 0; k < nr; k++)
-        {
-            size_t tl; const char *tn = sofab_json_string(sofab_json_array_at(req, k), &tl);
-            if (tn) v.req |= capFromName(tn);
-        }
+        v.req = reqMask(vj);
         size_t pl; const char *ph = sofab_json_string(sofab_json_get(vj, "string_hex"), &pl);
         size_t sl; const char *sh = sofab_json_string(sofab_json_get(vj, "serialized_hex"), &sl);
         if (!ph || !hex2bin(ph, pl, v.payload) || !sh || !hex2bin(sh, sl, v.serialized))
-        { err = v.name + ": bad hex"; sofab_json_free(root); return false; }
+        { err = v.name + ": bad hex"; return false; }
         out.push_back(std::move(v));
     }
-    sofab_json_free(root);
     return true;
+}
+
+/* --- envelope-drift guard (corelib-cpp#100) ---------------------------------
+ *
+ * Both group walkers now share ONE parse, and each demands its own top-level
+ * key. Feed them a doctored envelope in memory and report, per group, the
+ * walker's VERDICT and how many vectors it produced — kept apart on purpose: a
+ * key the walker no longer recognises must be REJECTED, not silently walked as
+ * an empty (== "nothing to test") list, and those two look the same if only the
+ * count is inspected. */
+struct EnvelopeWalk
+{
+    bool parsed = false;
+    bool vectorsOk = false, negOk = false;
+    size_t nVectors = 0, nNeg = 0;
+};
+
+EnvelopeWalk walkEnvelope(const char *json)
+{
+    EnvelopeWalk w;
+    char perr[128];
+    sofab_json_t *root = sofab_json_parse(json, std::strlen(json), perr, sizeof(perr));
+    if (!root) return w;
+    w.parsed = true;
+    std::vector<Vector> vs;
+    std::vector<NegVec> ns;
+    std::string e;
+    w.vectorsOk = loadVectors(root, vs, e);
+    w.negOk = loadNegVectors(root, ns, e);
+    w.nVectors = vs.size();
+    w.nNeg = ns.size();
+    sofab_json_free(root);
+    return w;
 }
 
 /* Reads the delivered field into a std::string, forcing UTF-8 validation on the
@@ -653,9 +718,17 @@ bool roundtrip(const Vector &v, std::string &err)
 
 int main()
 {
-    std::vector<Vector> vectors;
+    /* One read, one parse: the file carries every group this run walks. */
+    VectorFile vf;
     std::string err;
-    if (!loadVectors(SOFAB_TEST_VECTORS_PATH, vectors, err))
+    if (!loadVectorFile(SOFAB_TEST_VECTORS_PATH, vf, err))
+    {
+        std::printf("load failed: %s\n", err.c_str());
+        return 2;
+    }
+
+    std::vector<Vector> vectors;
+    if (!loadVectors(vf.root, vectors, err))
     {
         std::printf("load failed: %s\n", err.c_str());
         return 2;
@@ -716,7 +789,7 @@ int main()
      * on encode with InvalidArgument (spec §6.4). A non-strict build skips them:
      * with the check compiled out those bytes are accepted verbatim. */
     std::vector<NegVec> negs;
-    if (!loadNegVectors(SOFAB_TEST_VECTORS_PATH, negs, err))
+    if (!loadNegVectors(vf.root, negs, err))
     {
         std::printf("neg load failed: %s\n", err.c_str());
         return 2;
@@ -771,6 +844,60 @@ int main()
 #else
         ++negSkipped;
 #endif
+    }
+
+    /* --- envelope guards (corelib-cpp#100) ---
+     *
+     * Every group above came out of ONE read and ONE parse of the vector file.
+     * Two things have to stay true for that to be safe:
+     *   1. the file really is read once — a second loader creeping back in is a
+     *      silent duplicate of the loading prologue, which then has to be kept in
+     *      step by hand;
+     *   2. each walker owns its top-level key and fails loudly when it is absent,
+     *      renamed or empty. The envelope is generated upstream and has grown a
+     *      key before ("invalid_utf8"); a walker that quietly yields zero vectors
+     *      reports as "nothing to test" and the suite still passes. */
+    run(VectorFile::reads == 1, named("(all)"), "vector-file-read-once",
+        "the vector file was read " + std::to_string(VectorFile::reads) +
+            " times, expected exactly 1");
+
+    {
+        /* minimal, structurally valid members of either group */
+        static const char kVec[] = "{\"name\":\"v\",\"fields\":[],\"serialized\":{\"hex\":\"\"}}";
+        static const char kNeg[] = "{\"name\":\"n\",\"id\":0,\"string_hex\":\"ff\","
+                                   "\"serialized_hex\":\"0201ff\"}";
+        const std::string both  = std::string("{\"vectors\":[") + kVec +
+                                  "],\"invalid_utf8\":[" + kNeg + "]}";
+        const std::string onlyV = std::string("{\"vectors\":[") + kVec + "]}";
+        const std::string onlyN = std::string("{\"invalid_utf8\":[") + kNeg + "]}";
+        const std::string empty = "{\"vectors\":[],\"invalid_utf8\":[]}";
+        const std::string drift = std::string("{\"vectors_v2\":[") + kVec +
+                                  "],\"invalid_utf8_v2\":[" + kNeg + "]}";
+
+        const struct { const char *label; const std::string &json; bool wantV, wantN; } cases[] = {
+            {"envelope-both-groups",     both,  true,  true },
+            {"envelope-no-invalid_utf8", onlyV, true,  false},
+            {"envelope-no-vectors",      onlyN, false, true },
+            {"envelope-empty-groups",    empty, false, false},
+            {"envelope-renamed-keys",    drift, false, false},
+        };
+        for (const auto &c : cases)
+        {
+            const EnvelopeWalk w = walkEnvelope(c.json.c_str());
+            /* Accepted => the group yielded vectors; rejected => none, and the
+             * walker SAID so rather than returning an empty list. */
+            const bool ok = w.parsed &&
+                            w.vectorsOk == c.wantV && (w.nVectors > 0) == c.wantV &&
+                            w.negOk == c.wantN && (w.nNeg > 0) == c.wantN;
+            run(ok, named("(all)"), c.label,
+                !w.parsed ? std::string("probe envelope did not parse")
+                          : "vectors ok=" + std::to_string(static_cast<int>(w.vectorsOk)) +
+                                " n=" + std::to_string(w.nVectors) +
+                                ", invalid_utf8 ok=" + std::to_string(static_cast<int>(w.negOk)) +
+                                " n=" + std::to_string(w.nNeg) + "; expected ok " +
+                                std::to_string(static_cast<int>(c.wantV)) + "/" +
+                                std::to_string(static_cast<int>(c.wantN)));
+        }
     }
 
     std::printf("%zu vectors, %d run, %d skipped, %d checks, %d failures\n",

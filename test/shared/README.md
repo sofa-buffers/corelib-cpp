@@ -61,6 +61,14 @@ happens:
    what it cannot represent. See `assets/test_vectors_README.md` upstream for the
    authoritative format description.
 
+   The **envelope** — the file's top-level keys — is upstream's too, and it has
+   grown a key before (`invalid_utf8`). `test/test_vectors.cpp` reads and parses
+   the file exactly once and walks every group off that single parse; each walker
+   demands its own top-level key and fails the run when it is absent, renamed or
+   empty. A re-sync that reshapes the envelope therefore shows up as a red
+   `test_vectors` reporting `vector file has no non-empty "<key>" array`, not as
+   a green run that silently tested nothing.
+
 After any re-sync, run the suite (`ctest --test-dir build`) — a green
 `test_vectors` run is what proves this implementation still matches the shared
 spec.
