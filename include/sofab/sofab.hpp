@@ -90,9 +90,16 @@ namespace sofab
      * @ref Error::InvalidArgument; decoding one is @ref Error::InvalidMessage.
      */
     inline constexpr uint32_t ID_MAX = 0x7fffffffu;
-    /** Largest fixlen payload byte-length (`INT32_MAX`). */
+    /**
+     * Largest fixlen payload byte-length (`INT32_MAX`). Encoding a longer
+     * payload is @ref Error::InvalidArgument; decoding one is
+     * @ref Error::InvalidMessage.
+     */
     inline constexpr uint32_t FIXLEN_MAX = 0x7fffffffu;
-    /** Largest array element count (`INT32_MAX`). */
+    /**
+     * Largest array element count (`INT32_MAX`). Encoding a longer array is
+     * @ref Error::InvalidArgument; decoding one is @ref Error::InvalidMessage.
+     */
     inline constexpr uint32_t ARRAY_MAX = 0x7fffffffu;
     /**
      * Maximum nested-sequence depth (§4.9). Deeper nesting is rejected
@@ -1187,7 +1194,9 @@ namespace sofab
          * @ref MIN_OUTPUT_BUFFER usable bytes behind a sink) or when a field the
          * caller asked for was refused (a field id past @ref ID_MAX, a
          * sub-message past @ref MAX_DEPTH, a string that is not valid UTF-8
-         * under §6.4, a negative raw-blob length past §6.2's fixlen bound).
+         * under §6.4, an array of more than @ref ARRAY_MAX elements, a payload
+         * past @ref FIXLEN_MAX, a negative raw-blob length past §6.2's fixlen
+         * bound).
          * Only the first is kept: once condemned, the stream stays
          * condemned for the reason it was condemned for.
          *
@@ -1536,13 +1545,20 @@ namespace sofab
          * @param fieldId Field identifier; must not exceed @ref ID_MAX.
          * @param ft Payload sub-type (@ref Fix::String, @ref Fix::Blob, ...).
          * @param data Payload bytes.
-         * @param len Payload length in bytes.
-         * @return @ref Error::InvalidArgument if @p fieldId is too large,
+         * @param len Payload length in bytes; must not exceed @ref FIXLEN_MAX.
+         * @return @ref Error::InvalidArgument if @p fieldId or @p len is too large,
          *         @ref Error::BufferFull on overflow, otherwise @ref Error::None.
          */
         [[nodiscard]] Error writeFixlen(sofab::id fieldId, Fix ft, const uint8_t *data, size_t len) noexcept
         {
             if (fieldId > ID_MAX) [[unlikely]] return latch(Error::InvalidArgument);
+            /* §6.2: @ref FIXLEN_MAX is a format-wide ceiling, so a longer payload
+             * has no fixlen word a reader will take — the one this would emit is
+             * `INVALID` for every decoder (§5.2), this library's own included.
+             * Refused here, next to the id, and refused BEFORE @ref beforeContent
+             * so a held-back sequence run stays held back: the field emits
+             * nothing at all rather than a header its payload never follows. */
+            if (len > static_cast<size_t>(FIXLEN_MAX)) [[unlikely]] return latch(Error::InvalidArgument);
             if (Error e = beforeContent(); e != Error::None) return e;
             /* As in @ref writeScalar, plus the payload. The room test is split so
              * it cannot overflow on a huge @p len. */
@@ -1604,8 +1620,9 @@ namespace sofab
          *
          * @tparam E Integral element type.
          * @param fieldId Field identifier; must not exceed @ref ID_MAX.
-         * @param elems Elements to encode, in order.
-         * @return @ref Error::InvalidArgument if @p fieldId is too large,
+         * @param elems Elements to encode, in order; at most @ref ARRAY_MAX of them.
+         * @return @ref Error::InvalidArgument if @p fieldId is too large or
+         *         @p elems holds more than @ref ARRAY_MAX elements,
          *         @ref Error::BufferFull on overflow, otherwise @ref Error::None.
          */
         template <std::integral E>
@@ -1613,6 +1630,10 @@ namespace sofab
         {
             constexpr bool isSigned = std::is_signed_v<E>;
             if (fieldId > ID_MAX) [[unlikely]] return latch(Error::InvalidArgument);
+            /* §6.2/§4.7: the element count is bounded by @ref ARRAY_MAX, the same
+             * format-wide ceiling the decoder enforces on the count word — see
+             * @ref writeFixlen for why it is refused here and not emitted. */
+            if (elems.size() > static_cast<size_t>(ARRAY_MAX)) [[unlikely]] return latch(Error::InvalidArgument);
             if (Error e = beforeContent(); e != Error::None) return e;
             const uint64_t head = (static_cast<uint64_t>(fieldId) << 3) |
                         static_cast<uint64_t>(isSigned ? Wire::ArraySigned : Wire::ArrayUnsigned);
@@ -1671,8 +1692,9 @@ namespace sofab
          *
          * @tparam F Floating-point element type (`float` or `double`).
          * @param fieldId Field identifier; must not exceed @ref ID_MAX.
-         * @param elems Elements to encode, in order.
-         * @return @ref Error::InvalidArgument if @p fieldId is too large,
+         * @param elems Elements to encode, in order; at most @ref ARRAY_MAX of them.
+         * @return @ref Error::InvalidArgument if @p fieldId is too large or
+         *         @p elems holds more than @ref ARRAY_MAX elements,
          *         @ref Error::BufferFull on overflow, otherwise @ref Error::None.
          */
         template <std::floating_point F>
@@ -1680,6 +1702,9 @@ namespace sofab
         {
             constexpr Fix ft = (sizeof(F) == 4) ? Fix::Fp32 : Fix::Fp64;
             if (fieldId > ID_MAX) [[unlikely]] return latch(Error::InvalidArgument);
+            /* §6.2/§4.8: as in @ref writeIntArray — the count word is bounded by
+             * @ref ARRAY_MAX whatever the element type is. */
+            if (elems.size() > static_cast<size_t>(ARRAY_MAX)) [[unlikely]] return latch(Error::InvalidArgument);
             if (Error e = beforeContent(); e != Error::None) return e;
             /* §4.8: a fixlen array always carries its fixlen_word, even when empty
              * (count == 0), so an empty fp32 and fp64 array stay distinguishable. */
@@ -1876,8 +1901,9 @@ namespace sofab
          * output: an overflow with no flush callback set (@ref OStreamView with a
          * buffer smaller than the message), a rejected buffer installation, a
          * field id past @ref ID_MAX, a sub-message past @ref MAX_DEPTH, a string
-         * that is not valid UTF-8 under §6.4, a negative raw-blob length, and —
-         * rarely — a
+         * that is not valid UTF-8 under §6.4, an array of more than
+         * @ref ARRAY_MAX elements or a payload past @ref FIXLEN_MAX, a negative
+         * raw-blob length, and — rarely — a
          * @ref sequenceBeginLazy that cannot allocate room to hold a header back.
          *
          * @return true while every write this stream was given has been honoured.
@@ -1892,8 +1918,8 @@ namespace sofab
          *         when a buffer installation was rejected (§5.1 — an out-of-range
          *         offset, or fewer than @ref MIN_OUTPUT_BUFFER usable bytes behind
          *         a sink) or a field was refused as unencodable (§6.2's
-         *         @ref ID_MAX and @ref MAX_DEPTH, §6.4's UTF-8 rule), else
-         *         @ref Error::None.
+         *         @ref ID_MAX, @ref ARRAY_MAX, @ref FIXLEN_MAX and
+         *         @ref MAX_DEPTH, §6.4's UTF-8 rule), else @ref Error::None.
          */
         [[nodiscard]] Error error() const noexcept { return failure_; }
 
