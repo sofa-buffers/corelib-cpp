@@ -833,13 +833,15 @@ is better). All three are compiled at `-O3` so the comparison is like-for-like:
 
 | Workload | C | C++ wrapper | this (pure C++20) |
 |---|--:|--:|--:|
-| encode: u64 array (1000) | 124 992 | 125 021 | **38 046** (−70 %) |
-| encode: typical message  |     908 |   1 008 | **270** (−70 %) |
-| decode: u64 array (1000) | 289 941 | 289 942 | **44 835** (−85 %) |
-| decode: typical message  |   2 057 |   2 056 | **1 321** (−36 %) |
+| encode: u64 array (1000) | 124 992 | 125 021 | **35 046** (−72 %) |
+| encode: typical message  |     908 |   1 008 | **224** (−75 %) |
+| decode: u64 array (1000) | 289 941 | 289 942 | **43 830** (−85 %) |
+| decode: typical message  |   2 057 |   2 056 | **1 199** (−42 %) |
 
-All four columns were re-measured together on one machine; the percentages are
-against the C column. Reproduce with `bash bench/run_callgrind.sh` here and the
+The four columns were measured together on one machine and the percentages are
+against the C column. The last column has since been re-measured on its own —
+only this library's code moved — and is the current reading; the two C columns
+are the joint run's. Reproduce with `bash bench/run_callgrind.sh` here and the
 same script in `corelib-c-cpp`.
 
 The encode figures include the §2 sequence hold-back — the price of never
@@ -855,7 +857,19 @@ place without the C port's per-field bookkeeping. The array workloads pull
 furthest ahead because their varint runs establish the ten-byte window once and
 then move whole 64-bit words — eight varint bytes per store on encode, one load
 plus a terminator scan on decode — instead of testing bounds and continuation a
-byte at a time.
+byte at a time. Inside that word step the bit-spread is written as an add rather
+than a mask-and-recombine: once the 7-bit groups are laid out, each round's two
+halves partition the live bits, so `(w & keep) | ((w & move) << k)` is
+`w + (2^k - 1) * (w & move)` and drops a mask and an OR per round.
+
+On the message-shaped workloads the cost is dominated instead by what happens
+*around* the bytes, so that is what the same figures made worth removing: the
+nested-sequence dispatcher took its per-field callback as a `std::function`,
+which cost a construction, a manager-driven destruction and two indirect hops on
+every sub-message read; and the UTF-8 validator re-tested its word-skip
+condition once per character, so a short ASCII payload paid four branches a byte.
+Neither is visible on an array workload, and together they were a fifth of
+`decode: typical message` and a quarter of `encode: typical message`.
 
 In the multi-language arena it lands at a 434-byte wire size (vs protobuf's
 494 bytes) and roughly **1.3× the throughput of protobuf** for a comparable C++

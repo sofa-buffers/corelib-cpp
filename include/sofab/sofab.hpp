@@ -285,8 +285,18 @@ namespace sofab
         {
             uint64_t w = v & 0x00FFFFFFFFFFFFFFull;                                  /* 56 bits */
             w = (w & 0x000000000FFFFFFFull) | ((w & 0x00FFFFFFF0000000ull) << 4);    /* 2 x 28 */
-            w = (w & 0x00003FFF00003FFFull) | ((w & 0x0FFFC0000FFFC000ull) << 2);    /* 4 x 14 */
-            w = (w & 0x007F007F007F007Full) | ((w & 0x3F803F803F803F80ull) << 1);    /* 8 x 7  */
+            /* The last two rounds are spelled as an add rather than the
+             * split-mask-and-recombine of the first. Once the groups are laid
+             * out, the two halves of a round *partition* the live bits — `w`
+             * equals `(w & keep) + (w & move)` exactly — so
+             * `(w & keep) | ((w & move) << k)` is `w + (2^k - 1) * (w & move)`,
+             * which drops one mask and one OR per round. That is three x86
+             * instructions off every varint the encoder writes; on the shared
+             * `u64 array` workload it is ~8 % of the whole encode. The first
+             * round cannot use it: it would need `w` pre-masked to 56 bits in a
+             * register of its own, which costs back more than it saves. */
+            w += 3u * (w & 0x0FFFC0000FFFC000ull);                                   /* 4 x 14 */
+            w += (w & 0x3F803F803F803F80ull);                                        /* 8 x 7  */
             return w;
         }
 
@@ -304,6 +314,45 @@ namespace sofab
             w = (w & 0x00003FFF00003FFFull) | ((w & 0x3FFF00003FFF0000ull) >> 2);    /* 2 x 28 */
             w = (w & 0x000000000FFFFFFFull) | ((w & 0x0FFFFFFF00000000ull) >> 4);    /* 56 bits */
             return w;
+        }
+
+        /**
+         * @brief Store the object representation of a 4- or 8-byte value as
+         *        little-endian bytes.
+         *
+         * The wire is little-endian (§4), so on a little-endian host this is one
+         * unaligned store; elsewhere the bytes are laid down individually. The
+         * hand-rolled shift loop this replaces did not fold into a store on GCC
+         * and cost ten instructions per `fp32` field.
+         *
+         * @tparam U Unsigned type holding the bits (`uint32_t` or `uint64_t`).
+         * @param out Destination, with at least `sizeof(U)` writable bytes.
+         * @param bits Value to lay down.
+         */
+        template <std::unsigned_integral U>
+        inline void storeLittleBits(uint8_t *out, U bits) noexcept
+        {
+            if constexpr (std::endian::native == std::endian::little)
+                std::memcpy(out, &bits, sizeof bits);
+            else
+                for (size_t i = 0; i < sizeof(U); ++i)
+                    out[i] = static_cast<uint8_t>((bits >> (8 * i)) & 0xffu);
+        }
+
+        /** @brief Inverse of @ref storeLittleBits. */
+        template <std::unsigned_integral U>
+        inline U loadLittleBits(const uint8_t *in) noexcept
+        {
+            U bits;
+            if constexpr (std::endian::native == std::endian::little)
+                std::memcpy(&bits, in, sizeof bits);
+            else
+            {
+                bits = 0;
+                for (size_t i = 0; i < sizeof(U); ++i)
+                    bits |= static_cast<U>(in[i]) << (8 * i);
+            }
+            return bits;
         }
 
         /** @brief Load eight little-endian bytes as a 64-bit word (see @ref storeLittle64). */
@@ -411,14 +460,25 @@ namespace sofab
         [[nodiscard]] constexpr bool utf8Valid(const char *data, size_t len) noexcept
         {
             size_t i = 0;
-            uint32_t state = 0;
             while (i < len)
             {
-                /* SWAR: skip runs of ASCII 8 bytes at a time. Payloads in
-                 * practice are overwhelmingly ASCII, and this is where the
-                 * time goes -- a per-byte DFA over the same run is slower. */
+                /* The ASCII run, which is where the time goes: payloads in
+                 * practice are overwhelmingly ASCII, and a per-byte DFA over such
+                 * a run is slower than skipping it. It is walked in two steps,
+                 * word-at-a-time while a whole word is left and byte-at-a-time
+                 * over what remains, and — this is the point — each step runs to
+                 * completion before the other is considered again. Re-testing the
+                 * word condition once per byte, as this loop used to, cost a
+                 * short ASCII payload four branches per character: validating the
+                 * five-byte string of the shared `typical message` workload took
+                 * ~62 instructions, a quarter of the whole encode. */
                 if (!std::is_constant_evaluated())
                 {
+                    /* Spelled `i + 8 <= len`, not `len - i >= 8`: the two are
+                     * equal for `i <= len`, but only the first lets GCC's
+                     * value-range pass see that eight bytes at `data + i` are
+                     * in bounds — the subtraction reads as a possible unsigned
+                     * wrap and costs a bogus -Warray-bounds under -Werror. */
                     while (i + 8 <= len)
                     {
                         uint64_t w;
@@ -426,27 +486,22 @@ namespace sofab
                         if (w & 0x8080808080808080ULL) break;
                         i += 8;
                     }
-                    if (i >= len) break;
                 }
-                /* Stray ASCII tail: a run shorter than 8 bytes never enters the
-                 * SWAR skip, so a mostly-ASCII short payload would otherwise pay
-                 * the DFA's two-lookups-per-byte for plain ASCII. Advance ASCII
-                 * with one branch, exactly as the pre-DFA scalar loop did; only a
-                 * genuine multi-byte lead falls through to the DFA below. */
-                if (static_cast<unsigned char>(data[i]) < 0x80) { ++i; continue; }
-                /* multi-byte: step the DFA until it is back at ACCEPT, then hand
-                 * control to the SWAR loop again. */
-                state = utf8Dfa[256u + state + utf8Dfa[static_cast<unsigned char>(data[i])]];
-                if (state == 12) return false;
-                ++i;
-                while (state != 0 && i < len)
+                while (i < len && static_cast<unsigned char>(data[i]) < 0x80) ++i;
+                if (i >= len) return true;
+                /* multi-byte: step the DFA until it is back at ACCEPT (state 0),
+                 * then hand control back to the ASCII scan. REJECT is state 12. */
+                uint32_t state = 0;
+                do
                 {
                     state = utf8Dfa[256u + state + utf8Dfa[static_cast<unsigned char>(data[i])]];
                     if (state == 12) return false;
                     ++i;
-                }
+                } while (state != 0 && i < len);
+                /* Input ended inside a multi-byte sequence: truncated is INVALID. */
+                if (state != 0) return false;
             }
-            return state == 0;
+            return true;
         }
 
         /**
@@ -1601,14 +1656,15 @@ namespace sofab
                 uint8_t *o = cursor_;
                 o += encodeVarintPadded(o, headerWord(fieldId, Wire::Fixlen));
                 o += encodeVarintPadded(o, fixlenWord(sizeof(F), ft));
-                for (size_t i = 0; i < sizeof(F); ++i) o[i] = static_cast<uint8_t>((bits >> (8 * i)) & 0xff);
+                detail::storeLittleBits(o, bits);
                 cursor_ = o + sizeof(F);
                 return Error::None;
             }
             uint8_t tmp[20];
             size_t n = encodeVarint(tmp, headerWord(fieldId, Wire::Fixlen));
             n += encodeVarint(tmp + n, fixlenWord(sizeof(F), ft));
-            for (size_t i = 0; i < sizeof(F); ++i) tmp[n++] = static_cast<uint8_t>((bits >> (8 * i)) & 0xff);
+            detail::storeLittleBits(tmp + n, bits);
+            n += sizeof(F);
             return pushBytes(tmp, n);
         }
 
@@ -1735,9 +1791,8 @@ namespace sofab
             {
                 for (F v : elems)
                 {
-                    auto bits = detail::floatBits(v);
                     uint8_t tmp[sizeof(F)];
-                    for (size_t i = 0; i < sizeof(F); ++i) tmp[i] = static_cast<uint8_t>((bits >> (8 * i)) & 0xff);
+                    detail::storeLittleBits(tmp, detail::floatBits(v));
                     if (Error e = pushBytes(tmp, sizeof(F)); e != Error::None) return e;
                 }
                 return Error::None;
@@ -2673,18 +2728,20 @@ namespace sofab
          */
         static bool getVarintWindowed(const uint8_t *&p, uint64_t &out, bool *overflow) noexcept
         {
-            /* A single byte still wins on its own: it is one load and one compare
-             * against the word machinery's load, mask and gather. */
-            if (p[0] < 0x80)
-            {
-                out = p[0];
-                ++p;
-                return true;
-            }
             /* Read the first eight bytes as one word and locate the terminator by
              * its clear continuation bit. Everything past it belongs to whatever
              * follows this varint, so it is masked away before the gather. */
             const uint64_t w = detail::loadLittle64(p);
+            /* A single byte still wins on its own: one test against the gather's
+             * dozen ALU ops. It is taken off the word already loaded rather than
+             * from a second byte-sized load of p[0] — the load is on the critical
+             * path either way, and one of the two was pure overhead. */
+            if (!(w & 0x80u))
+            {
+                out = w & 0xffu;
+                ++p;
+                return true;
+            }
             const uint64_t term = ~w & 0x8080808080808080ull;
             if (term) [[likely]]
             {
@@ -2711,7 +2768,10 @@ namespace sofab
              * so callers observe the same position either way. */
             const uint8_t b9 = p[9];
             p += 10;
-            if ((b9 & 0x7f) > 1 || (b9 & 0x80))
+            /* `b9 > 1` is exactly "a payload bit above bit 0, or a continuation
+             * into an eleventh byte": the legal tenth bytes are 0x00 and 0x01 and
+             * nothing else, so the two tests fold into one compare. */
+            if (b9 > 1)
             {
                 if (overflow) *overflow = true;
                 return false;
@@ -2738,7 +2798,7 @@ namespace sofab
             }
             const uint8_t b9 = p[9];
             p += 10;
-            if ((b9 & 0x7f) > 1 || (b9 & 0x80))
+            if (b9 > 1) /* see @ref getVarintWindowed */
             {
                 if (overflow) *overflow = true;
                 return false;
@@ -2901,32 +2961,9 @@ namespace sofab
         template <std::floating_point F>
         static F loadFloat(const uint8_t *p) noexcept
         {
-            if constexpr (sizeof(F) == 4)
-            {
-                uint32_t b = 0;
-                for (int i = 0; i < 4; ++i) b |= static_cast<uint32_t>(p[i]) << (8 * i);
-                return detail::bitsFloat<F>(b);
-            }
-            else
-            {
-                uint64_t b = 0;
-                for (int i = 0; i < 8; ++i) b |= static_cast<uint64_t>(p[i]) << (8 * i);
-                return detail::bitsFloat<F>(b);
-            }
+            using Bits = std::conditional_t<sizeof(F) == 4, uint32_t, uint64_t>;
+            return detail::bitsFloat<F>(detail::loadLittleBits<Bits>(p));
         }
-
-        /**
-         * @brief Advance over one complete field (including nested sequences) without firing callbacks.
-         *
-         * Used to confirm a whole top-level field is present before delivering it.
-         *
-         * @param[in,out] p Cursor; advanced past the field on success.
-         * @param end One past the last readable byte.
-         * @param depth Current nesting depth; nesting past @ref MAX_DEPTH sets the
-         *        error flag (§4.9) so the caller reports @ref Error::InvalidMessage.
-         * @return `true` if a full field was spanned, `false` if the buffer ends
-         *         mid-field or the error flag was set (check @ref error_ to tell them apart).
-         */
 
         /**
          * @brief The §7.3 seam: does the delivered field's wire tag match the one
@@ -3000,11 +3037,21 @@ namespace sofab
          * @ref count_, ...) are set before @p cb runs; a field whose value the
          * callback does not @ref read is skipped automatically.
          *
+         * @tparam Cb The callable's own type, so the call is direct. A
+         *         `std::function` parameter here cost a construction, a
+         *         manager-driven destruction and two indirect hops **per
+         *         sub-message read**, and the `std::function` machinery around
+         *         it accounted for ~13 % of the `decode: typical message`
+         *         profile. The two call sites pass a stateless no-op
+         *         (@ref skipPayload) and a two-pointer lambda (@ref read), so
+         *         the instantiation count is bounded and the body inlines into
+         *         both.
          * @param cb Callback invoked as `(fieldId, size, count)` per field.
          * @param stopAtEnd If `true`, return at a @ref Wire::SequenceEnd
          *        marker (nested level); if `false`, such a marker is a decode error.
          */
-        void dispatchLevel(const std::function<void(sofab::id, size_t, size_t)> &cb, bool stopAtEnd) noexcept
+        template <typename Cb>
+        void dispatchLevel(Cb &&cb, bool stopAtEnd) noexcept
         {
             while (p_ < end_ && !error_ && !incomplete_)
             {
@@ -3015,20 +3062,8 @@ namespace sofab
                     exceedsBuffer(static_cast<size_t>(p_ - fieldStart_), 0))
                 { limitExceeded_ = true; return; }
                 const uint8_t *fieldStart = p_;
-                uint64_t header;
-                bool ovf = false;
-                if (!getVarint(p_, end_, header, &ovf))
-                {
-                    (ovf ? error_ : incomplete_) = true;
-                    return;
-                }
-                if ((header >> 3) > ID_MAX)
-                {
-                    error_ = true;
-                    return;
-                }
-                auto fieldId = static_cast<sofab::id>(header >> 3);
-                type_ = static_cast<Wire>(header & 0x7);
+                if (!parseFieldTag()) return; /* error_ or incomplete_ set */
+                const sofab::id fieldId = fieldId_;
                 /* §5.1/§7: an element index at or past the declared count is
                  * INVALID -- but §7.3 decides first. An element header whose wire
                  * type (or, for a fixlen element type, whose fixlen subtype)
@@ -3067,77 +3102,12 @@ namespace sofab
                     error_ = true; return;
                 }
 
-                /* parse the metadata that precedes the payload */
-                fixLen_ = 0; count_ = 0;
-                if (type_ == Wire::Fixlen)
-                {
-                    uint64_t sub;
-                    if (!getVarint(p_, end_, sub, &ovf))
-                    {
-                        (ovf ? error_ : incomplete_) = true;
-                        return;
-                    }
-                    if (!fixlenWordValid(sub)) /* §4.6/§7 */
-                    {
-                        error_ = true;
-                        return;
-                    }
-                    fixLen_ = static_cast<size_t>(sub >> 3);
-                    fixType_ = static_cast<Fix>(sub & 0x7);
-                }
-                else if (type_ == Wire::ArrayUnsigned || type_ == Wire::ArraySigned)
-                {
-                    uint64_t n;
-                    if (!getVarint(p_, end_, n, &ovf))
-                    {
-                        (ovf ? error_ : incomplete_) = true;
-                        return;
-                    }
-                    if (n > ARRAY_MAX) /* §6.2/§7 */
-                    {
-                        error_ = true;
-                        return;
-                    }
-                    count_ = static_cast<size_t>(n);
-                }
-                else if (type_ == Wire::ArrayFixlen)
-                {
-                    uint64_t n;
-                    if (!getVarint(p_, end_, n, &ovf))
-                    {
-                        (ovf ? error_ : incomplete_) = true;
-                        return;
-                    }
-                    /* §4.8 step 1: the FORMAT ceiling fires on the count word
-                     * whatever the subtype turns out to be, so an absurd count is
-                     * rejected before anything is sized from it. Without this the
-                     * `count_ * fixLen_` byte-span below wraps size_t — a count of
-                     * 2^62 with 4-byte elements wraps to zero and the array is
-                     * skipped as if it were empty, so a message that must be
-                     * INVALID decodes COMPLETE. The top-level path
-                     * (@ref parseFieldHeader) has always checked this; this
-                     * nested one did not. */
-                    if (n > ARRAY_MAX) /* §6.2/§7 */
-                    {
-                        error_ = true;
-                        return;
-                    }
-                    count_ = static_cast<size_t>(n);
-                    /* §4.8: the fixlen_word is always present, even for an empty array. */
-                    uint64_t sub;
-                    if (!getVarint(p_, end_, sub, &ovf))
-                    {
-                        (ovf ? error_ : incomplete_) = true;
-                        return;
-                    }
-                    if (!arrayFixlenWordValid(sub)) /* §4.8/§7 */
-                    {
-                        error_ = true;
-                        return;
-                    }
-                    fixLen_ = static_cast<size_t>(sub >> 3); /* element size */
-                    fixType_ = static_cast<Fix>(sub & 0x7);
-                }
+                /* The metadata that precedes the payload — one parser, shared
+                 * with the top level (@ref parseFieldMeta). It used to be copied
+                 * out here, and the copy silently lost the §6.2 count ceiling on
+                 * a nested fixlen array until #103 put it back; a second copy of
+                 * a validating parser is a hole waiting to reopen. */
+                if (!parseFieldMeta()) return;
 
                 /* the fixlen word is in: §7.3 first, then the §5.1/§7 bound. */
                 if (boundPending)
@@ -3538,27 +3508,56 @@ namespace sofab
         }
 
         /**
-         * @brief Parse one field header plus the metadata that precedes its
-         *        payload, into the current-field members.
+         * @brief Parse a field header word into @ref fieldId_ and @ref type_ (§4.3).
          *
-         * @return `true` when the header is complete and well-formed. On `false`
-         *         either @ref error_ (malformed) or @ref incomplete_ (more bytes
-         *         needed) is set.
+         * The **only** place a `(id << 3) | wire_type` word is taken apart. Both
+         * parse loops — @ref parseTopLevel through @ref parseFieldHeader, and
+         * @ref dispatchLevel inside a sequence — come through here, so the
+         * @ref ID_MAX ceiling (§6.2) cannot be present in one and missing from
+         * the other.
+         *
+         * @return `true` when a whole header word was read and its id is legal.
+         *         On `false` either @ref error_ (a > 64-bit varint, or an id past
+         *         @ref ID_MAX) or @ref incomplete_ (the word is cut short) is set.
          */
-        bool parseFieldHeader() noexcept
+        bool parseFieldTag() noexcept
         {
             uint64_t header;
             bool ovf = false;
             if (!getVarint(p_, end_, header, &ovf))
-            { if (ovf) error_ = true; else incomplete_ = true; return false; }
-            if ((header >> 3) > ID_MAX)
+            {
+                (ovf ? error_ : incomplete_) = true;
+                return false;
+            }
+            if ((header >> 3) > ID_MAX) /* §6.2/§7 */
             {
                 error_ = true;
                 return false;
             }
             fieldId_ = static_cast<sofab::id>(header >> 3);
             type_ = static_cast<Wire>(header & 0x7);
+            return true;
+        }
+
+        /**
+         * @brief Parse the word(s) between a field header and its payload —
+         *        the fixlen word (§4.6), the array count (§4.7) or both (§4.8).
+         *
+         * Shared by the two parse loops for the same reason as @ref parseFieldTag:
+         * this is where §4.6's subtype/length pairing, §4.8's element-subtype rule
+         * and §6.2's @ref ARRAY_MAX ceiling are enforced, and a second copy of it
+         * is a place for one of them to go missing — which is exactly how the
+         * nested path lost the @ref ARRAY_MAX check on a fixlen array until #103.
+         * A varint or sequence header states no metadata, so it falls through.
+         *
+         * @return `true` when the metadata is complete and well-formed, with
+         *         @ref fixLen_, @ref count_ and @ref fixType_ set. On `false`
+         *         either @ref error_ or @ref incomplete_ is set.
+         */
+        bool parseFieldMeta() noexcept
+        {
             fixLen_ = 0; count_ = 0;
+            bool ovf = false;
             switch (type_)
             {
                 case Wire::Fixlen:
@@ -3576,7 +3575,7 @@ namespace sofab
                     }
                     fixLen_ = static_cast<size_t>(sub >> 3);
                     fixType_ = static_cast<Fix>(sub & 0x7);
-                    break;
+                    return true;
                 }
                 case Wire::ArrayUnsigned:
                 case Wire::ArraySigned:
@@ -3593,7 +3592,7 @@ namespace sofab
                         return false;
                     }
                     count_ = static_cast<size_t>(n);
-                    break;
+                    return true;
                 }
                 case Wire::ArrayFixlen:
                 {
@@ -3603,7 +3602,14 @@ namespace sofab
                         (ovf ? error_ : incomplete_) = true;
                         return false;
                     }
-                    if (n > ARRAY_MAX)
+                    /* §4.8 step 1: the FORMAT ceiling fires on the count word
+                     * whatever the subtype turns out to be, so an absurd count is
+                     * rejected before anything is sized from it. Without it the
+                     * `count_ * fixLen_` byte-span computed downstream wraps
+                     * size_t — a count of 2^62 with 4-byte elements wraps to zero
+                     * and the array is skipped as if it were empty, so a message
+                     * that must be INVALID decodes COMPLETE (#103). */
+                    if (n > ARRAY_MAX) /* §6.2/§7 */
                     {
                         error_ = true;
                         return false;
@@ -3621,16 +3627,38 @@ namespace sofab
                         error_ = true;
                         return false;
                     }
-                    fixLen_ = static_cast<size_t>(sub >> 3);
+                    fixLen_ = static_cast<size_t>(sub >> 3); /* element size */
                     fixType_ = static_cast<Fix>(sub & 0x7);
-                    break;
+                    return true;
                 }
-                case Wire::SequenceEnd:
-                    error_ = true; return false; /* §7: dangling end at the root */
                 default:
-                    break;
+                    return true; /* varint and sequence headers carry no metadata */
             }
-            return true;
+        }
+
+        /**
+         * @brief Parse one **top-level** field header plus the metadata that
+         *        precedes its payload, into the current-field members.
+         *
+         * @ref parseFieldTag + @ref parseFieldMeta, with the one rule that is the
+         * top level's own: a @ref Wire::SequenceEnd here closes a sequence that
+         * was never opened, which is `INVALID` (§7). Inside a sequence the same
+         * marker is the close, which is why @ref dispatchLevel puts its own test
+         * between the two calls.
+         *
+         * @return `true` when the header is complete and well-formed. On `false`
+         *         either @ref error_ (malformed) or @ref incomplete_ (more bytes
+         *         needed) is set.
+         */
+        bool parseFieldHeader() noexcept
+        {
+            if (!parseFieldTag()) return false;
+            if (type_ == Wire::SequenceEnd) /* §7: dangling end at the root */
+            {
+                error_ = true;
+                return false;
+            }
+            return parseFieldMeta();
         }
 
         /**
@@ -3759,10 +3787,9 @@ namespace sofab
                 for (size_t k = 0; k < fit; ++k, ++i)
                 {
                     uint64_t raw;
-                    bool ovf = false;
-                    if (!getVarintWindowed(p_, raw, &ovf))
+                    if (!getVarintWindowed(p_, raw, nullptr))
                     {
-                        (ovf ? error_ : incomplete_) = true;
+                        error_ = true; /* only a > 64-bit varint can fail here */
                         return false;
                     }
                     if (!store(i, raw)) return false;
@@ -4326,6 +4353,13 @@ namespace sofab
         }
 
         /**
+         * @return `true` when a read in this delivery consumed the field. `false`
+         *         means the field was declined (skipped) or its payload has not
+         *         arrived yet, in which case it is delivered again later.
+         */
+        [[nodiscard]] bool consumed() const noexcept { return consumed_; }
+
+        /**
          * @brief Wire type of the field currently being delivered.
          *
          * Valid inside a deliver callback. Introspection only: the typed reads
@@ -4337,13 +4371,6 @@ namespace sofab
          *
          * @return The delivered field's @ref Wire.
          */
-        /**
-         * @return `true` when a read in this delivery consumed the field. `false`
-         *         means the field was declined (skipped) or its payload has not
-         *         arrived yet, in which case it is delivered again later.
-         */
-        [[nodiscard]] bool consumed() const noexcept { return consumed_; }
-
         [[nodiscard]] Wire wire() const noexcept { return type_; }
 
         /**
