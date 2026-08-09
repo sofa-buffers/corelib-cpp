@@ -7,6 +7,12 @@ add_executable(test_roundtrip test_roundtrip.cpp)
 # the call site and reports a mismatch, which it is not — the pair is consistent.
 target_compile_options(test_roundtrip PRIVATE -Wall -Wextra -Wpedantic -Werror
     -Wno-mismatched-new-delete)
+# headerParsersEnforceCeilings() reads the header source itself: a copy of the
+# field-header parser that no entry point reaches cannot be caught by feeding
+# bytes, so the check that every decode site carries the §4.6/§4.8/§6.2 ceilings
+# has to be structural.
+target_compile_definitions(test_roundtrip PRIVATE
+    SOFAB_HEADER_SOURCE_PATH="${PROJECT_SOURCE_DIR}/include/sofab/sofab.hpp")
 target_link_libraries(test_roundtrip PRIVATE sofab_cpp)
 add_test(NAME test_roundtrip COMMAND test_roundtrip)
 
