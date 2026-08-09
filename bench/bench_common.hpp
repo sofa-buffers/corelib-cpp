@@ -18,6 +18,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <ctime>
 #include <utility>
 
@@ -44,6 +45,19 @@ class OStreamRaw : public sofab::OStreamImpl
 {
 public:
     void init(uint8_t *b, size_t n) noexcept { initBuffer(b, n, 0); }
+
+    /*!
+     * A caller-supplied buffer installed **with a flush sink** — CORELIB_PLAN
+     * §5.1's streaming half, and the only configuration in which a message
+     * larger than the buffer can be encoded at all. `encode: blob 1MB streaming`
+     * is the workload that drives it (BENCH_SPEC), through a buffer of exactly
+     * 4096 bytes.
+     */
+    void init(flushCallback cb, uint8_t *b, size_t n) noexcept
+    {
+        flushCallback_ = std::move(cb);
+        initBuffer(b, n, 0);
+    }
 };
 
 class IStreamRaw : public sofab::IStreamImpl
@@ -71,6 +85,26 @@ inline uint64_t cycles() noexcept
 /*! Process CPU time in seconds (not wall-clock). */
 inline double cpu_now() noexcept { return (double)std::clock() / (double)CLOCKS_PER_SEC; }
 
+/*!
+ * @brief How long one measured loop runs, in CPU seconds.
+ *
+ * BENCH_SPEC fixes this at ~1 s and that is the default; nothing that publishes
+ * a number changes it. The environment override exists for the one caller that
+ * is not after a number — `test_bench_tools.sh`, which holds the printed tables
+ * against BENCH_SPEC's output grammar and would otherwise spend a minute of CI
+ * producing figures it discards. Driving the real loop over a token budget keeps
+ * that check on the same code path as the real run.
+ */
+inline double loopSeconds() noexcept
+{
+    static const double v = [] {
+        const char *e = std::getenv("SOFAB_BENCH_SECONDS");
+        const double d = e ? std::atof(e) : 0.0;
+        return d > 0.0 ? d : 1.0;
+    }();
+    return v;
+}
+
 /* Block size for the timed loop: enough iterations that one clock reading is a
  * rounding error against them. std::clock() is a real cost — on a host without
  * a vDSO fast path for CLOCK_PROCESS_CPUTIME_ID it runs to about a microsecond,
@@ -80,16 +114,21 @@ inline double cpu_now() noexcept { return (double)std::clock() / (double)CLOCKS_
  * so every clock() call in between is counted as part of the work. The spec asks
  * for a ~1 s CPU-time loop and a warmup; how often the clock is sampled inside
  * that loop is ours to choose. */
-constexpr double kBlockSeconds = 0.01; /* clock cost lands under ~0.01% of a block */
+inline double blockSeconds() noexcept
+{
+    const double s = loopSeconds() / 100.0; /* clock cost under ~0.01% of a block */
+    return s < 0.01 ? s : 0.01;
+}
 
-/*! Grow a block of back-to-back operations until it spans ::kBlockSeconds. */
+/*! Grow a block of back-to-back operations until it spans ::blockSeconds. */
 template <class F> inline unsigned long calibrateBlock(F &&body)
 {
+    const double target = blockSeconds();
     for (unsigned long block = 1;; block *= 2)
     {
         const double t0 = cpu_now();
         for (unsigned long k = 0; k < block; ++k) body();
-        if (cpu_now() - t0 >= kBlockSeconds) return block;
+        if (cpu_now() - t0 >= target) return block;
     }
 }
 
@@ -105,6 +144,7 @@ struct MeasureResult
 template <class F> inline MeasureResult measureLoop(F &&body, size_t bytes)
 {
     const unsigned long block = calibrateBlock(body);
+    const double budget = loopSeconds();
 
     unsigned long it = 0;
     double el;
@@ -114,7 +154,7 @@ template <class F> inline MeasureResult measureLoop(F &&body, size_t bytes)
         for (unsigned long k = 0; k < block; ++k) body();
         it += block;
         el = cpu_now() - t0;
-    } while (el < 1.0);
+    } while (el < budget);
     const uint64_t c1 = cycles();
 
     return MeasureResult{it, (double)(c1 - c0) / (double)it, el / (double)it * 1e9,

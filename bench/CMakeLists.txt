@@ -29,11 +29,14 @@ if(VALGRIND_EXECUTABLE)
     add_dependencies(run_bench_callgrind bench)
 endif()
 
-# The three tools stay comparable only while they share one definition of the
-# workloads, the stream adapters and the timing rules. This checks that sharing
-# structurally, and drives `bench --list` plus run_callgrind.sh end to end (with a
-# stub valgrind, so it needs no Valgrind and runs in milliseconds).
+# BENCH_SPEC fixes the workloads, their parity sizes and the output grammar, and
+# CORELIB_PLAN §10 requires all three tools to follow it from one definition of
+# the workloads, the stream adapters and the timing rules. This checks the
+# published set against BENCH_SPEC, holds both printed tables against its
+# regexes, checks the sharing structurally, and drives `bench --list` plus
+# run_callgrind.sh end to end (with a stub valgrind, so it needs no Valgrind and
+# runs in milliseconds).
 add_test(NAME test_bench_tools
     COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/test_bench_tools.sh
-            $<TARGET_FILE:bench> ${CMAKE_CURRENT_SOURCE_DIR})
+            $<TARGET_FILE:bench> ${CMAKE_CURRENT_SOURCE_DIR} $<TARGET_FILE:perf>)
 set_tests_properties(test_bench_tools PROPERTIES SKIP_RETURN_CODE 77)
