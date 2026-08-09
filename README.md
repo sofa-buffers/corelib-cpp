@@ -444,6 +444,14 @@ message handed in at once) the cursor walks straight over the caller's contiguou
   `blob` — an integer, an array, a sequence, an `fp32`, a `string` — is left for the
   decoder to skip (§7.3), `dst` is untouched and the call returns 0. A zero-length
   blob also copies 0 bytes, so `consumed()` is what tells the two apart.
+- `read(std::string&)` declares a fixlen **payload**, which is the pair `string`
+  *and* `blob` — a `std::string` owns either one verbatim, and `readString()` /
+  `readBlob()` are how you narrow the declaration to exactly one subtype. An
+  `fp32` or `fp64` field shares `Wire::Fixlen` with them but is a *value*, not a
+  payload, so it is left for the decoder to skip (§7.3): the string keeps what it
+  held instead of receiving the float's four or eight raw bytes as text — which
+  the strict-UTF-8 check would not have looked at either, since it applies to the
+  `string` subtype only.
 - If a `feed()` chunk ends mid-field, only that trailing field is copied into an
   internal accumulator and re-parsed on the next `feed()`. That accumulator is the
   one piece of library-owned heap on the decode path, and
