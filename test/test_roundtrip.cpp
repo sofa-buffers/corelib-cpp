@@ -26,6 +26,23 @@
 #include <utility>
 #include <vector>
 
+/* encodeFormatCeilings() hands the encoder a span longer than the format can
+ * count. A mapping is the only way to own one without committing the memory. */
+#if defined(__unix__) || defined(__unix) || (defined(__APPLE__) && defined(__MACH__))
+#  include <sys/mman.h>
+#  define SOFAB_TEST_HAVE_MMAP 1
+#  ifndef MAP_NORESERVE
+#    define MAP_NORESERVE 0
+#  endif
+#  ifndef MAP_ANONYMOUS
+#    ifdef MAP_ANON
+#      define MAP_ANONYMOUS MAP_ANON
+#    else
+#      undef SOFAB_TEST_HAVE_MMAP
+#    endif
+#  endif
+#endif
+
 static int g_failures = 0;
 static int g_checks = 0;
 
@@ -4272,6 +4289,158 @@ static void negativeBlobSize()
     }
 }
 
+/* --- The other two format ceilings of §6.2, on the ENCODE side. ARRAY_MAX and
+ *     FIXLEN_MAX are properties of the wire format, so a count or a declared
+ *     length above one is INVALID for every decoder (§5.2) -- including this
+ *     library's own, which rejects both words. Only the id was guarded on the
+ *     way out, so an over-long array composed its header and count word into
+ *     the buffer and then stopped on BufferFull: bytes no reader accepts,
+ *     handed on as a partial encode rather than refused as unencodable. With a
+ *     flush sink there is not even a BufferFull to stop it -- the whole 2 GB
+ *     goes out behind a count word the receiver must reject.
+ *
+ *     The over-long arguments are real, not lied about: a MAP_NORESERVE
+ *     read-only mapping owns the address space, every page a read touches
+ *     resolves to the shared zero page, and nothing is committed. Where the
+ *     platform has no mmap, or refuses the size, the case is skipped. --- */
+
+/* Exposes the protected fixlen writer: the public paths cannot reach a length
+ * above FIXLEN_MAX (the raw-blob overload's length is an int32_t, and a string
+ * would have to materialise 2 GB), so the guard is tested where it lives. */
+struct FixlenProbe : sofab::OStreamInline<32>
+{
+    using sofab::OStreamImpl::writeFixlen;
+};
+
+class ZeroMapping
+{
+public:
+    explicit ZeroMapping(size_t n) noexcept
+    {
+#if defined(SOFAB_TEST_HAVE_MMAP)
+        void *p = ::mmap(nullptr, n, PROT_READ,
+                         MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+        if (p != MAP_FAILED) { base_ = static_cast<const uint8_t *>(p); len_ = n; }
+#else
+        (void)n;
+#endif
+    }
+    ZeroMapping(const ZeroMapping &) = delete;
+    ZeroMapping &operator=(const ZeroMapping &) = delete;
+    ~ZeroMapping()
+    {
+#if defined(SOFAB_TEST_HAVE_MMAP)
+        if (base_) ::munmap(const_cast<uint8_t *>(base_), len_);
+#endif
+    }
+    [[nodiscard]] bool ok() const noexcept { return base_ != nullptr; }
+    [[nodiscard]] const uint8_t *data() const noexcept { return base_; }
+
+private:
+    const uint8_t *base_ = nullptr;
+    size_t len_ = 0;
+};
+
+static void encodeFormatCeilings()
+{
+    constexpr size_t kOverArray = static_cast<size_t>(sofab::ARRAY_MAX) + 1;
+    constexpr size_t kOverFixlen = static_cast<size_t>(sofab::FIXLEN_MAX) + 1;
+
+    /* An integer array one element past ARRAY_MAX. */
+    ZeroMapping bytes(kOverArray);
+    if (bytes.ok())
+    {
+        {
+            sofab::OStreamInline<32> os;
+            auto r = os.write(sofab::id(1), std::span<const uint8_t>(bytes.data(), kOverArray));
+            CHECK(r.code() == sofab::Error::InvalidArgument,
+                  "encode ceilings: an array past ARRAY_MAX is InvalidArgument, not BufferFull");
+            CHECK(os.bytesUsed() == 0,
+                  "encode ceilings: no count word above ARRAY_MAX reaches the wire");
+            CHECK(!os.ok() && os.error() == sofab::Error::InvalidArgument,
+                  "encode ceilings: the array refusal reaches the stream verdict (§5.1)");
+
+            /* The stream keeps working, and the next field is the FIRST field on
+             * the wire -- proof that not one byte of the refused array landed. */
+            os.write(sofab::id(1), uint64_t{1});
+            CHECK(toHex({os.data(), os.bytesUsed()}) == "0801",
+                  "encode ceilings: the following field is the only one on the wire");
+        }
+        {   /* With a sink there is no BufferFull to stop the element loop, so an
+             * unguarded encoder streams the whole 2 GB out. */
+            size_t emitted = 0;
+            uint8_t buf[32];
+            sofab::OStreamView os([&emitted](std::span<const uint8_t> d) { emitted += d.size(); },
+                                  buf, sizeof buf, 0);
+            auto r = os.write(sofab::id(1), std::span<const uint8_t>(bytes.data(), kOverArray));
+            CHECK(r.code() == sofab::Error::InvalidArgument,
+                  "encode ceilings: refused on a streaming installation too");
+            os.flush();
+            CHECK(emitted == 0,
+                  "encode ceilings: nothing is handed to the sink");
+        }
+        {   /* Boundary: ARRAY_MAX itself is a legal count, so the write gets past
+             * the ceiling and stops where any oversized array does -- on the
+             * buffer. The guard is `>`, not `>=`. */
+            sofab::OStreamInline<32> os;
+            auto r = os.write(sofab::id(1), std::span<const uint8_t>(bytes.data(), sofab::ARRAY_MAX));
+            CHECK(r.code() == sofab::Error::BufferFull,
+                  "encode ceilings: exactly ARRAY_MAX elements is not refused by the ceiling");
+        }
+        {   /* FIXLEN_MAX, at the boundary, through the protected writer. */
+            FixlenProbe os;
+            CHECK(os.writeFixlen(sofab::id(1), sofab::detail::Fix::Blob,
+                                 bytes.data(), sofab::FIXLEN_MAX) == sofab::Error::BufferFull,
+                  "encode ceilings: a payload of exactly FIXLEN_MAX is not refused by the ceiling");
+        }
+    }
+
+    /* The same one element past ARRAY_MAX for a fixlen (fp32) array, whose count
+     * word sits in front of the fixlen word rather than the payload. */
+    ZeroMapping floats(kOverArray * sizeof(float));
+    if (floats.ok())
+    {
+        sofab::OStreamInline<32> os;
+        std::span<const float> elems(reinterpret_cast<const float *>(floats.data()), kOverArray);
+        auto r = os.write(sofab::id(1), elems);
+        CHECK(r.code() == sofab::Error::InvalidArgument,
+              "encode ceilings: a float array past ARRAY_MAX is InvalidArgument");
+        CHECK(os.bytesUsed() == 0 && !os.ok() && os.error() == sofab::Error::InvalidArgument,
+              "encode ceilings: the float array emits nothing and condemns the stream");
+
+        sofab::OStreamInline<32> os2;
+        auto r2 = os2.write(sofab::id(1), std::span<const float>(elems.data(), sofab::ARRAY_MAX));
+        CHECK(r2.code() == sofab::Error::BufferFull,
+              "encode ceilings: exactly ARRAY_MAX floats is not refused by the ceiling");
+    }
+
+    /* A fixlen payload one byte past FIXLEN_MAX. No mapping is needed: the guard
+     * runs before the pointer is read, and a fixed encoder never reads it. */
+    {
+        FixlenProbe os;
+        const uint8_t *payload = bytes.ok() ? bytes.data() : nullptr;
+        CHECK(os.writeFixlen(sofab::id(1), sofab::detail::Fix::Blob, payload, kOverFixlen) ==
+                  sofab::Error::InvalidArgument,
+              "encode ceilings: a payload past FIXLEN_MAX is InvalidArgument, not BufferFull");
+        CHECK(os.bytesUsed() == 0,
+              "encode ceilings: no fixlen word above FIXLEN_MAX reaches the wire");
+        CHECK(!os.ok() && os.error() == sofab::Error::InvalidArgument,
+              "encode ceilings: the fixlen refusal reaches the stream verdict (§5.1)");
+    }
+
+    /* The refusal must not commit a held-back sequence run either: a sub-message
+     * whose only content is a refused field stays absent from the wire (§2). */
+    if (bytes.ok())
+    {
+        sofab::OStreamInline<64> os;
+        os.sequenceBeginLazy(sofab::id(1));
+        os.write(sofab::id(2), std::span<const uint8_t>(bytes.data(), kOverArray));
+        os.sequenceEnd();
+        CHECK(os.bytesUsed() == 0,
+              "encode ceilings: a refused array does not commit the sequence it sits in");
+    }
+}
+
 /* --- The returning-flush-callback contract (§5.1). A sink either COPIES the
  *     bytes it was handed -- it returns without installing anything, and the
  *     encoder resumes in the same buffer at offset 0 -- or it TAKES the buffer
@@ -4719,6 +4888,7 @@ int main()
     nestedArrayCountCeiling();
     minOutputBuffer();
     negativeBlobSize();
+    encodeFormatCeilings();
     encodeFailuresAreLatched();
     flushHandover();
     sinklessFlush();

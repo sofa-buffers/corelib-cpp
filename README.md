@@ -491,6 +491,7 @@ full buffer yields `Error::BufferFull`.
 **A rejected argument never reaches the buffer.** A write the format cannot carry
 returns `Error::InvalidArgument` and emits *nothing* — a field ID above `ID_MAX`,
 nesting past `MAX_DEPTH`, a non-UTF-8 `string` under the strict check (above),
+an array of more than `ARRAY_MAX` elements or a payload longer than `FIXLEN_MAX`,
 and a **negative** length handed to the raw-blob overload
 `write(id, const void*, int32_t)`. That length is signed for symmetry with the
 generated accessors, but CORELIB_PLAN §6.2 bounds a fixlen payload to
@@ -498,6 +499,18 @@ generated accessors, but CORELIB_PLAN §6.2 bounds a fixlen payload to
 encoder never turns `-1` into a huge unsigned length and never reads past the
 object you handed it. The stream keeps working after such a rejection: the next
 write encodes normally, and the refused field is simply absent from the wire.
+
+`ARRAY_MAX` and `FIXLEN_MAX` are the same §6.2 ceilings the **decoder** enforces
+on a count or length word, and they bind in both directions: a count above
+`ARRAY_MAX`, or a declared length above `FIXLEN_MAX`, is `INVALID` for every
+decoder (§5.2) — this library's own included — so writing one would produce bytes
+nothing can read. Both are checked before any byte of the field is composed, so
+an over-long argument costs one comparison, is never partially written, never
+commits a
+[held-back sequence run](#sequence-framing-an-all-default-sub-message-is-omitted),
+and — with a flush sink installed, where no `BufferFull` would ever stop the
+element loop — never streams a 2 GB body out behind a header the receiver has to
+reject.
 
 **`ok()` / `error()` is the verdict for the whole encode.** Every refusal above
 is sticky, exactly as `BufferFull` is: the code comes back in that call's
