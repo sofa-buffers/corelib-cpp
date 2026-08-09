@@ -684,6 +684,12 @@ Two suites run under CTest:
   skipped sub-sequence, and the §2 sequence framing above (an all-default
   sequence omitted, a kept element frame, hold-back at full `MAX_DEPTH`, and
   identical bytes when a run is committed across a flush boundary).
+  One check in it is structural rather than byte-driven: the header decodes a
+  field header `(id<<3)|type` in more than one place, and a copy that omits the
+  §4.6/§4.8/§6.2 ceilings is a hole that feeding bytes cannot expose for as long
+  as it stays unreachable — so `headerParsersEnforceCeilings()` also scans
+  `include/sofab/sofab.hpp` itself (CMake bakes the path in) and requires every
+  header-decode site to carry those checks.
 - **`test_vectors`** — replays the shared `assets/test_vectors.json` conformance
   suite (copied verbatim from `corelib-c-cpp`, the authoritative source) for
   encode, decode, and byte-at-a-time chunked streaming. It asserts each vector's

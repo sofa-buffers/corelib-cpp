@@ -2937,10 +2937,11 @@ namespace sofab
          * and `blob` all share @ref Wire::Fixlen. Every typed @ref read compares
          * the whole tag here, so half a comparison cannot be written.
          *
-         * On a mismatch the field is left unconsumed: @ref dispatchOne then skips
-         * it exactly like an unknown id, which is what MESSAGE_SPEC §7.3 requires
-         * — this is **not** an error, and never affects the decode outcome. The
-         * skip is counted in @ref skipped_ as a diagnostic.
+         * On a mismatch the field is left unconsumed: the parser that delivered it
+         * — @ref parseTopLevel at the top level, @ref dispatchLevel inside a
+         * sequence — then skips it exactly like an unknown id, which is what
+         * MESSAGE_SPEC §7.3 requires — this is **not** an error, and never affects
+         * the decode outcome. The skip is counted in @ref skipped_ as a diagnostic.
          *
          * A read may admit *more than one* subtype — `read(std::string&)` takes a
          * `string` or a `blob`, since both are fixlen payloads and a std::string
@@ -4355,80 +4356,6 @@ namespace sofab
          * @return The delivered field's @ref Fix.
          */
         [[nodiscard]] Fix fixType() const noexcept { return fixType_; }
-
-    private:
-        /**
-         * @brief Decode the field at the cursor, set its metadata and deliver it to @p cb.
-         *
-         * A field whose value @p cb does not @ref read is skipped automatically.
-         *
-         * @param cb Callback invoked as `(fieldId, size, count)` for the field.
-         */
-        void dispatchOne(const std::function<void(sofab::id, size_t, size_t)> &cb) noexcept
-        {
-            uint64_t header;
-            if (!getVarint(p_, end_, header))
-            {
-                error_ = true;
-                return;
-            }
-            if ((header >> 3) > ID_MAX)
-            {
-                error_ = true;
-                return;
-            }
-            auto fieldId = static_cast<sofab::id>(header >> 3);
-            type_ = static_cast<Wire>(header & 0x7);
-
-            fixLen_ = 0; count_ = 0;
-            if (type_ == Wire::Fixlen)
-            {
-                uint64_t sub;
-                if (!getVarint(p_, end_, sub))
-                {
-                    error_ = true;
-                    return;
-                }
-                fixLen_ = static_cast<size_t>(sub >> 3); fixType_ = static_cast<Fix>(sub & 0x7);
-            }
-            else if (type_ == Wire::ArrayUnsigned || type_ == Wire::ArraySigned)
-            {
-                uint64_t n;
-                if (!getVarint(p_, end_, n))
-                {
-                    error_ = true;
-                    return;
-                }
-                count_ = static_cast<size_t>(n);
-            }
-            else if (type_ == Wire::ArrayFixlen)
-            {
-                uint64_t n;
-                if (!getVarint(p_, end_, n))
-                {
-                    error_ = true;
-                    return;
-                }
-                count_ = static_cast<size_t>(n);
-                /* §4.8: the fixlen_word is always present, even for an empty array. */
-                uint64_t sub;
-                if (!getVarint(p_, end_, sub))
-                {
-                    error_ = true;
-                    return;
-                }
-                fixLen_ = static_cast<size_t>(sub >> 3); fixType_ = static_cast<Fix>(sub & 0x7);
-            }
-
-            consumed_ = false;
-            const uint8_t *payload = p_;
-            cb(fieldId, fixLen_, count_);
-            if (!consumed_)
-            {
-                p_ = payload;
-                skipPayload();
-            }
-        }
     };
 
     /**

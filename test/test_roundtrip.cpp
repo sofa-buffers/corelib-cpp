@@ -14,11 +14,15 @@
 
 #include "sofab/sofab.hpp"
 
+#include <algorithm>
 #include <array>
 #include <cfloat>
+#include <cstddef>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <fstream>
+#include <iterator>
 #include <new>
 #include <span>
 #include <string>
@@ -4143,6 +4147,103 @@ static void nestedArrayCountCeiling()
     }
 }
 
+/* --- Every field-header parser in the header enforces the same ceilings
+ *     (CORELIB_PLAN §4.6, §4.8, §6.2). The header decodes `(id<<3)|type` in more
+ *     than one place, and a copy that omits the ceilings is a latent hole: the
+ *     fixlen-array skip computes `count * element_size`, which wraps size_t for a
+ *     large enough count, so a message that must be INVALID skips as if the array
+ *     were empty and decodes COMPLETE (see nestedArrayCountCeiling above, which is
+ *     that exact regression on the nested copy).
+ *
+ *     Two halves, because one alone cannot see the whole surface. The first drives
+ *     the malformed headers through the CALLBACK entry point, the API a per-field
+ *     dispatcher serves. The second is structural: a copy that is not reachable
+ *     from any entry point cannot be caught by feeding bytes at all, so the source
+ *     is scanned directly and every header-decode site must carry the ceiling
+ *     checks. That is what a dead third parser, unreachable but ready to be wired
+ *     up, trips on (issue #88). --- */
+
+static void headerParsersEnforceCeilings()
+{
+    /* Half 1: the callback entry point rejects each ceiling violation. */
+    auto viaCallback = [](const std::vector<uint8_t> &b) {
+        sofab::IStreamInline in([](sofab::id, size_t, size_t) noexcept {});
+        return in.feed(b.data(), b.size()).code();
+    };
+
+    {   /* id0 fixlen array, count = 2^62, fp32 elements: 2^62 x 4 bytes is exactly
+         * 2^64, so an unchecked skip wraps to zero bytes and swallows the array. */
+        std::vector<uint8_t> b = {0x05};
+        appendVarint(b, uint64_t{1} << 62);
+        b.push_back((4u << 3) | 0u);
+        CHECK(viaCallback(b) == sofab::Error::InvalidMessage,
+              "header parsers: callback path rejects a fixlen-array count past ARRAY_MAX (§6.2)");
+    }
+    {   /* id0 unsigned array, count = 2^31: one past ARRAY_MAX. */
+        std::vector<uint8_t> b = {0x03};
+        appendVarint(b, uint64_t{1} << 31);
+        CHECK(viaCallback(b) == sofab::Error::InvalidMessage,
+              "header parsers: callback path rejects an integer-array count past ARRAY_MAX (§6.2)");
+    }
+    {   /* id0 fixlen, reserved subtype 4 (§4.6). */
+        std::vector<uint8_t> b = {0x02, (4u << 3) | 4u};
+        CHECK(viaCallback(b) == sofab::Error::InvalidMessage,
+              "header parsers: callback path rejects a reserved fixlen subtype (§4.6)");
+    }
+    {   /* id0 fixlen array of `string` elements: only fp32/fp64 are legal (§4.8). */
+        std::vector<uint8_t> b = {0x05, 0x01, (1u << 3) | 2u};
+        CHECK(viaCallback(b) == sofab::Error::InvalidMessage,
+              "header parsers: callback path rejects a non-fp element in a fixlen array (§4.8)");
+    }
+    {   /* Control: a legal two-element fp32 array still decodes. */
+        std::vector<uint8_t> b = {0x05, 0x02, (4u << 3) | 0u};
+        b.insert(b.end(), 8, 0x00);
+        size_t seen = 0;
+        sofab::IStreamInline in([&seen](sofab::id, size_t, size_t) noexcept { ++seen; });
+        CHECK(in.feed(b.data(), b.size()).code() == sofab::Error::None && seen == 1,
+              "header parsers: callback path still decodes a legal fixlen array");
+    }
+
+#ifndef SOFAB_HEADER_SOURCE_PATH
+    /* The path is baked in by test/CMakeLists.txt; a hand-rolled compile of this
+     * file (see the build line at the top) has no way to know it, so say out loud
+     * that the structural half did not run rather than passing quietly. */
+    std::printf("SKIP: header parsers: structural check needs -DSOFAB_HEADER_SOURCE_PATH\n");
+#else
+    /* Half 2: no header-decode site may skip the ceilings, reachable or not. */
+    std::ifstream src(SOFAB_HEADER_SOURCE_PATH, std::ios::binary);
+    std::string text((std::istreambuf_iterator<char>(src)), std::istreambuf_iterator<char>());
+    CHECK(text.size() > 1024, "header parsers: the header source is readable");
+
+    static const char kDecodeSite[] = "static_cast<Wire>(header & 0x7)";
+    std::vector<size_t> sites;
+    for (size_t at = text.find(kDecodeSite); at != std::string::npos;
+         at = text.find(kDecodeSite, at + 1))
+        sites.push_back(at);
+    CHECK(!sites.empty(), "header parsers: at least one field-header decode site is found");
+
+    for (size_t i = 0; i < sites.size(); ++i)
+    {
+        /* The site's region runs to the next decode site (or to the end of the
+         * file), so a newly added parser is measured on its own checks and never
+         * borrows those of the one before it. */
+        const size_t stop = (i + 1 < sites.size()) ? sites[i + 1] : text.size();
+        const std::string region = text.substr(sites[i], stop - sites[i]);
+        const size_t line = 1 + static_cast<size_t>(
+            std::count(text.begin(), text.begin() + static_cast<std::ptrdiff_t>(sites[i]), '\n'));
+
+        for (const char *guard : {"fixlenWordValid", "arrayFixlenWordValid", "ARRAY_MAX"})
+        {
+            char what[192];
+            std::snprintf(what, sizeof what,
+                          "header parsers: the parser at sofab.hpp:%zu checks %s",
+                          line, guard);
+            CHECK(region.find(guard) != std::string::npos, what);
+        }
+    }
+#endif
+}
+
 /* --- MIN_OUTPUT_BUFFER (§5.1): the smallest buffer this port accepts FOR
  *     STREAMING, declared so a caller can size a streaming buffer from the API
  *     instead of finding out at runtime. It binds a buffer installed together
@@ -4951,6 +5052,7 @@ int main()
     varintWidthSweep();
     trailingDefaultsStayOnTheWire();
     nestedArrayCountCeiling();
+    headerParsersEnforceCeilings();
     minOutputBuffer();
     negativeBlobSize();
     encodeFormatCeilings();
