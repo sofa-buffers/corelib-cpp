@@ -168,6 +168,13 @@ namespace sofab
          * @ref InvalidMessage, so a differential fuzzer never reads a local
          * buffering limit as a conformance divergence. The bytes are never clamped
          * or truncated; @ref IStreamImpl::feed simply fails with this code.
+         *
+         * **Never raised for a field the schema bounds** (§6.2.1/§6.3). A declared
+         * `maxlen`/`count` is a statement about *validity* and outranks any
+         * receiver-side statement about *capacity*: an over-bound claim is
+         * @ref InvalidMessage no matter how the cap is configured, so the same
+         * bytes cannot come out as a policy refusal on a receiver that happens to
+         * buffer less. Only a schema-**unbounded** field reaches this code.
          */
         LimitExceeded = 6,
     };
@@ -2413,6 +2420,13 @@ namespace sofab
          * or fixlen-array payload, as it accrues for a sequence -- so an oversized
          * claim fails before its payload is buffered, and even if that payload
          * never arrives. `SIZE_MAX` (the default) means no cap.
+         *
+         * It binds only a field the schema leaves **unbounded**: a declared
+         * `maxlen`/`count` decides first, and its violation is
+         * @ref Error::InvalidMessage rather than @ref Error::LimitExceeded
+         * (§6.2.1/§6.3). An over-cap field is therefore still handed to the deliver
+         * callback -- the only place that bound is known -- but with its payload
+         * withheld, so it can be judged without being materialised.
          */
         size_t max_buffered_field = SIZE_MAX;
     };
@@ -3426,7 +3440,32 @@ namespace sofab
                 incomplete_ = false;
                 if (!parseFieldHeader()) return fieldStart; /* error_ or incomplete_ set */
                 if (capped && exceedsBufferAtHeader(fieldStart))
-                { limitExceeded_ = true; return fieldStart; }
+                {
+                    /* §6.2.1/§6.3: a receiver-side cap "MUST NOT be applied to a
+                     * field the schema already bounds" — there the schema governs
+                     * and an over-bound claim is INVALID, which is why §6.3 says
+                     * LimitExceeded is "never raised for a field the schema bounds"
+                     * (#86). Only the callback knows the declared maxlen/count, so
+                     * the field is offered to it first with its payload WITHHELD:
+                     * end_ sits at the payload's first byte, so a typed read still
+                     * settles the tag (§7.3) and the bound (§7.1) — both decided
+                     * before a byte is copied — and then reports INCOMPLETE instead
+                     * of materialising anything. Nothing is buffered and nothing is
+                     * allocated; the only verdict that can come out of it is the
+                     * INVALID the same bytes get on an uncapped stream. */
+                    if (schemaBoundsHeader(type_))
+                    {
+                        consumed_ = false;
+                        const uint8_t *held = end_;
+                        end_ = p_;
+                        if (!declined_) topCallback_(fieldId_, fixLen_, count_);
+                        end_ = held;
+                        incomplete_ = false;
+                        if (error_) return fieldStart; /* the schema bound spoke first */
+                    }
+                    limitExceeded_ = true;
+                    return fieldStart;
+                }
 
                 consumed_ = false;
                 const uint8_t *payload = p_;
@@ -3554,6 +3593,24 @@ namespace sofab
                     break;
             }
             return true;
+        }
+
+        /**
+         * @brief Does this wire type's header state a size the schema can bound?
+         *
+         * True for the length-prefixed payload (`maxlen`) and the three array kinds
+         * (`count`) — exactly the fields whose §7.1 verdict outranks the reassembly
+         * cap (#86), and exactly the ones @ref exceedsBufferAtHeader derives a size
+         * from. A sequence states no size of its own (it accrues in
+         * @ref dispatchLevel) and a varint carries no length word at all.
+         *
+         * @param w The delivered field's wire type.
+         * @return `true` when a declared `maxlen`/`count` could reject this field.
+         */
+        [[nodiscard]] static constexpr bool schemaBoundsHeader(Wire w) noexcept
+        {
+            return w == Wire::Fixlen || w == Wire::ArrayUnsigned ||
+                   w == Wire::ArraySigned || w == Wire::ArrayFixlen;
         }
 
         /**
@@ -4150,8 +4207,29 @@ namespace sofab
                     return false;
                 }
             }
-            if constexpr (requires { dst.resize(count_); }) dst.resize(count_);
-            else                                            dst = T{};
+            /* Grow only as far as the bytes in hand could ever fill: a varint
+             * element is at least one byte, a fixlen one exactly @ref fixLen_, so
+             * with R bytes readable no more than that many elements can be present.
+             * A count the remaining bytes cannot possibly back therefore never
+             * becomes an allocation — the parse below still runs, so an over-width
+             * element that IS present stays INVALID and a genuinely cut payload
+             * stays INCOMPLETE and is delivered again whole, resized in full then.
+             * When the payload is complete this is exactly `count_`, so nothing
+             * changes for it. It is what lets the reassembly cap withhold an
+             * over-cap payload while the schema `count` above still gets to speak
+             * (#86): a withheld payload cannot make the receiver allocate for a
+             * count it is on the point of refusing. */
+            const uint64_t readable = static_cast<uint64_t>(end_ - p_);
+            const uint64_t needed = type_ == Wire::ArrayFixlen
+                                        ? static_cast<uint64_t>(count_) * fixLen_
+                                        : static_cast<uint64_t>(count_);
+            size_t grow = count_;
+            if (needed > readable) [[unlikely]] /* only a cut or withheld payload */
+                grow = static_cast<size_t>(type_ == Wire::ArrayFixlen
+                                               ? (fixLen_ ? readable / fixLen_ : uint64_t{0})
+                                               : readable);
+            if constexpr (requires { dst.resize(grow); }) dst.resize(grow);
+            else                                          dst = T{};
             if constexpr (std::is_integral_v<Elem> && !std::is_same_v<Elem, bool>)
             {
                 if (elem.armed)
