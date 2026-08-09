@@ -694,6 +694,16 @@ Five suites run under CTest:
   as it stays unreachable — so `headerParsersEnforceCeilings()` also scans
   `include/sofab/sofab.hpp` itself (CMake bakes the path in) and requires every
   header-decode site to carry those checks.
+  Four checks in it are *swept* rather than written once, because the code they
+  cover is a template and one instantiation proves nothing about the next: the
+  bulk array decoder is driven through the whole §7 matrix (tag, `count`, policy
+  cap, destination capacity, element width, both element loops and their surplus
+  halves) for every declared element type and destination shape; every message
+  type the suite declares gets the `reset()` contract checked on its own
+  instantiation; a set of real messages is fed at *every* split point and one
+  byte at a time (§7.2 item 4 — the verdict may not depend on the chunking); and
+  §6.4 is checked with the invalid UTF-8 sequence starting past the end of the
+  first chunk, the case the shared `invalid_utf8` vectors do not reach.
 - **`test_vectors`** — replays the shared `assets/test_vectors.json` conformance
   suite (copied verbatim from `corelib-c-cpp`, the authoritative source) for
   encode, decode, and byte-at-a-time chunked streaming. It asserts each vector's
