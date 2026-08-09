@@ -2891,6 +2891,12 @@ namespace sofab
          * — this is **not** an error, and never affects the decode outcome. The
          * skip is counted in @ref skipped_ as a diagnostic.
          *
+         * A read may admit *more than one* subtype — `read(std::string&)` takes a
+         * `string` or a `blob`, since both are fixlen payloads and a std::string
+         * is the documented destination for either. That is what the two-subtype
+         * overload is for: it is still one comparison of the whole tag, so a
+         * refusal counts exactly one skip, never one per candidate.
+         *
          * @param wantWire Wire type the read declares.
          * @param wantFix  Fixlen subtype it declares; ignored unless @p wantWire is
          *                 a fixlen kind and the caller separates the subtypes.
@@ -2906,6 +2912,15 @@ namespace sofab
         [[nodiscard]] bool tagMatches(Wire wantWire, Fix wantFix) noexcept
         {
             if (type_ == wantWire && fixType_ == wantFix) return true;
+            ++skipped_;
+            return false;
+        }
+
+        /** @copydoc tagMatches(Wire, Fix)
+         *  @param wantFix2 A second admissible fixlen subtype. */
+        [[nodiscard]] bool tagMatches(Wire wantWire, Fix wantFix, Fix wantFix2) noexcept
+        {
+            if (type_ == wantWire && (fixType_ == wantFix || fixType_ == wantFix2)) return true;
             ++skipped_;
             return false;
         }
@@ -3815,7 +3830,17 @@ namespace sofab
             }
             else if constexpr (std::is_same_v<T, std::string>)
             {
-                if (!tagMatches(Wire::Fixlen)) return false; /* §7.3, see the view branch */
+                /* §7.3: a std::string destination declares a fixlen *payload* —
+                 * `string` or `blob`. Both are byte payloads a std::string owns
+                 * verbatim, so either may be read into one (readString/readBlob
+                 * are how a caller narrows it to exactly one). `fp32` and `fp64`
+                 * share Wire::Fixlen with them but are not payloads: comparing
+                 * the wire type alone admitted them and materialised their four
+                 * or eight raw value bytes as text — and, since the UTF-8 gate
+                 * below is on the subtype, without even validating them. They
+                 * are skipped like an unknown id instead. */
+                if (!tagMatches(Wire::Fixlen, Fix::String, Fix::Blob))
+                    return false; /* §7.3, see the view branch */
                 if (static_cast<size_t>(end_ - p_) < fixLen_)
                 {
                     incomplete_ = true;

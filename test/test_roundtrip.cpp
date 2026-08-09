@@ -1462,6 +1462,69 @@ static void wireTypeGuard()
         }
     }
 
+    /* The same subtype nuance with NO hand-written guard (issue #85).
+     *
+     * read(std::string&) is a typed read, and what it declares is a fixlen
+     * *payload* destination — `string` or `blob`. fp32 and fp64 share
+     * Wire::Fixlen with those two, so a wire-type-only comparison let them
+     * through and materialised their raw payload bytes as text: four (fp32) or
+     * eight (fp64) bytes of float straight into the std::string, and under
+     * SOFAB_STRICT_UTF8 not even validated, since that check is gated on
+     * Fix::String. §7.3 requires the field to be SKIPPED like an unknown id —
+     * destination untouched, decode still COMPLETE, the following field still
+     * delivered — and the skip counted exactly once.
+     *
+     * `blob` stays admissible on purpose: a blob read into a std::string is the
+     * documented opaque-bytes destination, pinned by strictUtf8() below. */
+    {
+        struct StrBinder : sofab::IStreamMessage
+        {
+            std::string s = "untouched";
+            bool taken = false;
+            uint32_t next = 0;
+            void deserialize(sofab::IStreamImpl &is, sofab::id id, size_t, size_t) noexcept override
+            {
+                if (id == 5)      taken = is.read(s);
+                else if (id == 6) is.read(next);
+            }
+        };
+
+        struct StrCase
+        {
+            const char *what;
+            std::vector<uint8_t> bytes; /* id5 fixlen field, then id6 unsigned 7 */
+            bool taken;                 /* did the read consume the field? */
+            std::string want;           /* the destination afterwards */
+            size_t skipped;             /* the §7.3 diagnostic */
+        };
+
+        const StrCase cases[] = {
+            /* 0x2a = id5|Fixlen; 0x20 = len4|Fp32; 1.0f = 00 00 80 3f. */
+            {"str-read: an fp32 scalar is skipped, not stored as text",
+             {0x2a, 0x20, 0x00, 0x00, 0x80, 0x3f, 0x30, 0x07}, false, "untouched", 1},
+            /* 0x41 = len8|Fp64; 1.0 = 00 00 00 00 00 00 f0 3f. */
+            {"str-read: an fp64 scalar is skipped, not stored as text",
+             {0x2a, 0x41, 0, 0, 0, 0, 0, 0, 0xf0, 0x3f, 0x30, 0x07}, false, "untouched", 1},
+            /* CONTROL — 0x12 = len2|String. */
+            {"str-read: a string is read",
+             {0x2a, 0x12, 'h', 'i', 0x30, 0x07}, true, "hi", 0},
+            /* CONTROL — 0x13 = len2|Blob: opaque bytes into a std::string stay legal. */
+            {"str-read: a blob is read",
+             {0x2a, 0x13, 'A', 'B', 0x30, 0x07}, true, "AB", 0},
+        };
+
+        for (const auto &c : cases)
+        {
+            sofab::IStreamObject<StrBinder> in;
+            auto r = in.feed(c.bytes.data(), c.bytes.size());
+            CHECK(r.code() == sofab::Error::None, c.what);
+            CHECK((*in).taken == c.taken, c.what);
+            CHECK((*in).s == c.want, c.what);
+            CHECK((*in).next == 7, c.what); /* the following field still resyncs */
+            CHECK(r.skipped() == c.skipped, c.what);
+        }
+    }
+
     /* The RAW read(void*, size_t) overload is a typed read too (issue #80).
      *
      * It binds a `blob`, so §7.3 applies to it exactly as to readBlob(): a field
