@@ -2445,6 +2445,94 @@ static void schemaBoundOutranksCap()
  *     itself is always available (utf8_valid); the SOFAB_STRICT_UTF8 gate only
  *     decides whether encode/decode invoke it. --- */
 
+/* --- utf8_valid, differentially, against Unicode Table 3-7 -----------------
+ *
+ * The validator is the one place in this header that takes a *security*
+ * decision on attacker-controlled bytes, and it is also a hot loop that gets
+ * rewritten for speed: it runs a Hoehrmann DFA over multi-byte sequences and
+ * skips ASCII runs a machine word at a time, so how far the word skip and the
+ * DFA each advance before handing over to the other is an implementation
+ * detail that moves. The hand-picked cases in strictUtf8() below pin the
+ * classic rejects; what they cannot pin is the *seams* — a lead byte landing
+ * exactly on a word boundary, a sequence straddling one, a truncation at every
+ * distance from the end.
+ *
+ * So this check compares the shipped validator against an independent
+ * reference: a direct transcription of Unicode Table 3-7 (the well-formed
+ * byte-sequence table), sharing no code, no table and no loop shape with it.
+ * The corpus places every single byte value and every interesting multi-byte
+ * sequence at every offset 0..17 inside an ASCII run, with trailing runs of up
+ * to 17 more — so every atom in turn crosses, starts on and ends on an
+ * eight-byte boundary, and every truncation distance is exercised. */
+
+static bool refUtf8Valid(const char *d, size_t n)
+{
+    size_t i = 0;
+    while (i < n)
+    {
+        const unsigned c = static_cast<unsigned char>(d[i]);
+        unsigned trail, lo, hi; /* continuation count, and the 2nd byte's range */
+        if (c < 0x80) { ++i; continue; }
+        else if (c >= 0xC2 && c <= 0xDF) { trail = 1; lo = 0x80; hi = 0xBF; }
+        else if (c == 0xE0)              { trail = 2; lo = 0xA0; hi = 0xBF; }
+        else if (c >= 0xE1 && c <= 0xEC) { trail = 2; lo = 0x80; hi = 0xBF; }
+        else if (c == 0xED)              { trail = 2; lo = 0x80; hi = 0x9F; }
+        else if (c >= 0xEE && c <= 0xEF) { trail = 2; lo = 0x80; hi = 0xBF; }
+        else if (c == 0xF0)              { trail = 3; lo = 0x90; hi = 0xBF; }
+        else if (c >= 0xF1 && c <= 0xF3) { trail = 3; lo = 0x80; hi = 0xBF; }
+        else if (c == 0xF4)              { trail = 3; lo = 0x80; hi = 0x8F; }
+        else return false; /* C0/C1 (overlong), F5..FF (> U+10FFFF), 80..BF (bare) */
+        if (n - i - 1 < trail) return false; /* truncated before the end */
+        if (static_cast<unsigned char>(d[i + 1]) < lo ||
+            static_cast<unsigned char>(d[i + 1]) > hi) return false;
+        for (unsigned k = 2; k <= trail; ++k)
+        {
+            const unsigned b = static_cast<unsigned char>(d[i + k]);
+            if (b < 0x80 || b > 0xBF) return false;
+        }
+        i += trail + 1;
+    }
+    return true;
+}
+
+static void utf8ValidatorSweep()
+{
+    std::vector<std::string> atoms;
+    for (int b = 0; b < 256; ++b) atoms.push_back(std::string(1, static_cast<char>(b)));
+    for (const char *a : {"\xC2\xA9", "\xDF\xBF", "\xE0\xA0\x80", "\xE2\x82\xAC", "\xED\x9F\xBF",
+                          "\xEE\x80\x80", "\xEF\xBF\xBF", "\xF0\x90\x80\x80", "\xF0\x9F\x98\x80",
+                          "\xF4\x8F\xBF\xBF", /* valid: both edges of every lead class */
+                          "\xC0\x80", "\xC1\xBF", "\xE0\x80\x80", "\xE0\x9F\xBF", "\xED\xA0\x80",
+                          "\xED\xBF\xBF", "\xF0\x80\x80\x80", "\xF0\x8F\xBF\xBF", "\xF4\x90\x80\x80",
+                          "\xF5\x80\x80\x80", /* overlong, surrogate, out of range */
+                          "\xC2", "\xE2\x82", "\xF0\x9F\x98", "\xE2\x28\xA1", "\xF0\x9F\x28\x80",
+                          "\xC2\xC2\xA9"}) /* truncated and bad-continuation forms */
+        atoms.push_back(std::string(a));
+
+    size_t cases = 0, mismatches = 0;
+    std::string s;
+    for (const std::string &atom : atoms)
+        for (size_t lead = 0; lead <= 17; ++lead)
+            for (size_t trail : {size_t{0}, size_t{1}, size_t{6}, size_t{7}, size_t{8},
+                                 size_t{9}, size_t{16}, size_t{17}})
+            {
+                s.assign(lead, 'a');
+                s += atom;
+                s.append(trail, 'z');
+                ++cases;
+                if (sofab::utf8_valid(std::string_view{s}) != refUtf8Valid(s.data(), s.size()))
+                    ++mismatches;
+            }
+    CHECK(cases > 40000, "utf8 sweep: the corpus is the size it claims to be");
+    CHECK(mismatches == 0, "utf8 sweep: utf8_valid agrees with Unicode Table 3-7 on every case");
+
+    /* Pure-ASCII runs of every length: the word skip's own boundaries. */
+    bool asciiOk = true;
+    for (size_t n = 0; n <= 64; ++n)
+        if (!sofab::utf8_valid(std::string_view{std::string(n, 'x')})) asciiOk = false;
+    CHECK(asciiOk, "utf8 sweep: an ASCII run of every length 0..64 validates");
+}
+
 /* Encode a single string/blob field (id 5) so it can be fed straight into ScalarMsg. */
 static std::vector<uint8_t> stringFieldWire(std::string_view payload, sofab::detail::Fix sub)
 {
@@ -4221,6 +4309,15 @@ static void headerParsersEnforceCeilings()
          at = text.find(kDecodeSite, at + 1))
         sites.push_back(at);
     CHECK(!sites.empty(), "header parsers: at least one field-header decode site is found");
+    /* One parser, not two. The top level and the nested level used to carry a
+     * copy each, and the copies drifted: the nested one shipped without the
+     * §6.2 ARRAY_MAX check on a fixlen array's count word until #103, which is
+     * the whole reason this structural check exists. They are now one function
+     * (parseFieldTag + parseFieldMeta), so the invariant can be stated at full
+     * strength — a second site is a regression whether or not it happens to
+     * carry the ceilings today. */
+    CHECK(sites.size() == 1,
+          "header parsers: the field header is taken apart in exactly one place");
 
     for (size_t i = 0; i < sites.size(); ++i)
     {
@@ -5041,6 +5138,7 @@ int main()
     maxDepth();
     bufferLimits();
     schemaBoundOutranksCap();
+    utf8ValidatorSweep();
     strictUtf8();
     messageLayerFraming();
     wrapperArrayCollectors();
