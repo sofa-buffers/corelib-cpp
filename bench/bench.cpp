@@ -18,12 +18,11 @@
  * SPDX-License-Identifier: MIT
  */
 
-#include "sofab/sofab.hpp"
+#include "bench_common.hpp"
 
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
-#include <ctime>
 #include <span>
 #include <string>
 
@@ -32,18 +31,8 @@
 namespace
 {
 
-/* Streams that drive a caller-owned raw buffer (no heap in the measured run). */
-class OStreamRaw : public sofab::OStreamImpl
-{
-public:
-    void init(uint8_t *b, size_t n) noexcept { initBuffer(b, n, 0); }
-};
-
-class IStreamRaw : public sofab::IStreamImpl
-{
-public:
-    template <class F> void init(F &&cb) noexcept { topCallback_ = std::forward<F>(cb); }
-};
+using sofab_bench::IStreamRaw;
+using sofab_bench::OStreamRaw;
 
 /* shared buffers */
 uint64_t src[N];
@@ -92,40 +81,10 @@ void encode_typical(OStreamRaw &os)
     os.sequenceEnd();
 }
 
-double cpu_now() { return (double)std::clock() / (double)CLOCKS_PER_SEC; }
-
-/* Block size for the timed loop: enough iterations that one clock reading is a
- * rounding error against them. std::clock() is a real cost — on a host without
- * a vDSO fast path for CLOCK_PROCESS_CPUTIME_ID it runs to about a microsecond,
- * which is more than an entire `typical message` operation — so reading it once
- * per iteration, as this loop used to, measures mostly the clock. The spec asks
- * for a ~1 s CPU-time loop and a warmup; how often the clock is sampled inside
- * that loop is ours to choose. */
-constexpr double kBlockSeconds = 0.01; /* clock cost lands under ~0.01% of a block */
-
-long calibrateBlock(void (*fn)())
-{
-    for (long block = 1;; block *= 2)
-    {
-        double t0 = cpu_now();
-        for (long k = 0; k < block; ++k) fn();
-        if (cpu_now() - t0 >= kBlockSeconds) return block;
-    }
-}
-
 double measure(void (*fn)(), size_t bytes)
 {
     fn(); /* warmup */
-    const long block = calibrateBlock(fn);
-    double t0 = cpu_now();
-    long it = 0;
-    double el;
-    do {
-        for (long k = 0; k < block; ++k) fn();
-        it += block;
-        el = cpu_now() - t0;
-    } while (el < 1.0);
-    return (double)bytes * (double)it / el / 1e6; /* MB/s, MB = 1e6 bytes */
+    return sofab_bench::measureLoop([fn] { fn(); }, bytes).mb_s;
 }
 
 } // namespace
@@ -176,52 +135,90 @@ extern "C" __attribute__((noinline)) void run_decode_typical()
     is.feed(typ_buf, typ_used);
 }
 
+/* ---- the workload table: the one definition of what this suite measures ---
+ *
+ * The timed table, the single-shot Callgrind mode and `--list` all walk this
+ * array, so a workload cannot exist in one of them and be missing from another.
+ * `bench --list` prints it as "name<TAB>label" lines; run_callgrind.sh and the
+ * run_bench_callgrind CMake target take their workload names and their row
+ * labels from that output instead of keeping copies (CORELIB_PLAN §10). */
+
+namespace
+{
+
+struct Workload
+{
+    const char *name;    /* CLI name; the Callgrind toggle is run_<name> */
+    const char *label;   /* row label, per BENCH_SPEC's output grammar */
+    void (*setup)();     /* prepares the input, excluded from collection */
+    void (*run)();       /* the measured operation */
+    const size_t *bytes; /* message size, valid once setup+run have run */
+};
+
+const Workload kWorkloads[] = {
+    {"encode_u64_array", "encode: u64 array (1000)", nullptr, run_encode_u64_array, &enc_u64_used},
+    {"encode_typical", "encode: typical message", nullptr, run_encode_typical, &typ_used},
+    {"decode_u64_array", "decode: u64 array (1000)", run_encode_u64_array, run_decode_u64_array,
+     &enc_u64_used},
+    {"decode_typical", "decode: typical message", run_encode_typical, run_decode_typical,
+     &typ_used},
+};
+
+const Workload *find(const char *name)
+{
+    for (const Workload &w : kWorkloads)
+        if (!strcmp(w.name, name)) return &w;
+    return nullptr;
+}
+
 /* ---- single-shot mode (one operation, for Callgrind instruction counts) -- */
 
-static int run_one(const char *w)
+int run_one(const char *name)
 {
-    make_src();
-    if (!strcmp(w, "encode_u64_array")) {
-        run_encode_u64_array();
-    } else if (!strcmp(w, "encode_typical")) {
-        run_encode_typical();
-    } else if (!strcmp(w, "decode_u64_array")) {
-        run_encode_u64_array();          /* setup (excluded from collection) */
-        run_decode_u64_array();
-    } else if (!strcmp(w, "decode_typical")) {
-        run_encode_typical();            /* setup (excluded from collection) */
-        run_decode_typical();
-    } else {
-        fprintf(stderr, "unknown workload: %s\n", w);
+    const Workload *w = find(name);
+    if (!w)
+    {
+        fprintf(stderr, "unknown workload: %s\n", name);
         return 1;
     }
 
-    size_t bytes = (!strcmp(w, "encode_u64_array") || !strcmp(w, "decode_u64_array"))
-                       ? enc_u64_used : typ_used;
+    make_src();
+    if (w->setup) w->setup();
+    w->run();
+
     fprintf(stderr, "arr0=%llu f1=%u s_f2=%d str=%.5s BYTES=%zu\n",
-            (unsigned long long)dec_array[0], T.f1, T.s_f2, T.f5.c_str(), bytes);
+            (unsigned long long)dec_array[0], T.f1, T.s_f2, T.f5.c_str(), *w->bytes);
     return 0;
 }
+
+} // namespace
 
 int main(int argc, char **argv)
 {
     T.f5.reserve(16); /* string read buffer, reserved outside the measured run */
 
     if (argc >= 2)
+    {
+        if (!strcmp(argv[1], "--list"))
+        {
+            for (const Workload &w : kWorkloads) printf("%s\t%s\n", w.name, w.label);
+            return 0;
+        }
         return run_one(argv[1]);
+    }
 
     make_src();
-    run_encode_u64_array();
-    run_encode_typical();
-    size_t ba = enc_u64_used, bt = typ_used;
+    for (const Workload &w : kWorkloads) /* prime every buffer and message size */
+    {
+        if (w.setup) w.setup();
+        w.run();
+    }
 
     printf("=== SofaBuffers pure-C++20 throughput (CPU time, MB/s) ===\n");
     printf("%-26s %12s\n", "Workload", "MB/s");
     printf("%-26s %12s\n", "--------", "----");
-    printf("%-26s %12.2f\n", "encode: u64 array (1000)", measure(run_encode_u64_array, ba));
-    printf("%-26s %12.2f\n", "encode: typical message",  measure(run_encode_typical, bt));
-    printf("%-26s %12.2f\n", "decode: u64 array (1000)", measure(run_decode_u64_array, ba));
-    printf("%-26s %12.2f\n", "decode: typical message",  measure(run_decode_typical, bt));
+    for (const Workload &w : kWorkloads)
+        printf("%-26s %12.2f\n", w.label, measure(w.run, *w.bytes));
     printf("\nMB = 1e6 bytes. ~1s CPU-time loop per workload.\n");
     return 0;
 }

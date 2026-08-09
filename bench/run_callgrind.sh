@@ -38,25 +38,41 @@ fi
 
 OUT="$(mktemp -d)"
 trap 'rm -rf "$OUT"' EXIT
-WORKLOADS=(encode_u64_array encode_typical decode_u64_array decode_typical)
+
+# The workloads and their row labels come from the bench binary itself
+# ("name<TAB>label" per line, straight out of the table bench.cpp dispatches on).
+# CORELIB_PLAN §10 wants the three tools to follow one definition, so this script
+# keeps no list of its own: a workload added, removed or renamed in bench.cpp
+# shows up here without an edit, and can never silently disagree.
+if ! LIST="$("$BIN" --list 2>"$OUT/list.log")"; then
+    echo "error: '$BIN --list' failed — rebuild the bench binary:" >&2
+    cat "$OUT/list.log" >&2
+    exit 1
+fi
+
+WORKLOADS=(); LABELS=()
+while IFS=$'\t' read -r name label; do
+    [ -n "${name:-}" ] || continue
+    WORKLOADS+=("$name"); LABELS+=("${label:-$name}")
+done <<<"$LIST"
+
+if [ "${#WORKLOADS[@]}" -eq 0 ]; then
+    echo "error: '$BIN --list' published no workloads." >&2
+    exit 1
+fi
 
 run_cg() { # $1 workload
-    valgrind --tool=callgrind --collect-atstart=no --toggle-collect="run_$1" \
+    if ! valgrind --tool=callgrind --collect-atstart=no --toggle-collect="run_$1" \
         --callgrind-out-file="$OUT/$1.out" "$BIN" "$1" \
-        >/dev/null 2>"$OUT/$1.log"
+        >/dev/null 2>"$OUT/$1.log"; then
+        echo "error: the Callgrind run for workload '$1' failed:" >&2
+        cat "$OUT/$1.log" >&2
+        exit 1
+    fi
 }
 
 ir_of()    { grep -m1 '^summary:' "$OUT/$1.out" 2>/dev/null | awk '{print $2}'; }
 bytes_of() { grep -ohE 'BYTES=[0-9]+' "$OUT/$1.log" 2>/dev/null | head -1 | cut -d= -f2; }
-
-label() {
-    case "$1" in
-        encode_u64_array) echo "encode: u64 array (1000)";;
-        encode_typical)   echo "encode: typical message";;
-        decode_u64_array) echo "decode: u64 array (1000)";;
-        decode_typical)   echo "decode: typical message";;
-    esac
-}
 
 echo ">> Measuring instructions/op under Callgrind (this is slow) ..." >&2
 echo
@@ -67,10 +83,18 @@ echo "==========================================================================
 printf "%-26s %16s %9s\n" "Workload" "instr/op" "bytes"
 printf "%-26s %16s %9s\n" "--------" "--------" "-----"
 
-for w in "${WORKLOADS[@]}"; do
+for i in "${!WORKLOADS[@]}"; do
+    w="${WORKLOADS[$i]}"
     run_cg "$w"
-    ir="$(ir_of "$w")"; b="$(bytes_of "$w")"
-    printf "%-26s %16s %9s\n" "$(label "$w")" "${ir:--}" "${b:--}"
+    # A missing figure is a failure, not a dash: a table with a "-" in it looks
+    # exactly like a fresh one, so a broken measurement has to stop the run.
+    ir="$(ir_of "$w" || true)"; b="$(bytes_of "$w" || true)"
+    if [ -z "$ir" ] || [ -z "$b" ]; then
+        echo "error: workload '$w' produced no instruction count / message size:" >&2
+        cat "$OUT/$w.log" >&2
+        exit 1
+    fi
+    printf "%-26s %16s %9s\n" "${LABELS[$i]}" "$ir" "$b"
 done
 echo
 echo "Ir = instructions retired (Callgrind). Independent of CPU clock and OS"
