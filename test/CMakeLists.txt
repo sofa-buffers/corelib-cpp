@@ -28,6 +28,15 @@ target_compile_options(test_vectors PRIVATE -Wall -Wextra -Werror)
 target_link_libraries(test_vectors PRIVATE sofab_cpp)
 add_test(NAME test_vectors COMMAND test_vectors)
 
+# CORELIB_PLAN §12.1 requires the suite to run against a debug *and* a release
+# build. Which configurations CI builds is a property of the workflow files, so
+# a Release-only defect cannot be caught from inside the C++ suites — this check
+# reads .github/workflows/ and fails when a required leg is missing.
+add_test(NAME test_ci_workflows
+    COMMAND bash ${CMAKE_CURRENT_LIST_DIR}/test_ci_workflows.sh
+            ${PROJECT_SOURCE_DIR}/.github/workflows)
+set_tests_properties(test_ci_workflows PROPERTIES SKIP_RETURN_CODE 77)
+
 if(SOFAB_ENABLE_COVERAGE)
     target_link_libraries(test_roundtrip PRIVATE sofab_coverage)
     target_link_libraries(test_vectors PRIVATE sofab_coverage)

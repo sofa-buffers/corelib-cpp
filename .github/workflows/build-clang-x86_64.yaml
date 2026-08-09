@@ -1,5 +1,9 @@
 name: "Build: x86_64 (Clang)"
 
+# Both configurations, as CORELIB_PLAN §12.1 requires — see the GCC workflow for
+# why the Release leg is worth its runtime. `fail-fast: false` keeps one red leg
+# from hiding the other's result.
+
 on:
   push:
     branches: [ main ]
@@ -9,6 +13,11 @@ on:
 jobs:
   build:
     runs-on: ubuntu-latest
+
+    strategy:
+      fail-fast: false
+      matrix:
+        build_type: [ Debug, Release ]
 
     steps:
       - name: Checkout repository
@@ -23,7 +32,7 @@ jobs:
       - name: Configure with CMake
         run: |
           cmake -S . -B build \
-            -DCMAKE_BUILD_TYPE=Debug \
+            -DCMAKE_BUILD_TYPE=${{ matrix.build_type }} \
             -DCMAKE_CXX_COMPILER=clang++
 
       - name: Build project

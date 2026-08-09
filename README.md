@@ -42,7 +42,9 @@ C backend.
 ### Built with the following compilers
 
 Non-native targets are built and run under [QEMU](https://www.qemu.org/)
-user-mode emulation in CI, reproducible locally without the real hardware.
+user-mode emulation in CI, reproducible locally without the real hardware. Both
+x86_64 legs build and run the full suite twice — in `Debug` **and** in `Release`
+(`-O3 -DNDEBUG`) — so a defect only the optimiser exposes cannot ship green.
 
 | Target | Status |
 | - | - |
@@ -673,7 +675,12 @@ Always give `--parallel` an explicit job count. Bare `--parallel` defers to the
 native build tool's default, and with the Unix Makefiles generator that is
 `make -j` with *no* limit — one compiler per translation unit, all at once.
 
-Three suites run under CTest:
+Run it in both configurations — `-DCMAKE_BUILD_TYPE=Debug` and
+`-DCMAKE_BUILD_TYPE=Release` — which is what CI does; a Release-only defect
+(strict aliasing, UB the optimiser acts on, an uninitialised field) is invisible
+to a Debug-only run.
+
+Four suites run under CTest:
 
 - **`test_roundtrip`** — encode/decode/nested/chunked/skip checks plus the
   three-valued decode outcome (§7: COMPLETE / INCOMPLETE / INVALID), malformed-input
@@ -712,6 +719,15 @@ Three suites run under CTest:
   drives `run_callgrind.sh` end to end against a stub `valgrind`, so it needs no
   Valgrind and still proves a failing measurement aborts the table with the
   captured diagnostic. Skipped when the build did not produce the `bench` binary.
+- **`test_ci_workflows`** — the one check aimed at CI rather than at the
+  library: which configurations get built is a property of
+  `.github/workflows/`, so no C++ test can notice when a leg disappears. It
+  requires that the workflows running CTest cover both `Debug` and `Release`,
+  that a testing workflow never configures CMake without a build type (the empty
+  default is neither: no optimisation, no `NDEBUG`), and that a workflow using a
+  strategy matrix sets `fail-fast: false`. `${{ matrix.build_type }}` is resolved
+  against the workflow's own `build_type:` axis. Skipped in a source tree
+  without `.github/workflows/`.
 
 ### Coverage and API docs
 

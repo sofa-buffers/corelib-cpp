@@ -1,5 +1,11 @@
 name: "Build: x86_64 (GCC)"
 
+# CORELIB_PLAN §12.1 requires both a debug and a release configuration to be
+# built and tested: Release is -O3 -DNDEBUG, where strict-aliasing or UB in the
+# varint window fast paths and optimiser-visible use of an uninitialised field
+# first become observable. `fail-fast: false` keeps one red leg from hiding the
+# other's result.
+
 on:
   push:
     branches: [ main ]
@@ -9,6 +15,11 @@ on:
 jobs:
   build:
     runs-on: ubuntu-latest
+
+    strategy:
+      fail-fast: false
+      matrix:
+        build_type: [ Debug, Release ]
 
     steps:
       - name: Checkout repository
@@ -23,7 +34,7 @@ jobs:
       - name: Configure with CMake
         run: |
           cmake -S . -B build \
-            -DCMAKE_BUILD_TYPE=Debug \
+            -DCMAKE_BUILD_TYPE=${{ matrix.build_type }} \
             -DCMAKE_CXX_COMPILER=g++
 
       - name: Build project
@@ -38,7 +49,7 @@ jobs:
       - name: Configure (strict UTF-8 OFF)
         run: |
           cmake -S . -B build-utf8-off \
-            -DCMAKE_BUILD_TYPE=Debug \
+            -DCMAKE_BUILD_TYPE=${{ matrix.build_type }} \
             -DCMAKE_CXX_COMPILER=g++ \
             -DCMAKE_CXX_FLAGS="-DSOFAB_STRICT_UTF8=0"
 
