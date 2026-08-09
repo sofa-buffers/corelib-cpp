@@ -346,6 +346,25 @@ std::vector<uint8_t> wire = pt.encode();
 Point got = Point::decode(wire.data(), wire.size());   // got.x == 3, got.y == 4
 ```
 
+`sofab::OStreamObject<Point>` is the encode-side counterpart of the
+`IStreamObject` used above: it bundles a `Point` with an inline buffer of
+`Point::_maxSize` bytes, reaches the message through `operator->` — as
+`IStreamObject` hands back the decoded one through `operator*` — and encodes it
+in a single `serialize()` call, so neither the stream nor the buffer has to be
+managed separately.
+
+```cpp
+sofab::OStreamObject<Point> out;
+out->x = 3; out->y = 4;
+out.serialize();          // out.data() / out.bytesUsed() now hold the message
+```
+
+Constructed with a flush callback it streams instead, and `serialize()` hands
+the bytes to that sink; constructed without one — as above — there is nowhere to
+drain to, so the message simply stays in the buffer (see
+[Memory handling](#memory-handling)). A third template argument reserves a head
+of leading bytes in front of the message, exactly like `OStreamInline`'s.
+
 Messages nest: passing a message deriving `OStreamMessage` to `write(id, msg)`
 encodes it as a sub-sequence, and `is.read(childMsg)` descends into it on decode.
 

@@ -4645,6 +4645,71 @@ static void sinklessFlush()
     }
 }
 
+/* --- OStreamObject is public API (CORELIB_PLAN §6.1.1) and it is the one-shot
+ *     encode path: a message bundled with the buffer sized for it, populated
+ *     through operator-> and encoded by serialize(). Being a class template it
+ *     is only ever checked once something instantiates it, and nothing did —
+ *     which is how operator-> came to return a *reference*: `obj->field` is not
+ *     a member access on a reference, it is an error, so every use the class
+ *     documents failed to compile.
+ *
+ *     These checks therefore exist as much to *instantiate* the template as to
+ *     assert on it: populate through the arrow on a mutable and on a const
+ *     handle, encode, and byte-compare against the same message written by hand
+ *     into a plain OStreamInline. --- */
+
+/* A generated-style message with two fields, so the arrow has something to
+ * populate and the comparison has an order to get wrong. */
+struct ArrowProbe : sofab::OStreamMessage
+{
+    static constexpr std::size_t _maxSize = 32;
+    int32_t x = 0;
+    uint64_t y = 0;
+
+    sofab::OStreamImpl::Result serialize(sofab::OStreamImpl &os) const noexcept override
+    {
+        return os.write(sofab::id(1), x).write(sofab::id(2), y);
+    }
+};
+
+static void oneShotObject()
+{
+    /* the reference encode: the same two fields through the ordinary stream */
+    sofab::OStreamInline<ArrowProbe::_maxSize> ref;
+    ref.write(sofab::id(1), int32_t{-3}).write(sofab::id(2), uint64_t{4});
+    const std::string want = toHex({ref.data(), ref.bytesUsed()});
+
+    /* (a) populate through operator->, encode, and match byte for byte */
+    {
+        sofab::OStreamObject<ArrowProbe> obj;
+        obj->x = -3;
+        obj->y = 4;
+        CHECK(obj->x == -3 && obj->y == 4, "one-shot object: operator-> reaches the fields");
+
+        const auto &cobj = obj;
+        CHECK(cobj->x == -3 && cobj->y == 4, "one-shot object: operator-> works on a const handle");
+
+        auto r = obj.serialize();
+        CHECK(r.code() == sofab::Error::None && obj.ok(), "one-shot object: serialize succeeds");
+        CHECK(toHex({obj.data(), obj.bytesUsed()}) == want,
+              "one-shot object: the bytes match the equivalent OStreamInline encode");
+    }
+
+    /* (b) the same with a sink: serialize() flushes, so the callback — not
+     *     data()/bytesUsed() — is where the message comes out. */
+    {
+        std::vector<uint8_t> sunk;
+        sofab::OStreamObject<ArrowProbe> obj{
+            [&](std::span<const uint8_t> b) { sunk.insert(sunk.end(), b.begin(), b.end()); }};
+        obj->x = -3;
+        obj->y = 4;
+        auto r = obj.serialize();
+        CHECK(r.code() == sofab::Error::None && obj.ok(),
+              "one-shot object: serialize succeeds with a sink");
+        CHECK(toHex(sunk) == want, "one-shot object: serialize drains the message to the sink");
+    }
+}
+
 /* --- Chunk lifetime (CORELIB_PLAN §6, §7.2 item 4): a fed chunk is borrowed
  *     ONLY for the duration of the feed() call. Once it returns, the caller may
  *     reuse, overwrite or free that memory and the decoded message must be
@@ -4892,6 +4957,7 @@ int main()
     encodeFailuresAreLatched();
     flushHandover();
     sinklessFlush();
+    oneShotObject();
     chunkLifetime();
 
     std::printf("\n%d checks, %d failures\n", g_checks, g_failures);
