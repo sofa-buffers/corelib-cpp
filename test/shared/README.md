@@ -8,10 +8,16 @@ below).
 
 ## Provenance
 
-| File | Upstream source | Pinned at |
-|------|-----------------|-----------|
-| `sofab_test_json.c` | [`sofa-buffers/corelib-c-cpp`](https://github.com/sofa-buffers/corelib-c-cpp) → `test/shared/sofab_test_json.c` | commit `e149c218cdbb` (2026-06-25) |
-| `sofab_test_json.h` | [`sofa-buffers/corelib-c-cpp`](https://github.com/sofa-buffers/corelib-c-cpp) → `test/shared/sofab_test_json.h` | commit `e149c218cdbb` (2026-06-25) |
+| File | Upstream source | Pinned at | `md5` |
+|------|-----------------|-----------|-------|
+| `sofab_test_json.c` | [`sofa-buffers/corelib-c-cpp`](https://github.com/sofa-buffers/corelib-c-cpp) → `test/shared/sofab_test_json.c` | commit `e149c218cdbb` (2026-06-25) | `4dd57a285e9e3d16b3aced83800d7bff` |
+| `sofab_test_json.h` | [`sofa-buffers/corelib-c-cpp`](https://github.com/sofa-buffers/corelib-c-cpp) → `test/shared/sofab_test_json.h` | commit `e149c218cdbb` (2026-06-25) | `dc69a2eab0135b5903f9bafa8785ebad` |
+
+Each row pins a **merged** upstream commit — the last commit on `corelib-c-cpp`'s
+`main` that touched that file — and the `md5` the copy hashed to when it was
+taken. The checksum is what makes the record self-checking: `test_vendored_provenance`
+re-hashes every vendored file on each `ctest` run, so a copy refreshed without
+re-pinning its row turns red instead of drifting silently.
 
 `sofab_test_json.{c,h}` is a tiny dependency-free JSON reader. Its only job is to
 load the shared conformance vectors so `test/test_vectors.cpp` can replay them
@@ -19,9 +25,9 @@ through this repo's pure-C++20 `sofab::OStream` / `sofab::IStream`.
 
 The vectors it loads are **also vendored**, from the same upstream:
 
-| File | Upstream source | Pinned at |
-|------|-----------------|-----------|
-| `../../assets/test_vectors.json` | [`sofa-buffers/corelib-c-cpp`](https://github.com/sofa-buffers/corelib-c-cpp) → `assets/test_vectors.json` | commit `37e06a829178` (2026-07-26), branch `poc/omit-all-default-sequences` — re-pin to the merged SHA once that lands |
+| File | Upstream source | Pinned at | `md5` |
+|------|-----------------|-----------|-------|
+| `../../assets/test_vectors.json` | [`sofa-buffers/corelib-c-cpp`](https://github.com/sofa-buffers/corelib-c-cpp) → `assets/test_vectors.json` | commit `f30244e3f29e` (2026-07-28) | `f542c66bfa6aecb3636282ec6e802a1b` |
 
 `test_vectors.json` is the cross-language source of truth for the wire format and
 is copied verbatim into every SofaBuffers corelib. We track the copy vendored in
@@ -84,4 +90,19 @@ curl -fsSL https://raw.githubusercontent.com/sofa-buffers/corelib-c-cpp/main/tes
 curl -fsSL https://raw.githubusercontent.com/sofa-buffers/corelib-c-cpp/main/assets/test_vectors.json -o assets/test_vectors.json
 ```
 
-Then update the "Pinned at" commits in the table above to the new upstream SHAs.
+Then re-pin the table above. For each file, take the SHA of the last **merged**
+commit that touched it upstream — never a branch or an unmerged PR head, which
+gives a later reader nothing to diff against — and its new checksum:
+
+```sh
+# the merged SHA to pin (repeat per path)
+gh api 'repos/sofa-buffers/corelib-c-cpp/commits?path=assets/test_vectors.json&sha=main&per_page=1' \
+    --jq '.[0] | "\(.sha[0:12]) (\(.commit.committer.date[0:10]))"'
+
+# the checksums to record
+md5sum test/shared/sofab_test_json.c test/shared/sofab_test_json.h assets/test_vectors.json
+```
+
+Verifying an existing checkout needs neither command nor the network — the
+recorded checksums are re-hashed by `ctest -R test_vendored_provenance`, which
+also rejects a pin that is not a bare merged commit.

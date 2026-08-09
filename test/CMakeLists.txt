@@ -49,6 +49,21 @@ add_test(NAME test_readme_structure
             ${PROJECT_SOURCE_DIR}/README.md)
 set_tests_properties(test_readme_structure PROPERTIES SKIP_RETURN_CODE 77)
 
+# CORELIB_PLAN §8: the shared vectors and the JSON reader are copies of
+# corelib-c-cpp, the authoritative source. Their provenance record — which
+# merged upstream commit each copy came from, and what it hashed to — is the
+# only thing that makes a re-sync checkable, and no C++ test can see it rot:
+# test_vectors replays whatever bytes are on disk, pinned or not. This check
+# reads test/shared/README.md and fails on a pin that is not a bare merged
+# commit (a branch or an unmerged PR head leaves a re-syncer nothing to diff
+# against), on a recorded checksum that no longer matches the vendored file, and
+# on a vendored file with no row at all.
+add_test(NAME test_vendored_provenance
+    COMMAND bash ${CMAKE_CURRENT_LIST_DIR}/test_vendored_provenance.sh
+            ${CMAKE_CURRENT_LIST_DIR}/shared/README.md
+            ${CMAKE_COMMAND})
+set_tests_properties(test_vendored_provenance PROPERTIES SKIP_RETURN_CODE 77)
+
 if(SOFAB_ENABLE_COVERAGE)
     target_link_libraries(test_roundtrip PRIVATE sofab_coverage)
     target_link_libraries(test_vectors PRIVATE sofab_coverage)

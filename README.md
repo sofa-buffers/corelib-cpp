@@ -733,6 +733,16 @@ Five suites run under CTest:
   with no invented ones, no API-documentation section (§9.4), and the §9.8
   two-corelib comparison as a subsection of
   [Benchmarks](#benchmarks). Skipped in a tree without a README.
+- **`test_vendored_provenance`** — the shared vectors and the JSON reader that
+  loads them are verbatim copies of `corelib-c-cpp`, and `test_vectors` replays
+  whatever bytes are on disk, pinned or not. What makes a re-sync checkable is
+  the provenance table in `test/shared/README.md`: the merged upstream commit
+  each copy came from and the `md5` it hashed to. This check reads that table
+  and re-hashes the files, so a copy refreshed without re-pinning its row goes
+  red rather than drifting silently; it also rejects a pin that is not a bare
+  merged commit — a branch or an unmerged PR head leaves the next re-syncer with
+  no SHA to diff against — and a vendored file with no row at all. Skipped in a
+  tree without `test/shared/README.md`.
 
 ### Coverage and API docs
 
