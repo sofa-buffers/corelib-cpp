@@ -2390,8 +2390,19 @@ namespace sofab
         explicit OStreamObject(typename OStreamImpl::flushCallback callback) noexcept
             : OStreamInline<N + Offset, Offset>{std::move(callback)} {}
 
-        /** @return The wrapped message, so its fields can be populated via `obj->field`. */
-        MessageType &operator->() noexcept { return message_; }
+        /**
+         * @brief Reach the wrapped message, so its fields are `obj->field`.
+         *
+         * `operator->` is re-applied to what it returns until a pointer comes
+         * back, so this has to hand out a *pointer* to the message: returning a
+         * reference to a type that has no `operator->` of its own is not a
+         * member access at all, it is a compile error at every use.
+         *
+         * @return Pointer to the wrapped message; never null.
+         */
+        MessageType *operator->() noexcept { return &message_; }
+        /** @copydoc operator->() */
+        const MessageType *operator->() const noexcept { return &message_; }
 
         /**
          * @brief Serialise the wrapped message into the inline buffer and flush.
