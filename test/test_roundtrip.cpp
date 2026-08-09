@@ -16,13 +16,16 @@
 
 #include <algorithm>
 #include <array>
+#include <bit>
 #include <cfloat>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <fstream>
 #include <iterator>
+#include <limits>
 #include <new>
 #include <span>
 #include <string>
@@ -92,6 +95,60 @@ static std::string toHex(std::span<const uint8_t> bytes)
     ++g_checks; \
     if (!(cond)) { ++g_failures; std::printf("FAIL: %s\n", what); } \
 } while (0)
+
+/* --- reset(): one decoder object, the next message --------------------------
+ *
+ * destinationReuse() above pins what reset() means for one message type. This
+ * applies the same contract to every message type the suite defines, because
+ * IStreamObject::reset() is a *template*: on top of the decoder state it
+ * re-initialises the owned message (destroy_at + construct_at), so it is
+ * separate code for every destination type and only a per-type call runs it.
+ *
+ * The two things it must drop are both observable without knowing the schema:
+ *
+ *   - the bytes of a half-arrived field still in the reassembly buffer, so the
+ *     next message starts at a field boundary rather than inside the previous
+ *     one;
+ *   - the latched terminal INVALID (§5.2 -- terminal for the *message*, not for
+ *     the object, and reset() is the only way back).
+ *
+ * After each of them a zero-byte feed is the all-default message, which
+ * MESSAGE_SPEC §2 makes COMPLETE for every schema, since no field is delivered
+ * and nothing is left over. --- */
+
+template <typename M>
+static void checkStreamReuse(const char *name)
+{
+    static char buf[192];
+    auto say = [&](const char *what) {
+        std::snprintf(buf, sizeof buf, "reset() [%s]: %s", name, what);
+        return buf;
+    };
+
+    /* A field header with no payload: the field has begun and cannot finish, so
+     * its byte is retained for a continuation that never comes. */
+    static const uint8_t partial[] = {0x00};                /* id 0, Wire::Unsigned */
+    /* §4.1: a varint wider than 64 bits. INVALID under every schema -- a message
+     * that reads field 0 fails in getVarint, one that declines it fails the
+     * identical test in skipVarint. */
+    static const uint8_t overlong[] = {0x00, 0x80, 0x80, 0x80, 0x80, 0x80,
+                                       0x80, 0x80, 0x80, 0x80, 0x02};
+
+    sofab::IStreamObject<M> in;
+    CHECK(in.feed(partial, sizeof partial).code() == sofab::Error::Incomplete,
+          say("a lone field header is INCOMPLETE, and its byte is buffered"));
+    in.reset();
+    CHECK(in.feed(partial, 0).code() == sofab::Error::None,
+          say("the buffered partial field is gone -- the empty message is COMPLETE"));
+
+    CHECK(in.feed(overlong, sizeof overlong).code() == sofab::Error::InvalidMessage,
+          say("a >64-bit varint is INVALID (§4.1)"));
+    CHECK(in.feed(partial, 0).code() == sofab::Error::InvalidMessage,
+          say("INVALID is latched on the stream (§5.2)"));
+    in.reset();
+    CHECK(in.feed(partial, 0).code() == sofab::Error::None,
+          say("reset() clears the latched INVALID -- nothing else does"));
+}
 
 /* --- encode: compare produced bytes to the known wire hex --- */
 
@@ -280,6 +337,7 @@ static void rawBlobReadTruncation()
         void deserialize(sofab::IStreamImpl &is, sofab::id id, size_t, size_t) noexcept override
         { if (id == 1) got = is.read(dst, sizeof(dst)); }
     };
+    checkStreamReuse<RawBlobMsg>("rawBlobReadTruncation/RawBlobMsg");
 
     /* Cut after 4, 5 and 6: the header and the fixlen word are complete in the first
      * feed, the payload is short. Cuts 2 and 3 land before the word and were already
@@ -315,6 +373,7 @@ static void skippingUnknownFields()
         void deserialize(sofab::IStreamImpl &is, sofab::id id, size_t, size_t) noexcept override
         { if (id == 2) is.read(b); }
     };
+    checkStreamReuse<Only2>("skippingUnknownFields/Only2");
     sofab::IStreamObject<Only2> in;
     in.feed(os.data(), os.bytesUsed());
     CHECK((*in).b == -222, "skip: read only field 2");
@@ -510,6 +569,7 @@ static void malformedInput()
             void deserialize(sofab::IStreamImpl &is, sofab::id id, size_t, size_t) noexcept override
             { if (id == 2) is.read(b); }
         };
+        checkStreamReuse<Only2>("malformedInput/Only2");
         sofab::IStreamObject<Only2> in;
         in.feed(os.data(), os.bytesUsed());
         CHECK((*in).b == -222, "malformed/skip: resync after skipped sub-sequence");
@@ -770,6 +830,7 @@ static void callbackInvalidate()
             }
         }
     };
+    checkStreamReuse<BoundedArr>("callbackInvalidate/BoundedArr");
 
     /* Control: count == capacity decodes COMPLETE. */
     {
@@ -848,6 +909,7 @@ static void headerFirstBounds()
         void deserialize(sofab::IStreamImpl &is, sofab::id id, size_t, size_t) noexcept override
         { if (id == 15) is.readArray(u, 4); }
     };
+    checkStreamReuse<BoundedArr>("headerFirstBounds/BoundedArr");
     {   /* count 6 (>4) then EOF after 2 elements — over-count AND truncated */
         const uint8_t bytes[] = {0x7b, 0x06, 1, 2};
         sofab::IStreamObject<BoundedArr> in;
@@ -884,6 +946,7 @@ static void headerFirstBounds()
         void deserialize(sofab::IStreamImpl &is, sofab::id id, size_t, size_t) noexcept override
         { if (id == 5) is.readString(s, 8); }
     };
+    checkStreamReuse<BoundedStr>("headerFirstBounds/BoundedStr");
     {   /* len 10 (>8), complete */
         const uint8_t bytes[] = {0x2a, 0x52, 'A','B','C','D','E','F','G','H','I','J'};
         sofab::IStreamObject<BoundedStr> in;
@@ -925,6 +988,7 @@ static void headerFirstBounds()
         void deserialize(sofab::IStreamImpl &is, sofab::id id, size_t, size_t) noexcept override
         { if (id == 3) is.read(e); }
     };
+    checkStreamReuse<WrapMsg>("headerFirstBounds/WrapMsg");
     {   /* elements 0,1 then element index 2 (>=2), complete */
         const uint8_t bytes[] = {0x1e, 0x00, 0x2a, 0x08, 0x2a, 0x10, 0x2a, 0x07};
         sofab::IStreamObject<WrapMsg> in;
@@ -951,6 +1015,7 @@ static void headerFirstBounds()
     {
         struct Quiet : sofab::IStreamMessage
         { void deserialize(sofab::IStreamImpl &, sofab::id, size_t, size_t) noexcept override {} };
+        checkStreamReuse<Quiet>("headerFirstBounds/Quiet");
         const uint8_t over[] = {0x7b, 0x06, 1, 2, 3, 4, 5, 6};
         sofab::IStreamObject<Quiet> in;
         CHECK(in.feed(over, sizeof over).code() == sofab::Error::None,
@@ -981,6 +1046,7 @@ static void elementWidthBound()
         void deserialize(sofab::IStreamImpl &is, sofab::id id, size_t, size_t) noexcept override
         { if (id == 15) is.readArray(u, 4, -1, sofab::ElemBound::of<uint8_t>()); }
     };
+    checkStreamReuse<U8Arr>("elementWidthBound/U8Arr");
     /* the same array read WITHOUT a declared width, as a hand-written caller
      * that never had one does. */
     struct U8ArrUnbounded : sofab::IStreamMessage
@@ -989,6 +1055,7 @@ static void elementWidthBound()
         void deserialize(sofab::IStreamImpl &is, sofab::id id, size_t, size_t) noexcept override
         { if (id == 15) is.readArray(u, 4); }
     };
+    checkStreamReuse<U8ArrUnbounded>("elementWidthBound/U8ArrUnbounded");
     /* array<i8> count 4 at id 15 (header 0x7c = (15<<3)|ArraySigned). Elements are
      * zig-zagged: -128 -> 255 (ff 01), -129 -> 257 (81 02), 127 -> 254 (fe 01),
      * 128 -> 256 (80 02). */
@@ -998,6 +1065,7 @@ static void elementWidthBound()
         void deserialize(sofab::IStreamImpl &is, sofab::id id, size_t, size_t) noexcept override
         { if (id == 15) is.readArray(i, 4, -1, sofab::ElemBound::of<int8_t>()); }
     };
+    checkStreamReuse<I8Arr>("elementWidthBound/I8Arr");
 
     /* ---- THE ISOLATE: 16383 (ff 7f) into a declared u8. Masking it stores 255;
      *      §7.1 says the message is INVALID. ---- */
@@ -1070,6 +1138,7 @@ static void elementWidthBound()
             void deserialize(sofab::IStreamImpl &is, sofab::id id, size_t, size_t) noexcept override
             { if (id == 15) is.readArray(u, 2, -1, sofab::ElemBound::of<uint32_t>()); }
         };
+        checkStreamReuse<U32Arr>("elementWidthBound/U32Arr");
         {   /* 4294967295 = ff ff ff ff 0f */
             const uint8_t bytes[] = {0x7b, 0x01, 0xff, 0xff, 0xff, 0xff, 0x0f};
             sofab::IStreamObject<U32Arr> in;
@@ -1096,6 +1165,7 @@ static void elementWidthBound()
             void deserialize(sofab::IStreamImpl &is, sofab::id id, size_t, size_t) noexcept override
             { if (id == 15) is.readArray(u, 1, -1, sofab::ElemBound::of<uint64_t>()); }
         };
+        checkStreamReuse<U64Arr>("elementWidthBound/U64Arr");
         const uint8_t bytes[] = {0x7b, 0x01, 0xff, 0xff, 0xff, 0xff, 0xff,
                                  0xff, 0xff, 0xff, 0xff, 0x01}; /* UINT64_MAX */
         sofab::IStreamObject<U64Arr> in;
@@ -1114,6 +1184,7 @@ static void elementWidthBound()
             void deserialize(sofab::IStreamImpl &is, sofab::id id, size_t, size_t) noexcept override
             { if (id == 15) is.readArray(u, -1, -1, sofab::ElemBound::of<uint8_t>()); }
         };
+        checkStreamReuse<ShortDst>("elementWidthBound/ShortDst");
         {   /* four elements into a two-element destination, the LAST over-width */
             const uint8_t bytes[] = {0x7b, 0x04, 1, 2, 3, 0x80, 0x02};
             sofab::IStreamObject<ShortDst> in;
@@ -1184,6 +1255,7 @@ static void elementWidthBound()
             void deserialize(sofab::IStreamImpl &is, sofab::id id, size_t, size_t) noexcept override
             { if (id == 15) is.readArray(u, 4, -1, sofab::ElemBound::of<uint16_t>()); }
         };
+        checkStreamReuse<VecArr>("elementWidthBound/VecArr");
         {   /* 65535 = ff ff 03 */
             const uint8_t bytes[] = {0x7b, 0x02, 0xff, 0xff, 0x03, 7};
             sofab::IStreamObject<VecArr> in;
@@ -1207,6 +1279,7 @@ static void elementWidthBound()
             void deserialize(sofab::IStreamImpl &is, sofab::id id, size_t, size_t) noexcept override
             { if (id == 15) is.readArray(i, 2, -1, sofab::ElemBound{-10, 10}); }
         };
+        checkStreamReuse<RangedArr>("elementWidthBound/RangedArr");
         {   /* -10, 10 -> zig-zag 19 (13), 20 (14) */
             const uint8_t bytes[] = {0x7c, 0x02, 19, 20};
             sofab::IStreamObject<RangedArr> in;
@@ -1251,6 +1324,7 @@ static void callbackExceedLimit()
             }
         }
     };
+    checkStreamReuse<CappedArr>("callbackExceedLimit/CappedArr");
 
     /* Control: count within the cap decodes COMPLETE. */
     {
@@ -1308,6 +1382,7 @@ static void wireTypeGuard()
             read = true;
         }
     };
+    checkStreamReuse<GuardedU>("wireTypeGuard/GuardedU");
 
     /* Correctly typed: id 0, Unsigned, value 6 -> read as 6. */
     {
@@ -1343,6 +1418,7 @@ static void wireTypeGuard()
             void deserialize(sofab::IStreamImpl &is, sofab::id id, size_t, size_t) noexcept override
             { if (id == 0) taken = is.read(v); }
         };
+        checkStreamReuse<UnguardedU>("wireTypeGuard/UnguardedU");
         const uint8_t bytes[] = {0x01, 0x06}; /* Signed, zig-zag 6 = 3 */
         sofab::IStreamObject<UnguardedU> in;
         auto r = in.feed(bytes, sizeof bytes);
@@ -1364,6 +1440,7 @@ static void wireTypeGuard()
             void deserialize(sofab::IStreamImpl &is, sofab::id id, size_t, size_t) noexcept override
             { if (id == 0) is.read(a); else if (id == 1) is.read(b); }
         };
+        checkStreamReuse<TwoU>("wireTypeGuard/TwoU");
         const uint8_t bytes[] = {0x01, 0x06, 0x09, 0x06}; /* id0 Signed, id1 Signed */
         sofab::IStreamObject<TwoU> in;
         auto r1 = in.feed(bytes, 2);
@@ -1405,6 +1482,7 @@ static void wireTypeGuard()
                 /* every other id: not ours, never read */
             }
         };
+        checkStreamReuse<Watched>("wireTypeGuard/Watched");
         struct Case { const char *what; const uint8_t *bytes; size_t n; size_t want; };
         const uint8_t unknownId[]  = {0x38, 0x2a};       /* id 7, unsigned — no arm */
         const uint8_t knownOk[]    = {0x00, 0x09};       /* id 0, unsigned — matches */
@@ -1440,6 +1518,7 @@ static void wireTypeGuard()
                 else if (id == 1) { if (is.wire() != sofab::detail::Wire::Signed) return; is.read(b); }
             }
         };
+        checkStreamReuse<TwoFields>("wireTypeGuard/TwoFields");
         const uint8_t bytes[] = {0x01, 0x06, 0x09, 0x53};
         sofab::IStreamObject<TwoFields> in;
         auto r = in.feed(bytes, sizeof bytes);
@@ -1464,6 +1543,7 @@ static void wireTypeGuard()
                 read = true;
             }
         };
+        checkStreamReuse<GuardedStr>("wireTypeGuard/GuardedStr");
 
         /* delivered as fp32 (0x2a = id5|Fixlen, 0x20 = len4|Fp32, then 4 bytes) -> skip. */
         {
@@ -1509,6 +1589,7 @@ static void wireTypeGuard()
                 else if (id == 6) is.read(next);
             }
         };
+        checkStreamReuse<StrBinder>("wireTypeGuard/StrBinder");
 
         struct StrCase
         {
@@ -1572,6 +1653,7 @@ static void wireTypeGuard()
                 consumed = is.consumed();
             }
         };
+        checkStreamReuse<RawBlobBinder>("wireTypeGuard/RawBlobBinder");
 
         struct RawCase
         {
@@ -1641,6 +1723,7 @@ static void wireTypeGuard()
             void deserialize(sofab::IStreamImpl &is, sofab::id, size_t, size_t) noexcept override
             { w.push_back(is.wire()); f.push_back(is.fixType()); } /* no read(): fields auto-skip */
         };
+        checkStreamReuse<Recorder>("wireTypeGuard/Recorder");
         sofab::IStreamObject<Recorder> in;
         auto r = in.feed(os.data(), os.bytesUsed());
         CHECK(r.code() == sofab::Error::None, "accessor: readout message is COMPLETE");
@@ -1719,6 +1802,7 @@ static void zeroLengthForms()
             void deserialize(sofab::IStreamImpl &is, sofab::id id, size_t, size_t) noexcept override
             { if (id == 2) is.read(t); }
         };
+        checkStreamReuse<OnlyTail>("zeroLengthForms/OnlyTail");
         sofab::IStreamObject<OnlyTail> in;
         in.feed(seq.data(), seq.bytesUsed());
         CHECK((*in).t == -7, "empty sequence: resync after empty sub-sequence");
@@ -2197,6 +2281,7 @@ static void maxDepth()
         struct Empty : sofab::IStreamMessage {
             void deserialize(sofab::IStreamImpl &, sofab::id, size_t, size_t) noexcept override {}
         };
+        checkStreamReuse<Empty>("maxDepth/Empty");
         sofab::IStreamObject<Empty> in;
         auto r = in.feed(deep.data(), deep.size());
         CHECK(r.code() == sofab::Error::InvalidMessage, "decoder rejects nesting past MAX_DEPTH");
@@ -2646,6 +2731,7 @@ static void strictUtf8()
         struct SkipAll : sofab::IStreamMessage {
             void deserialize(sofab::IStreamImpl &, sofab::id, size_t, size_t) noexcept override {} /* read nothing */
         };
+        checkStreamReuse<SkipAll>("strictUtf8/SkipAll");
         auto w = stringFieldWire("\xC0\x80", sofab::detail::Fix::String);
         sofab::IStreamObject<SkipAll> in;
         auto r = in.feed(w.data(), w.size());
@@ -3721,6 +3807,7 @@ static void heapFreeStorage()
                 if (id == 1) is.readString(name); /* no declared maxlen */
             }
         };
+        checkStreamReuse<NoBoundMsg>("heapFreeStorage/NoBoundMsg");
         uint8_t buf[64];
         sofab::OStreamView os{buf, sizeof(buf)};
         (void)os.write(1, std::string_view{"123456789"}); /* 9 > capacity 8 */
@@ -3741,6 +3828,7 @@ static void heapFreeStorage()
                 if (id == 1) is.readString(name, 8);
             }
         };
+        checkStreamReuse<TypedMsg>("heapFreeStorage/TypedMsg");
         uint8_t buf[64];
         sofab::OStreamView os{buf, sizeof(buf)};
         (void)os.write(1, static_cast<uint64_t>(7)); /* unsigned, not a string */
@@ -3762,6 +3850,7 @@ static void heapFreeStorage()
                 if (id == 5) is.readString(s, 8);
             }
         };
+        checkStreamReuse<Utf8Msg>("heapFreeStorage/Utf8Msg");
         /* Built by hand: the encoder refuses to emit C0 80 at all
          * (InvalidArgument, checked in strictUtf8()), so the wire has to come
          * from stringFieldWire, exactly as the growable-destination case does. */
@@ -3792,6 +3881,7 @@ static void heapFreeStorage()
                 if (id == 1) is.readArray(v); /* no declared count */
             }
         };
+        checkStreamReuse<UnboundedArrayMsg>("heapFreeStorage/UnboundedArrayMsg");
         struct BoundedArrayMsg : sofab::IStreamMessage
         {
             sofab::InlineVector<uint32_t, 4> v;
@@ -3800,6 +3890,7 @@ static void heapFreeStorage()
                 if (id == 1) is.readArray(v, 4); /* count: 4 */
             }
         };
+        checkStreamReuse<BoundedArrayMsg>("heapFreeStorage/BoundedArrayMsg");
         struct GrowableArrayMsg : sofab::IStreamMessage
         {
             std::vector<uint32_t> v;
@@ -3808,6 +3899,7 @@ static void heapFreeStorage()
                 if (id == 1) is.readArray(v);
             }
         };
+        checkStreamReuse<GrowableArrayMsg>("heapFreeStorage/GrowableArrayMsg");
 
         const uint32_t ten[10] = {1, 2, 3, 4, 5, 6, 7, 8, 9, 10};
         uint8_t buf[64];
@@ -3852,6 +3944,7 @@ static void heapFreeStorage()
                     if (id == 2) is.readArray(v);
                 }
             };
+            checkStreamReuse<FloatArrayMsg>("heapFreeStorage/FloatArrayMsg");
             const float six[6] = {1.f, 2.f, 3.f, 4.f, 5.f, 6.f};
             uint8_t fbuf[64];
             sofab::OStreamView fos{fbuf, sizeof(fbuf)};
@@ -4182,6 +4275,7 @@ static void nestedArrayCountCeiling()
     struct Nested : sofab::IStreamMessage {
         void deserialize(sofab::IStreamImpl &, sofab::id, size_t, size_t) noexcept override {}
     };
+    checkStreamReuse<Nested>("nestedArrayCountCeiling/Nested");
     auto outcome = [](const std::vector<uint8_t> &b) {
         sofab::IStreamObject<Nested> in;
         return in.feed(b.data(), b.size()).code();
@@ -4946,6 +5040,7 @@ static void chunkLifetime()
             }
         }
     };
+    checkStreamReuse<Payload>("chunkLifetime/Payload");
 
     /* Long enough that every field straddles several chunks at the small sizes
      * below, so both the in-place path and the reassembly path are exercised. */
@@ -5112,6 +5207,692 @@ static void encodeFailuresAreLatched()
     }
 }
 
+/* --- the bulk array decoder, swept per declared element type ----------------
+ *
+ * readArray is where every receiver-side decision about an array meets, in the
+ * one order §7 allows: the wire tag (§7.3), the declared `count` (§7.1), the
+ * configured policy cap (generator#102 -- LimitExceeded, deliberately NOT
+ * INVALID), the destination's own capacity, and last the declared element width
+ * (§7.1), applied as each element is decoded. Underneath it the element loop is
+ * not one loop but four: a windowed one that runs while a full 10-byte varint
+ * window is readable and a checked one for the last few bytes, each in a stored
+ * and a surplus form -- the surplus being the elements past the destination
+ * that are parsed only to keep the field framed.
+ *
+ * All of it is a template instantiated per destination type, so a case written
+ * for one element type leaves that same case unexecuted for every other one.
+ * The sweep is therefore written once and run for each destination type the
+ * suite decodes into, driving each through the whole matrix. --- */
+
+/* zig-zag (§4.2), so a signed element's wire value can be written directly. */
+static uint64_t zigzag(int64_t v)
+{
+    return (static_cast<uint64_t>(v) << 1) ^ static_cast<uint64_t>(v >> 63);
+}
+
+/* §4.7: `(id << 3) | type` at id 15, the element count, then the elements. */
+static std::vector<uint8_t> intArrayWire(bool sign, const std::vector<uint64_t> &raws)
+{
+    std::vector<uint8_t> w;
+    appendVarint(w, (15u << 3) | (sign ? 4u : 3u));
+    appendVarint(w, raws.size());
+    for (uint64_t r : raws) appendVarint(w, r);
+    return w;
+}
+
+/* The destination under test. The three knobs are exactly what generated code
+ * passes down from the schema; the sweep sets them per case. */
+template <typename C>
+struct SweepArrMsg : sofab::IStreamMessage
+{
+    C v{};
+    long count = -1;                 /**< declared `count: N` (§7.1)     */
+    long cap = -1;                   /**< configured decode limit (#102) */
+    sofab::ElemBound bound{};        /**< declared element width (§7.1)  */
+    void deserialize(sofab::IStreamImpl &is, sofab::id id, size_t, size_t) noexcept override
+    {
+        if (id == 15) is.readArray(v, count, cap, bound);
+    }
+};
+
+/* Feed one byte at a time and return the final verdict: the same bytes must end
+ * on the same outcome however they are cut (§7.2 item 4), and the drip also
+ * drives the checked element loops, which only run when fewer than ten bytes
+ * are readable. */
+template <typename C>
+static sofab::Error dripFeed(sofab::IStreamObject<SweepArrMsg<C>> &in,
+                             const std::vector<uint8_t> &w)
+{
+    sofab::Error last = sofab::Error::Incomplete;
+    for (uint8_t b : w) last = in.feed(&b, 1).code();
+    return last;
+}
+
+/* How many elements the destination keeps: a growable one is resized to the
+ * wire count, a fixed-extent one keeps its leading slots and the rest is
+ * surplus. */
+template <typename C>
+static constexpr size_t destSlots(size_t wireCount)
+{
+    if constexpr (requires(C c) { c.resize(size_t{}); }) return wireCount;
+    else                                                 return C{}.size();
+}
+
+template <typename C>
+static void sweepIntArray(const char *name)
+{
+    using E = typename C::value_type;
+    constexpr bool sign = std::is_signed_v<E>;
+    constexpr bool narrow = sizeof(E) < sizeof(int64_t);
+
+    static char buf[192];
+    auto say = [&](const char *what) {
+        std::snprintf(buf, sizeof buf, "array sweep [%s]: %s", name, what);
+        return buf;
+    };
+    auto raw = [](int64_t value) {
+        return sign ? zigzag(value) : static_cast<uint64_t>(value);
+    };
+    /* A 64-bit element type has the accumulator's own range, so ElemBound::of is
+     * unarmed for it -- there is nothing it could reject. An explicit range is
+     * what a schema states instead, and it drives the identical armed decode. */
+    const sofab::ElemBound bound = narrow ? sofab::ElemBound::of<E>()
+                                          : sofab::ElemBound{0, 100};
+    /* One wire value the declared width does not admit. */
+    const uint64_t overWide = []() -> uint64_t {
+        if constexpr (narrow && sign)
+            return zigzag(static_cast<int64_t>(std::numeric_limits<E>::max()) + 1);
+        else if constexpr (narrow)
+            return static_cast<uint64_t>(std::numeric_limits<E>::max()) + 1;
+        else if constexpr (sign) return zigzag(101);
+        else                     return 101;
+    }();
+    /* §4.1: ten bytes whose tenth carries a payload bit above bit 0 -- a varint
+     * wider than 64 bits, INVALID wherever it appears. */
+    static const std::vector<uint8_t> tooWide = {0x80, 0x80, 0x80, 0x80, 0x80,
+                                                 0x80, 0x80, 0x80, 0x80, 0x02};
+
+    /* 24 one-byte elements: long enough that the windowed loops run first and
+     * the checked ones finish the tail, and -- for a fixed-extent destination --
+     * that both of those run a second time over the surplus. */
+    const size_t n = 24;
+    std::vector<uint64_t> raws;
+    for (size_t i = 0; i < n; ++i) raws.push_back(raw(static_cast<int64_t>(i % 7) + 1));
+    const size_t kept = std::min(n, destSlots<C>(n));
+
+    auto elemAt = [](const SweepArrMsg<C> &m, size_t i) {
+        return static_cast<long long>(m.v[i]);
+    };
+
+    /* --- the plain decode, with and without a declared element width. Same
+     *     bytes, same values: the bound rejects, it never rewrites. --- */
+    for (bool armed : {false, true})
+    {
+        const auto w = intArrayWire(sign, raws);
+        sofab::IStreamObject<SweepArrMsg<C>> in;
+        (*in).bound = armed ? bound : sofab::ElemBound{};
+        CHECK(in.feed(w.data(), w.size()).code() == sofab::Error::None,
+              say(armed ? "an in-width array decodes COMPLETE (bounded)"
+                        : "an in-width array decodes COMPLETE (unbounded)"));
+        bool values = true;
+        for (size_t i = 0; i < kept; ++i)
+            values = values && elemAt(*in, i) == static_cast<long long>(i % 7) + 1;
+        CHECK(values, say(armed ? "every stored element decodes (bounded)"
+                                : "every stored element decodes (unbounded)"));
+
+        /* ...and byte by byte, which is the same message through the checked
+         * loops instead of the windowed ones. */
+        sofab::IStreamObject<SweepArrMsg<C>> drip;
+        (*drip).bound = armed ? bound : sofab::ElemBound{};
+        CHECK(dripFeed(drip, w) == sofab::Error::None,
+              say("the same array fed one byte at a time is COMPLETE too"));
+        bool same = true;
+        for (size_t i = 0; i < kept; ++i)
+            same = same && elemAt(*drip, i) == elemAt(*in, i);
+        CHECK(same, say("a one-byte-at-a-time feed decodes the same elements"));
+    }
+
+    /* --- §7.1: an element outside the declared width is INVALID wherever it
+     *     sits -- first, last stored, or out in the surplus, which §7.1 does not
+     *     exempt: it never asks whether the element had a slot to be masked
+     *     into. --- */
+    std::vector<size_t> spots{0, kept - 1, n - 1};
+    std::sort(spots.begin(), spots.end());
+    spots.erase(std::unique(spots.begin(), spots.end()), spots.end());
+    for (size_t pos : spots)
+    {
+        auto bad = raws;
+        bad[pos] = overWide;
+        const auto w = intArrayWire(sign, bad);
+        sofab::IStreamObject<SweepArrMsg<C>> in;
+        (*in).bound = bound;
+        CHECK(in.feed(w.data(), w.size()).code() == sofab::Error::InvalidMessage,
+              say("an over-width element is INVALID (§7.1)"));
+        /* the identical bytes with no declared width decode unchanged: the bound
+         * is opt-in, so a caller that has no schema keeps the decode it had. */
+        sofab::IStreamObject<SweepArrMsg<C>> loose;
+        CHECK(loose.feed(w.data(), w.size()).code() == sofab::Error::None,
+              say("the same element without a declared width decodes"));
+    }
+
+    /* --- §4.1: a varint wider than 64 bits is INVALID with or without a width
+     *     bound. Only the windowed loops can see the tenth byte at all, so it is
+     *     placed once over a stored element and once out in the surplus. --- */
+    for (size_t pos : {size_t{0}, n - 1})
+        for (bool armed : {false, true})
+        {
+            std::vector<uint8_t> w;
+            appendVarint(w, (15u << 3) | (sign ? 4u : 3u));
+            appendVarint(w, n);
+            for (size_t i = 0; i < n; ++i)
+            {
+                if (i == pos) w.insert(w.end(), tooWide.begin(), tooWide.end());
+                else          appendVarint(w, raws[i]);
+            }
+            sofab::IStreamObject<SweepArrMsg<C>> in;
+            (*in).bound = armed ? bound : sofab::ElemBound{};
+            CHECK(in.feed(w.data(), w.size()).code() == sofab::Error::InvalidMessage,
+                  say("a >64-bit array element is INVALID (§4.1)"));
+        }
+
+    /* --- §7: a payload that stops mid-array is INCOMPLETE, not malformed, with
+     *     and without a width bound and in both element loops. The count the
+     *     missing bytes could never back is not allocated for either. --- */
+    for (bool armed : {false, true})
+    {
+        auto cut = intArrayWire(sign, raws);
+        cut.resize(cut.size() - 6);
+        sofab::IStreamObject<SweepArrMsg<C>> in;
+        (*in).bound = armed ? bound : sofab::ElemBound{};
+        CHECK(in.feed(cut.data(), cut.size()).code() == sofab::Error::Incomplete,
+              say("a cut array payload is INCOMPLETE (§7)"));
+        /* and a cut INSIDE the last element's varint, where the checked loop has
+         * to tell "ran dry" (INCOMPLETE) from "over-long" (INVALID). */
+        auto mid = intArrayWire(sign, raws);
+        mid.back() = 0x80; /* a continuation byte with nothing after it */
+        sofab::IStreamObject<SweepArrMsg<C>> half;
+        (*half).bound = armed ? bound : sofab::ElemBound{};
+        CHECK(half.feed(mid.data(), mid.size()).code() == sofab::Error::Incomplete,
+              say("a cut inside an element's varint is INCOMPLETE, not over-long"));
+    }
+
+    /* --- the ceilings, in the order §7 fixes them. --- */
+    {   /* 2. the declared `count` -- a schema fact, so INVALID. */
+        const auto w = intArrayWire(sign, raws);
+        sofab::IStreamObject<SweepArrMsg<C>> in;
+        (*in).count = static_cast<long>(n) - 1;
+        CHECK(in.feed(w.data(), w.size()).code() == sofab::Error::InvalidMessage,
+              say("a wire count past the declared `count` is INVALID (§7.1)"));
+    }
+    {   /* 3. the configured policy cap -- a receiver fact, so LimitExceeded
+         *    (§6.2.1) and never folded into INVALID: the bytes are well-formed
+         *    and decode elsewhere. */
+        const auto w = intArrayWire(sign, raws);
+        sofab::IStreamObject<SweepArrMsg<C>> in;
+        (*in).cap = static_cast<long>(n) - 1;
+        auto r = in.feed(w.data(), w.size());
+        CHECK(r.code() == sofab::Error::LimitExceeded && !r.invalid(),
+              say("a wire count past the configured cap is LimitExceeded, not INVALID"));
+    }
+    {   /* 1. and the tag decides before either of them: the opposite array kind
+         *    at the same id is not this field's value at all (§7.3), so neither
+         *    ceiling nor the width bound is ever applied to it. */
+        const auto w = intArrayWire(!sign, raws);
+        sofab::IStreamObject<SweepArrMsg<C>> in;
+        (*in).count = 1;
+        (*in).cap = 1;
+        (*in).bound = bound;
+        auto r = in.feed(w.data(), w.size());
+        CHECK(r.code() == sofab::Error::None && r.skipped() == 1,
+              say("the opposite array kind is skipped, never bound-checked (§7.3)"));
+    }
+
+    checkStreamReuse<SweepArrMsg<C>>(name);
+}
+
+/* An `fp32`/`fp64` array is fixlen-framed (§4.8): the count, then the
+ * element-width word, then raw little-endian payload. A different set of
+ * decisions from the varint arrays above -- the payload length is known from
+ * the two words alone -- so it is swept separately. */
+template <typename C>
+static void sweepFloatArray(const char *name)
+{
+    using E = typename C::value_type;
+    static_assert(std::is_floating_point_v<E>, "float element type");
+    constexpr uint64_t sub = sizeof(E) == 4 ? 0u : 1u; /* Fix::Fp32 / Fix::Fp64 */
+
+    static char buf[192];
+    auto say = [&](const char *what) {
+        std::snprintf(buf, sizeof buf, "float array sweep [%s]: %s", name, what);
+        return buf;
+    };
+
+    /* A destination that publishes a capacity() refuses a longer array outright
+     * (see sweepCappedDestination), so the sweep stays inside it and checks that
+     * refusal separately below. */
+    constexpr size_t n = []() constexpr -> size_t {
+        if constexpr (requires { C::capacity(); }) return C::capacity();
+        else                                       return destSlots<C>(6);
+    }();
+    auto wire = [](size_t count, size_t elements) {
+        std::vector<uint8_t> w;
+        appendVarint(w, (15u << 3) | 5u); /* Wire::ArrayFixlen */
+        appendVarint(w, count);
+        appendVarint(w, (sizeof(E) << 3) | sub); /* §4.8 element word */
+        for (size_t i = 0; i < elements; ++i)
+        {
+            const E v = static_cast<E>(i) + E{0.5};
+            uint8_t bytes[sizeof(E)];
+            std::memcpy(bytes, &v, sizeof v);
+            /* §4: the wire is little-endian, whatever the host is. */
+            if constexpr (std::endian::native == std::endian::big)
+                std::reverse(bytes, bytes + sizeof bytes);
+            w.insert(w.end(), bytes, bytes + sizeof bytes);
+        }
+        return w;
+    };
+
+    {
+        const auto w = wire(n, n);
+        sofab::IStreamObject<SweepArrMsg<C>> in;
+        CHECK(in.feed(w.data(), w.size()).code() == sofab::Error::None,
+              say("a full fixlen array decodes COMPLETE"));
+        bool values = true;
+        for (size_t i = 0; i < n; ++i)
+            values = values && (*in).v[i] == static_cast<E>(i) + E{0.5};
+        CHECK(values, say("every element decodes at its own width"));
+    }
+    {   /* §7: the payload stops short. INCOMPLETE, and the destination is not
+         *    grown for a count the readable bytes cannot back. */
+        const auto w = wire(n, n - 1);
+        sofab::IStreamObject<SweepArrMsg<C>> in;
+        CHECK(in.feed(w.data(), w.size()).code() == sofab::Error::Incomplete,
+              say("a cut fixlen payload is INCOMPLETE"));
+    }
+    {   /* §7.3: an integer array at the same id contradicts the declared element
+         *    type, so it is skipped like an unknown id -- and its count, which is
+         *    past both ceilings below, is never measured. */
+        const auto w = intArrayWire(false, {1, 2, 3, 4, 5, 6, 7, 8});
+        sofab::IStreamObject<SweepArrMsg<C>> in;
+        (*in).count = 1;
+        (*in).cap = 1;
+        auto r = in.feed(w.data(), w.size());
+        CHECK(r.code() == sofab::Error::None && r.skipped() == 1,
+              say("an integer array at the same id is skipped (§7.3)"));
+    }
+    {   /* §7.1 then §6.2.1 -- the same two ceilings, the same split verdict. */
+        const auto w = wire(n, n);
+        sofab::IStreamObject<SweepArrMsg<C>> in;
+        (*in).count = static_cast<long>(n) - 1;
+        CHECK(in.feed(w.data(), w.size()).code() == sofab::Error::InvalidMessage,
+              say("a wire count past the declared `count` is INVALID"));
+        sofab::IStreamObject<SweepArrMsg<C>> capped;
+        (*capped).cap = static_cast<long>(n) - 1;
+        auto r = capped.feed(w.data(), w.size());
+        CHECK(r.code() == sofab::Error::LimitExceeded && !r.invalid(),
+              say("a wire count past the configured cap is LimitExceeded"));
+    }
+    {   /* one byte at a time: same verdict, same values (§7.2 item 4). */
+        const auto w = wire(n, n);
+        sofab::IStreamObject<SweepArrMsg<C>> in;
+        CHECK(dripFeed(in, w) == sofab::Error::None,
+              say("the same array fed one byte at a time is COMPLETE"));
+        CHECK((*in).v[n - 1] == static_cast<E>(n - 1) + E{0.5},
+              say("a one-byte-at-a-time feed decodes the last element"));
+    }
+
+    if constexpr (requires { C::capacity(); })
+    {   /* one element past what the destination can hold: §6.2.1 policy, not
+         * malformation, because the same bytes decode into a growable one. */
+        const auto w = wire(n + 1, n + 1);
+        sofab::IStreamObject<SweepArrMsg<C>> in;
+        auto r = in.feed(w.data(), w.size());
+        CHECK(r.code() == sofab::Error::LimitExceeded && !r.invalid(),
+              say("an over-capacity count is LimitExceeded, never truncated in"));
+        sofab::IStreamObject<SweepArrMsg<C>> declared;
+        (*declared).count = static_cast<long>(n);
+        CHECK(declared.feed(w.data(), w.size()).code() == sofab::Error::InvalidMessage,
+              say("under a declared `count` the same overflow is INVALID (§7.1)"));
+    }
+
+    checkStreamReuse<SweepArrMsg<C>>(name);
+}
+
+/* A destination that publishes a static capacity() -- the heap-free containers
+ * -- refuses a count it cannot hold instead of truncating into it (issue #81).
+ * WHICH refusal it is depends on where the ceiling comes from: with no declared
+ * `count` the capacity is this receiver's own technical limit and the same
+ * bytes decode into a growable destination, so §6.2.1 makes it LimitExceeded;
+ * with a `count` declared the schema governs and the verdict stays the INVALID
+ * an over-count payload always gets (§7.1). */
+template <typename C>
+static void sweepCappedDestination(const char *name)
+{
+    using E = typename C::value_type;
+    constexpr size_t cap = C::capacity();
+
+    static char buf[192];
+    auto say = [&](const char *what) {
+        std::snprintf(buf, sizeof buf, "capped destination [%s]: %s", name, what);
+        return buf;
+    };
+
+    std::vector<uint64_t> fits, over;
+    for (size_t i = 0; i < cap; ++i)     fits.push_back(i + 1);
+    for (size_t i = 0; i < cap + 1; ++i) over.push_back(i + 1);
+
+    {
+        const auto w = intArrayWire(false, fits);
+        sofab::IStreamObject<SweepArrMsg<C>> in;
+        (*in).bound = sofab::ElemBound::of<E>();
+        CHECK(in.feed(w.data(), w.size()).code() == sofab::Error::None,
+              say("a count the destination can hold decodes"));
+        CHECK((*in).v.size() == cap && (*in).v[cap - 1] == static_cast<E>(cap),
+              say("the destination holds exactly the elements the wire carries"));
+    }
+    {
+        const auto w = intArrayWire(false, over);
+        sofab::IStreamObject<SweepArrMsg<C>> in;
+        auto r = in.feed(w.data(), w.size());
+        CHECK(r.code() == sofab::Error::LimitExceeded && !r.invalid(),
+              say("an over-capacity count with no declared `count` is LimitExceeded"));
+    }
+    {
+        const auto w = intArrayWire(false, over);
+        sofab::IStreamObject<SweepArrMsg<C>> in;
+        (*in).count = static_cast<long>(cap);
+        CHECK(in.feed(w.data(), w.size()).code() == sofab::Error::InvalidMessage,
+              say("under a declared `count` the same overflow is INVALID (§7.1)"));
+    }
+
+    checkStreamReuse<SweepArrMsg<C>>(name);
+}
+
+static void arrayDecodeSweep()
+{
+    sweepIntArray<std::array<uint8_t, 2>>("std::array<u8,2>");
+    sweepIntArray<std::array<uint8_t, 4>>("std::array<u8,4>");
+    sweepIntArray<std::array<int8_t, 4>>("std::array<i8,4>");
+    sweepIntArray<std::array<uint32_t, 2>>("std::array<u32,2>");
+    sweepIntArray<std::array<int32_t, 2>>("std::array<i32,2>");
+    sweepIntArray<std::array<uint64_t, 1>>("std::array<u64,1>");
+    sweepIntArray<std::vector<uint8_t>>("std::vector<u8>");
+    sweepIntArray<std::vector<uint16_t>>("std::vector<u16>");
+    sweepIntArray<std::vector<int16_t>>("std::vector<i16>");
+    sweepIntArray<std::array<uint16_t, 2>>("std::array<u16,2>");
+    sweepIntArray<std::array<int16_t, 2>>("std::array<i16,2>");
+    sweepIntArray<std::array<int64_t, 2>>("std::array<i64,2>");
+    sweepIntArray<std::vector<uint32_t>>("std::vector<u32>");
+    sweepIntArray<std::vector<uint64_t>>("std::vector<u64>");
+    sweepIntArray<std::vector<int64_t>>("std::vector<i64>");
+
+    sweepFloatArray<std::vector<float>>("std::vector<fp32>");
+    sweepFloatArray<std::array<float, 3>>("std::array<fp32,3>");
+    sweepFloatArray<std::array<float, 4>>("std::array<fp32,4>");
+    sweepFloatArray<std::vector<double>>("std::vector<fp64>");
+    sweepFloatArray<sofab::InlineVector<float, 4>>("InlineVector<fp32,4>");
+
+    sweepCappedDestination<sofab::InlineVector<uint32_t, 4>>("InlineVector<u32,4>");
+}
+
+/* --- §6.4 across chunk boundaries ------------------------------------------
+ *
+ * The shared `invalid_utf8` vectors all put the bad sequence where a one-shot
+ * decode meets it head on. The case they leave out is the one a *streaming*
+ * validator gets wrong: the invalid sequence starts at an offset at or past
+ * everything fed so far, so an implementation that validates only the bytes of
+ * the chunk in hand -- or that resumes a payload from the wrong offset -- never
+ * looks at those bytes at all and hands back COMPLETE. §6.4 puts the validation
+ * at payload completion for exactly that reason, and §7.2 item 4 forbids the
+ * verdict from depending on where the chunks were cut.
+ *
+ * So the message below is fed at every split point, and the invalid sequence is
+ * placed past the first chunk's end for most of them. INVALID must come out
+ * every time, including when the split falls INSIDE the bad sequence -- where a
+ * validator that judged the truncated prefix could just as wrongly report
+ * INVALID one chunk early, i.e. before the bytes that decide it have arrived.
+ * --- */
+
+/* A heap-free destination takes the same rule on its own branch of readString,
+ * which does its own capacity check before any byte is copied. */
+struct Utf8FixedMsg : sofab::IStreamMessage
+{
+    sofab::FixedString<32> s;
+    void deserialize(sofab::IStreamImpl &is, sofab::id id, size_t, size_t) noexcept override
+    {
+        if (id == 5) is.readString(s, 32);
+    }
+};
+
+/* A message that reads nothing: §6.4 exempts a SKIPPED string from validation,
+ * and that exemption must survive the chunking too. */
+struct Utf8SkipMsg : sofab::IStreamMessage
+{
+    void deserialize(sofab::IStreamImpl &, sofab::id, size_t, size_t) noexcept override {}
+};
+
+template <typename M>
+static void checkUtf8AtEverySplit(const char *name, const std::vector<uint8_t> &w,
+                                  sofab::Error want)
+{
+    static char buf[192];
+    auto say = [&](const char *what) {
+        std::snprintf(buf, sizeof buf, "utf8/chunked [%s]: %s", name, what);
+        return buf;
+    };
+
+    {
+        sofab::IStreamObject<M> in;
+        CHECK(in.feed(w.data(), w.size()).code() == want,
+              say("the whole message in one feed"));
+    }
+    for (size_t k = 1; k < w.size(); ++k)
+    {
+        sofab::IStreamObject<M> in;
+        auto r1 = in.feed(w.data(), k);
+        /* The field is unfinished, so nothing is decided yet: a prefix must be
+         * INCOMPLETE. Judging the truncated payload here would report INVALID
+         * for bytes that have not arrived. */
+        CHECK(r1.code() == sofab::Error::Incomplete,
+              say("a prefix of the field is INCOMPLETE, not yet judged"));
+        auto r2 = in.feed(w.data() + k, w.size() - k);
+        CHECK(r2.code() == want, say("the completing chunk decides, at every split"));
+    }
+    {   /* one byte at a time: the pathological chunking, same verdict. */
+        sofab::IStreamObject<M> in;
+        sofab::Error last = sofab::Error::Incomplete;
+        for (uint8_t b : w) last = in.feed(&b, 1).code();
+        CHECK(last == want, say("one byte at a time reaches the same verdict"));
+    }
+}
+
+static void utf8AcrossChunkBoundaries()
+{
+    /* 24 ASCII bytes, then the invalid sequence: with any chunk shorter than the
+     * field's first 26 bytes, the bad sequence begins at or beyond the total fed
+     * so far. */
+    const std::string lead(24, 'a');
+    const std::string overlong = lead + std::string("\xC0\x80", 2); /* overlong NUL */
+    const std::string surrogate = lead + std::string("\xED\xA0\x80", 3); /* U+D800 */
+    /* the same shape, but the tail is well-formed -- the control that says the
+     * verdict comes from the bytes and not from the chunking. */
+    const std::string good = lead + std::string("\xF0\x9F\x98\x80", 4); /* U+1F600 */
+    /* and one where the invalid sequence is TRUNCATED by the declared length:
+     * the payload ends inside it, so completion is what decides (§6.4). */
+    const std::string cutSeq = lead + std::string("\xE2\x82", 2);
+
+#if SOFAB_STRICT_UTF8
+    const sofab::Error bad = sofab::Error::InvalidMessage;
+#else
+    /* Without the strict flag nothing validates, so every one of these is a
+     * plain string payload -- the chunk-independence claim still holds, only the
+     * expected verdict changes. */
+    const sofab::Error bad = sofab::Error::None;
+#endif
+
+    checkUtf8AtEverySplit<ScalarMsg>("overlong C0 80 past the first chunk",
+                                     stringFieldWire(overlong, sofab::detail::Fix::String), bad);
+    checkUtf8AtEverySplit<ScalarMsg>("surrogate ED A0 80 past the first chunk",
+                                     stringFieldWire(surrogate, sofab::detail::Fix::String), bad);
+    checkUtf8AtEverySplit<ScalarMsg>("a sequence the declared length cuts short",
+                                     stringFieldWire(cutSeq, sofab::detail::Fix::String), bad);
+    checkUtf8AtEverySplit<ScalarMsg>("a valid 4-byte sequence in the tail",
+                                     stringFieldWire(good, sofab::detail::Fix::String),
+                                     sofab::Error::None);
+
+    /* The heap-free destination validates on its own branch... */
+    checkUtf8AtEverySplit<Utf8FixedMsg>("FixedString destination",
+                                        stringFieldWire(overlong, sofab::detail::Fix::String), bad);
+    checkUtf8AtEverySplit<Utf8FixedMsg>("FixedString destination, valid tail",
+                                        stringFieldWire(good, sofab::detail::Fix::String),
+                                        sofab::Error::None);
+
+    /* ...a blob is never text, so the identical bytes are COMPLETE however they
+     * are cut... */
+    checkUtf8AtEverySplit<ScalarMsg>("the same bytes as a blob",
+                                     stringFieldWire(overlong, sofab::detail::Fix::Blob),
+                                     sofab::Error::None);
+    /* ...and so is a string nobody reads (§6.4's skip exemption). */
+    checkUtf8AtEverySplit<Utf8SkipMsg>("a skipped invalid string",
+                                       stringFieldWire(overlong, sofab::detail::Fix::String),
+                                       sofab::Error::None);
+}
+
+/* --- §7.2 item 4: the verdict does not depend on where the chunks were cut ---
+ *
+ * A message fed in two pieces must end exactly where the same bytes fed whole
+ * end, at every split point, and the pieces in between must be INCOMPLETE --
+ * never INVALID (the bytes are fine) and never a silent COMPLETE that drops the
+ * unfinished tail. Nested sequences are what make this more than bookkeeping: a
+ * cut inside a sub-message abandons the level where it began and the whole
+ * top-level field is delivered again once the rest arrives, so every one of
+ * those restarts has to land on its feet -- and the restart runs per message
+ * type, since the dispatch is instantiated per callback. --- */
+
+template <typename M, typename Check>
+static void checkEverySplit(const char *name, const std::vector<uint8_t> &w, Check &&check)
+{
+    static char buf[192];
+    auto say = [&](const char *what) {
+        std::snprintf(buf, sizeof buf, "split sweep [%s]: %s", name, what);
+        return buf;
+    };
+
+    {
+        sofab::IStreamObject<M> in;
+        CHECK(in.feed(w.data(), w.size()).code() == sofab::Error::None,
+              say("the whole message decodes COMPLETE"));
+        CHECK(check(*in), say("the whole message decodes to the expected values"));
+    }
+    for (size_t k = 1; k < w.size(); ++k)
+    {
+        sofab::IStreamObject<M> in;
+        const auto r1 = in.feed(w.data(), k);
+        CHECK(r1.code() == sofab::Error::Incomplete || r1.code() == sofab::Error::None,
+              say("a prefix is INCOMPLETE or COMPLETE, never INVALID"));
+        const auto r2 = in.feed(w.data() + k, w.size() - k);
+        CHECK(r2.code() == sofab::Error::None, say("the rest completes the message"));
+        CHECK(check(*in), say("the split message decodes to the same values"));
+    }
+    {   /* one byte at a time, which restarts every field as many times as it is
+         * long. */
+        sofab::IStreamObject<M> in;
+        sofab::Error last = sofab::Error::Incomplete;
+        for (uint8_t b : w) last = in.feed(&b, 1).code();
+        CHECK(last == sofab::Error::None, say("one byte at a time is COMPLETE"));
+        CHECK(check(*in), say("one byte at a time decodes the same values"));
+    }
+}
+
+static void chunkIndependence()
+{
+    /* Every wrapper-array collector and both nesting forms in one message, so
+     * the restart is exercised through each of them: a string array (id 1), a
+     * sub-message array (id 2), a blob array (id 3), an array-of-arrays (id 4),
+     * an array of sub-messages that themselves nest (id 5) and a plain scalar
+     * (id 9). */
+    const auto seq = fromHex("0e020a780a0a7907"      /* tags   = [x, y]       */
+                             "1606070e00070707"      /* rows   = [{}, {a=7}]  */
+                             "1e02130102120b0307"    /* blobs  = [{1,2},{},{3}] */
+                             "2603020102" "07"       /* matrix = [[1, 2]]     */
+                             "2e060e000707" "0707"   /* nested = [{child={a=7}}] */
+                             "4801");                /* other  = 1            */
+    checkEverySplit<SeqMsg>("every collector in one message", seq, [](const SeqMsg &m) {
+        return m.tags.size() == 2 && m.tags[0] == "x" && m.tags[1] == "y" &&
+               m.rows.size() == 2 && m.rows[0].a == 0 && m.rows[1].a == 7 &&
+               m.blobs.size() == 3 && m.blobs[0] == std::vector<uint8_t>{1, 2} &&
+               m.blobs[1].empty() && m.blobs[2] == std::vector<uint8_t>{3} &&
+               m.matrix.size() == 1 && m.matrix[0] == std::vector<uint32_t>{1, 2} &&
+               m.nested.size() == 1 && m.nested[0].child.a == 7 &&
+               m.other == 1;
+    });
+
+    /* A sub-message FIELD (not an element), with fields on both sides of it. */
+    const auto nested = fromHex("002a0e002a1153071153");
+    checkEverySplit<Parent>("a nested sub-message field", nested, [](const Parent &m) {
+        return m.top == 42 && m.child.x == 42 && m.child.y == -42 && m.tail == -42;
+    });
+
+    /* An element-index gap, which the decoder has to fill on every restart --
+     * getting that wrong shortens the array instead of failing loudly (§5.1). */
+    const auto gapped = fromHex("0e060005071600090707");
+    checkEverySplit<RowsAtOneMsg>("a gapped sub-message array", gapped,
+                                  [](const RowsAtOneMsg &m) {
+        return m.rows.size() == 3 && m.rows[0].a == 5 && m.rows[1].a == 0 && m.rows[2].a == 9;
+    });
+
+    /* Scalars of every wire form, so the restart is driven over a varint, a
+     * fixlen payload and both array kinds as well. */
+    sofab::OStreamInline<256> os;
+    const std::array<uint32_t, 5> u{10, 20, 30, 0x80000000u, UINT32_MAX};
+    os.write(1, uint64_t{123456789})
+      .write(2, int64_t{-987654321})
+      .write(3, 3.14159f)
+      .write(4, 2.718281828459045)
+      .write(5, std::string_view{"hello sofab"})
+      .write(6, true);
+    CHECK(os.ok(), "split sweep: the scalar message encodes");
+    const std::vector<uint8_t> scalars(os.data(), os.data() + os.bytesUsed());
+    checkEverySplit<ScalarMsg>("every scalar wire form", scalars, [](const ScalarMsg &m) {
+        return m.a == 123456789u && m.b == -987654321 && m.f == 3.14159f &&
+               m.d == 2.718281828459045 && m.s == "hello sofab" && m.flag;
+    });
+
+    sofab::OStreamInline<256> aos;
+    aos.write(1, u).write(2, std::array<float, 3>{1.5f, -2.5f, 1e30f});
+    CHECK(aos.ok(), "split sweep: the array message encodes");
+    const std::vector<uint8_t> arrays(aos.data(), aos.data() + aos.bytesUsed());
+    checkEverySplit<ArrMsg>("a varint array and a fixlen array", arrays, [&u](const ArrMsg &m) {
+        return m.u == u && m.f == std::array<float, 3>{1.5f, -2.5f, 1e30f};
+    });
+}
+
+/* The message types this file declares at namespace scope get the same per-type
+ * reset() check as the ones declared inside a test above (see
+ * checkStreamReuse). */
+static void decoderReuseAcrossTypes()
+{
+    checkStreamReuse<ScalarMsg>("ScalarMsg");
+    checkStreamReuse<ArrMsg>("ArrMsg");
+    checkStreamReuse<Child>("Child");
+    checkStreamReuse<Parent>("Parent");
+    checkStreamReuse<EmptyArrMsg>("EmptyArrMsg");
+    checkStreamReuse<BoundedMsg>("BoundedMsg");
+    checkStreamReuse<SeqMsg>("SeqMsg");
+    checkStreamReuse<RowsAtOneMsg>("RowsAtOneMsg");
+    checkStreamReuse<BoundedSeqMsg>("BoundedSeqMsg");
+    checkStreamReuse<CappedMsg>("CappedMsg");
+    checkStreamReuse<F41Msg>("F41Msg");
+    checkStreamReuse<F41GenMsg>("F41GenMsg");
+    checkStreamReuse<F56Msg>("F56Msg");
+    checkStreamReuse<FixedStoreMsg>("FixedStoreMsg");
+    checkStreamReuse<TrailMsg>("TrailMsg");
+    checkStreamReuse<SweepU>("SweepU");
+    checkStreamReuse<SweepI>("SweepI");
+    checkStreamReuse<Utf8FixedMsg>("Utf8FixedMsg");
+    checkStreamReuse<Utf8SkipMsg>("Utf8SkipMsg");
+}
+
 int main()
 {
     encodeVectors();
@@ -5159,6 +5940,10 @@ int main()
     sinklessFlush();
     oneShotObject();
     chunkLifetime();
+    arrayDecodeSweep();
+    decoderReuseAcrossTypes();
+    utf8AcrossChunkBoundaries();
+    chunkIndependence();
 
     std::printf("\n%d checks, %d failures\n", g_checks, g_failures);
     return g_failures ? 1 : 0;
