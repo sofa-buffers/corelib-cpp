@@ -13,46 +13,25 @@
  * SPDX-License-Identifier: MIT
  */
 
-#include "sofab/sofab.hpp"
+#include "bench_common.hpp"
 
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
-#include <ctime>
 #include <span>
 #include <string>
 
-#if defined(__x86_64__) || defined(__i386__)
-#include <x86intrin.h>
-#define PERF_HAVE_CYCLES 1
-static inline uint64_t perf_cycles() { return (uint64_t)__rdtsc(); }
-#elif defined(__aarch64__)
-#define PERF_HAVE_CYCLES 1
-static inline uint64_t perf_cycles() { uint64_t v; __asm__ volatile("mrs %0, cntvct_el0" : "=r"(v)); return v; }
-#else
-#define PERF_HAVE_CYCLES 0
-static inline uint64_t perf_cycles() { return 0; }
-#endif
-
 namespace
 {
+
+using sofab_bench::IStreamRaw;
+using sofab_bench::OStreamRaw;
 
 #define PERF_STRING "perf-benchmark-message"
 
 const uint32_t perf_samples[8] = {1000000u, 2000000u, 3000000u, 4000000u, 5000000u, 6000000u, 7000000u, 8000000u};
 const int32_t  perf_deltas[8]  = {-100000, -200000, -300000, -400000, -500000, -600000, -700000, -800000};
 const double   perf_fp64[4]    = {3.14159265, 6.28318530, 9.42477795, 12.56637060};
-
-class OStreamRaw : public sofab::OStreamImpl
-{
-public:
-    void init(uint8_t *b, size_t n) noexcept { initBuffer(b, n, 0); }
-};
-class IStreamRaw : public sofab::IStreamImpl
-{
-public:
-    template <class F> void init(F &&cb) noexcept { topCallback_ = std::forward<F>(cb); }
-};
 
 size_t perf_encode(uint8_t *buf, size_t buflen)
 {
@@ -119,9 +98,9 @@ void perf_decode(const uint8_t *buf, size_t len, PerfOut &out)
     is.feed(buf, len);
 }
 
-struct PerfResult { unsigned long iters; double cycles_op; double ns_op; double mb_s; };
-
-double cpu_now() { return (double)std::clock() / (double)CLOCKS_PER_SEC; }
+/*! The measured-loop result and the ~1 s CPU-time loop itself come from
+ *  bench_common.hpp, so `perf` and `bench` cannot time differently. */
+using PerfResult = sofab_bench::MeasureResult;
 
 void perf_report(const char *what, PerfResult r, size_t bytes)
 {
@@ -138,40 +117,6 @@ void perf_report(const char *what, PerfResult r, size_t bytes)
     printf("  throughput    : %.1f MB/s  (speedtest, MB = 1e6 bytes)\n", r.mb_s);
 }
 
-/* Sample the CPU clock once per block of operations rather than once per
- * operation. std::clock() can cost around a microsecond — comparable to, or
- * larger than, one operation on this message — so a per-iteration reading lands
- * squarely inside the measurement. It corrupts cycles/op too, not just the
- * timing: the cycle counter brackets the whole loop, so every clock() call in
- * between is counted as part of the work. The block is grown until it spans
- * long enough that a single reading cannot matter. */
-constexpr double kBlockSeconds = 0.01; /* clock cost lands under ~0.01% of a block */
-
-template <class F>
-PerfResult measure_loop(F &&body, size_t bytes)
-{
-    unsigned long block = 1;
-    for (;; block *= 2)
-    {
-        double t0 = cpu_now();
-        for (unsigned long k = 0; k < block; ++k) body();
-        if (cpu_now() - t0 >= kBlockSeconds) break;
-    }
-
-    unsigned long it = 0;
-    double el;
-    uint64_t c0 = perf_cycles();
-    double t0 = cpu_now();
-    do {
-        for (unsigned long k = 0; k < block; ++k) body();
-        it += block;
-        el = cpu_now() - t0;
-    } while (el < 1.0);
-    uint64_t c1 = perf_cycles();
-    return PerfResult{it, (double)(c1 - c0) / (double)it, el / (double)it * 1e9,
-                      (double)bytes * (double)it / el / 1e6};
-}
-
 PerfResult measure_encode(uint8_t *buf, size_t buflen, size_t &msg_size)
 {
     volatile size_t sink = 0;
@@ -179,7 +124,7 @@ PerfResult measure_encode(uint8_t *buf, size_t buflen, size_t &msg_size)
     for (unsigned i = 0; i < 1000u; i++) msg = perf_encode(buf, buflen); /* warmup */
     msg_size = msg;
 
-    PerfResult r = measure_loop([&] { sink += perf_encode(buf, buflen); }, msg);
+    PerfResult r = sofab_bench::measureLoop([&] { sink += perf_encode(buf, buflen); }, msg);
     (void)sink;
     return r;
 }
@@ -189,7 +134,7 @@ PerfResult measure_decode(const uint8_t *buf, size_t len, PerfOut &out)
     volatile uint32_t sink = 0;
     for (unsigned i = 0; i < 1000u; i++) perf_decode(buf, len, out); /* warmup */
 
-    PerfResult r = measure_loop([&] { perf_decode(buf, len, out); sink += out.u32; }, len);
+    PerfResult r = sofab_bench::measureLoop([&] { perf_decode(buf, len, out); sink += out.u32; }, len);
     (void)sink;
     return r;
 }

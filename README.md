@@ -673,7 +673,7 @@ Always give `--parallel` an explicit job count. Bare `--parallel` defers to the
 native build tool's default, and with the Unix Makefiles generator that is
 `make -j` with *no* limit — one compiler per translation unit, all at once.
 
-Two suites run under CTest:
+Three suites run under CTest:
 
 - **`test_roundtrip`** — encode/decode/nested/chunked/skip checks plus the
   three-valued decode outcome (§7: COMPLETE / INCOMPLETE / INVALID), malformed-input
@@ -703,6 +703,15 @@ Two suites run under CTest:
   off that one parse; since the envelope is generated upstream and has grown a
   top-level key before, each walker demands its own key and the run fails loudly
   when it is absent, renamed or empty, instead of quietly testing nothing.
+- **`test_bench_tools`** — guards the benchmark tooling's single sources of
+  truth (see [Benchmarks](#benchmarks)): every workload `bench --list` publishes
+  runs and reports its size, an unknown name is rejected, neither
+  `run_callgrind.sh` nor `bench/CMakeLists.txt` keeps a second copy of the
+  workload list, and `bench.cpp`/`perf.cpp` take the stream adapters and the
+  timing harness from `bench_common.hpp` rather than redeclaring them. It also
+  drives `run_callgrind.sh` end to end against a stub `valgrind`, so it needs no
+  Valgrind and still proves a failing measurement aborts the table with the
+  captured diagnostic. Skipped when the build did not produce the `bench` binary.
 
 ### Coverage and API docs
 
@@ -739,10 +748,26 @@ hosts and against the other language ports:
 
 ```sh
 bash bench/run_callgrind.sh                       # Ir/op table (needs valgrind)
-cmake --build build --target run_bench_callgrind  # same runs via CMake, raw callgrind.*.out files
+cmake --build build --target run_bench_callgrind  # the same script, driven from CMake
 ```
 
 Those figures are the head-to-head data below.
+
+All three tools measure **one** list of workloads: the table in `bench/bench.cpp`,
+published by `bench --list` as `name<TAB>label` lines and read from there by
+`run_callgrind.sh` and the CMake target, so a workload cannot be renamed in one
+tool and go stale in another. The stream adapters and the timing rules
+(BENCH_SPEC's ~1 s CPU-time loop) likewise live once, in `bench/bench_common.hpp`,
+included by both `bench` and `perf`. `bench <workload>` runs a single operation
+and exits — the Callgrind single-shot mode; an unknown name is rejected, and a
+run that yields no figure aborts the table instead of printing a `-`:
+
+```sh
+build/bench/bench --list           # the workloads, one "name<TAB>label" per line
+build/bench/bench encode_typical   # one operation, then exit (Callgrind mode)
+```
+
+`ctest -R test_bench_tools` guards that sharing.
 
 ## Choosing between the two C++ corelibs
 
