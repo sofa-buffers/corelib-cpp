@@ -77,7 +77,7 @@ bytes_of() { grep -ohE 'BYTES=[0-9]+' "$OUT/$1.log" 2>/dev/null | head -1 | cut 
 echo ">> Measuring instructions/op under Callgrind (this is slow) ..." >&2
 echo
 echo "==============================================================================="
-echo " SofaBuffers C++ instruction cost   (Callgrind, Ir/op)"
+echo " SofaBuffers pure-C++20 instruction cost   (Callgrind, Ir/op)"
 echo " instructions/op: lower is better. Deterministic & machine-independent."
 echo "==============================================================================="
 printf "%-26s %16s %9s\n" "Workload" "instr/op" "bytes"

@@ -717,12 +717,16 @@ Five suites run under CTest:
   off that one parse; since the envelope is generated upstream and has grown a
   top-level key before, each walker demands its own key and the run fails loudly
   when it is absent, renamed or empty, instead of quietly testing nothing.
-- **`test_bench_tools`** — guards the benchmark tooling's single sources of
-  truth (see [Benchmarks](#benchmarks)): every workload `bench --list` publishes
-  runs and reports its size, an unknown name is rejected, neither
-  `run_callgrind.sh` nor `bench/CMakeLists.txt` keeps a second copy of the
-  workload list, and `bench.cpp`/`perf.cpp` take the stream adapters and the
-  timing harness from `bench_common.hpp` rather than redeclaring them. It also
+- **`test_bench_tools`** — guards the benchmark tooling against BENCH_SPEC and
+  against internal drift (see [Benchmarks](#benchmarks)): the published workloads
+  are BENCH_SPEC's, all of them and none outside its output grammar; both printed
+  tables match that grammar row for row; the cross-port parity sizes hold
+  (`blob 1MB` 1,000,005, `composite` 956, `perf` 170); every workload
+  `bench --list` publishes runs and reports its size; an unknown name is
+  rejected; neither `run_callgrind.sh` nor `bench/CMakeLists.txt` keeps a second
+  copy of the workload list; and `bench.cpp`/`perf.cpp` take the stream adapters
+  and the timing harness from `bench_common.hpp` rather than redeclaring them.
+  It also
   drives `run_callgrind.sh` end to end against a stub `valgrind`, so it needs no
   Valgrind and still proves a failing measurement aborts the table with the
   captured diagnostic. Skipped when the build did not produce the `bench` binary.
@@ -769,9 +773,12 @@ cmake --build build --target doc
 
 ## Benchmarks
 
-Two tools mirror the C / C++ / Rust / Go / Java / Python benchmarks on identical
-workloads (a 1000-element `u64` array and a typical mixed message), so results
-are directly comparable across languages:
+Three tools mirror the C / C++ / Rust / Go / Java / Python benchmarks on
+identical workloads, so results are directly comparable across languages. The
+workloads are BENCH_SPEC's four datasets — a 1000-element `u64` array, a
+`typical` mixed message, an unbounded **1 MB `blob`**, and a `composite` message
+that exercises what the flat three never reach (a wrapper array, multi-byte
+UTF-8, depth-3 nesting, a field the encoder must omit, a two-byte field header):
 
 ```sh
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
@@ -794,6 +801,31 @@ cmake --build build --target run_bench_callgrind  # the same script, driven from
 
 Those figures are the head-to-head data below.
 
+On this machine (GCC 15, `-O3`, x86-64) the throughput table reads:
+
+```
+encode: u64 array (1000)         4295.75      decode: u64 array (1000)     3529.74
+encode: typical message          2051.08      decode: typical message       377.27
+encode: blob 1MB one-shot       42063.92      decode: blob 1MB            16696.61
+encode: blob 1MB streaming        970.19      decode: composite             539.41
+encode: composite                 922.58      decode: composite skip-all   1705.72
+```
+
+Two of those rows are not a statement about this library. Five bytes of the
+`blob 1MB` message are metadata and a million are payload, so its MB/s is the
+host's `memcpy` and its memory bandwidth — **read the one-shot and streaming
+rows against each other, never either alone.** Their difference is what
+CORELIB_PLAN §5.1's divisible-run path costs, and it is stark: 42.1 GB/s in one
+contiguous write against 0.97 GB/s through a 4096-byte buffer with a flush sink,
+**43×**. The instruction counts below put the same gap at **13×** with bandwidth
+taken out of it — the encoder's `pushBytes` takes a `memcpy` when the run fits
+the buffer and falls back to a byte-at-a-time loop when it does not, and a
+megabyte through 4096-byte buffers is entirely the second case. Nothing else in
+the suite reaches that path: the other three datasets are schema-bounded and
+small enough that no flush happens mid-encode. `blob 1MB passthrough`,
+BENCH_SPEC's optional third row, is absent because this port implements no
+pass-through permission.
+
 All three tools measure **one** list of workloads: the table in `bench/bench.cpp`,
 published by `bench --list` as `name<TAB>label` lines and read from there by
 `run_callgrind.sh` and the CMake target, so a workload cannot be renamed in one
@@ -808,7 +840,12 @@ build/bench/bench --list           # the workloads, one "name<TAB>label" per lin
 build/bench/bench encode_typical   # one operation, then exit (Callgrind mode)
 ```
 
-`ctest -R test_bench_tools` guards that sharing.
+`ctest -R test_bench_tools` guards that sharing, and holds both printed tables
+against BENCH_SPEC's output grammar and its two cross-port parity sizes
+(`blob 1MB` = 1,000,005 bytes, `composite` = 956, as `perf`'s message is 170). It
+drives the real loops over a token time budget via `SOFAB_BENCH_SECONDS`, which
+exists for that check alone — nothing that publishes a number changes it, and
+the default is BENCH_SPEC's ~1 s per workload.
 
 ### Choosing between the two C++ corelibs
 
@@ -844,15 +881,48 @@ is better). All three are compiled at `-O3` so the comparison is like-for-like:
 | Workload | C | C++ wrapper | this (pure C++20) |
 |---|--:|--:|--:|
 | encode: u64 array (1000) | 124 992 | 125 021 | **35 046** (−72 %) |
-| encode: typical message  |     908 |   1 008 | **224** (−75 %) |
-| decode: u64 array (1000) | 289 941 | 289 942 | **43 830** (−85 %) |
-| decode: typical message  |   2 057 |   2 056 | **1 199** (−42 %) |
+| encode: typical message  |     908 |   1 008 | **226** (−75 %) |
+| decode: u64 array (1000) | 289 941 | 289 942 | **43 839** (−85 %) |
+| decode: typical message  |   2 057 |   2 056 | **1 275** (−38 %) |
 
 The four columns were measured together on one machine and the percentages are
 against the C column. The last column has since been re-measured on its own —
 only this library's code moved — and is the current reading; the two C columns
 are the joint run's. Reproduce with `bash bench/run_callgrind.sh` here and the
 same script in `corelib-c-cpp`.
+
+The two message rows read 224 and 1199 before the suite grew to BENCH_SPEC's
+full ten workloads, and the library did not change: GCC's inlining budget is
+per-translation-unit, so a bigger `bench.cpp` was enough to move them (to 330 and
+1355, in fact, before the entry points were marked `flatten`). `flatten` pins
+each Callgrind toggle point to its own call tree, which is what makes a figure
+comparable from one release to the next; the four rows above then measure
+identically whether the file holds four workloads or ten, at a couple of percent
+above the absolute minimum an unconstrained GCC finds for a small file. That
+trade is deliberate — a stable number is worth more here than a minimal one.
+
+The six BENCH_SPEC rows this table does not compare (no C figures exist for them
+yet) round the picture out:
+
+| Workload | Ir/op | bytes |
+|---|--:|--:|
+| encode: blob 1MB one-shot  |  1 000 026 | 1 000 005 |
+| encode: blob 1MB streaming | 13 009 127 | 1 000 005 |
+| encode: composite          |     11 514 |       956 |
+| decode: blob 1MB           |  3 654 639 | 1 000 005 |
+| decode: composite          |     22 417 |       956 |
+| decode: composite skip-all |      7 671 |       956 |
+
+The `blob 1MB` pair is the one to read together: **13× more instructions** to put
+the same megabyte through a 4096-byte buffer with a flush sink than to write it
+contiguously — 13 instructions per payload byte against one. That is the whole
+cost of CORELIB_PLAN §5.1's divisible-run path here, and it comes from
+`pushBytes` falling back to a byte-at-a-time `pushByte` loop the moment the run
+does not fit the buffer; the one-shot row takes the `memcpy` branch and pays a
+single instruction per byte. Nothing else in the suite reaches that fallback.
+`decode: composite skip-all` is the other pair-wise reading: walking the message
+and materialising nothing costs **7 671** against **22 417** to decode it, so
+about two-thirds of a decode is the destinations rather than the parse.
 
 The encode figures include the §2 sequence hold-back — the price of never
 framing an all-default sub-message, see
