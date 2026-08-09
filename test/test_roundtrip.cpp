@@ -2275,15 +2275,22 @@ static void bufferLimits()
         CHECK((*in).s == big, "limit: uncapped large field round-trips");
     }
 
-    /* The cap plumbs through IStreamInline too (not just IStreamObject). */
+    /* The cap plumbs through IStreamInline too (not just IStreamObject). The
+     * over-cap field is still offered to the callback — that is how a declared
+     * maxlen/count gets to rule INVALID ahead of the cap (#86) — but with its
+     * payload withheld: no read can consume it and no value is produced. */
     {
         std::vector<uint8_t> hdr = {0x2a};
         appendVarint(hdr, (static_cast<uint64_t>(1u << 20) << 3) | 2u);
-        bool delivered = false;
-        sofab::IStreamInline in([&](sofab::id, size_t, size_t) { delivered = true; }, sofab::Limits{cap});
+        std::string got;
+        bool consumed = false;
+        sofab::IStreamInline in(
+            [&](sofab::id, size_t, size_t) { in.read(got); consumed = in.consumed(); },
+            sofab::Limits{cap});
         auto r = in.feed(hdr.data(), hdr.size());
         CHECK(r.code() == sofab::Error::LimitExceeded, "limit: IStreamInline honours the cap");
-        CHECK(!delivered, "limit: IStreamInline delivers no field for the rejected header");
+        CHECK(!consumed && got.empty(),
+              "limit: IStreamInline materialises no value for the rejected header");
     }
 
     /* A field under the cap decodes COMPLETE even with a cap set — the limit only
@@ -2296,6 +2303,120 @@ static void bufferLimits()
         auto r = in.feed(os.data(), os.bytesUsed());
         CHECK(r.code() == sofab::Error::None, "limit: a field under the cap decodes COMPLETE");
         CHECK((*in).s == s, "limit: under-cap field round-trips with a cap set");
+    }
+}
+
+/* --- a schema bound outranks the reassembly cap (issue #86, CORELIB_PLAN
+ *     §6.2.1/§6.3). A receiver-side limit "MUST NOT be applied to a field the
+ *     schema already bounds", and LimitExceeded is "never raised for a field
+ *     the schema bounds — there an over-bound value is InvalidMessage". So a
+ *     declared length/count past its maxlen/count is INVALID no matter how the
+ *     receiver sized Limits::max_buffered_field: the same bytes must not decode
+ *     as a *policy* rejection just because the cap happens to be smaller. --- */
+
+struct BoundedMsg : sofab::IStreamMessage
+{
+    std::string s;                /* id 1: string, maxlen 4    */
+    std::vector<uint8_t> a;       /* id 2: array<u8>, count 4  */
+    std::string u;                /* id 3: string, unbounded   */
+    std::vector<uint8_t> v;       /* id 4: array<u8>, unbounded*/
+    void deserialize(sofab::IStreamImpl &is, sofab::id id, size_t, size_t) noexcept override
+    {
+        switch (id)
+        {
+            case 1: is.readString(s, 4); break;
+            case 2: is.readArray(a, 4);  break;
+            case 3: is.read(u);          break;
+            case 4: is.readArray(v);     break;
+        }
+    }
+};
+
+static void schemaBoundOutranksCap()
+{
+    const size_t cap = 8; /* deliberately smaller than the bounded field's span */
+
+    /* id 1 is `string, maxlen 4`; the wire declares 100 bytes. MESSAGE_SPEC §7.1
+     * makes that INVALID — uncapped it already is, and the cap must not change
+     * the verdict into a policy rejection. */
+    const std::vector<uint8_t> overMaxlen = {0x0a, 0xa2, 0x06}; /* id1 fixlen string, len 100 */
+    {
+        sofab::IStreamObject<BoundedMsg> in; /* uncapped: the reference verdict */
+        CHECK(in.feed(overMaxlen.data(), overMaxlen.size()).code() == sofab::Error::InvalidMessage,
+              "bound-vs-cap: an over-maxlen string is INVALID with no cap set");
+    }
+    {
+        sofab::IStreamObject<BoundedMsg> in(sofab::Limits{cap});
+        auto r = in.feed(overMaxlen.data(), overMaxlen.size());
+        CHECK(r.code() == sofab::Error::InvalidMessage,
+              "bound-vs-cap: an over-maxlen string stays INVALID under a smaller cap");
+        CHECK(r.invalid() && !r.limitExceeded(),
+              "bound-vs-cap: the schema bound's verdict is not masked as LimitExceeded");
+        CHECK((*in).s.empty(), "bound-vs-cap: the rejected string leaves its destination alone");
+    }
+
+    /* Chunk-independent: the same field dribbled a byte at a time reaches the
+     * same INVALID, from the buffered-continuation path. */
+    {
+        sofab::IStreamObject<BoundedMsg> in(sofab::Limits{cap});
+        sofab::Error last = sofab::Error::None;
+        for (size_t i = 0; i < overMaxlen.size(); ++i)
+        {
+            last = in.feed(overMaxlen.data() + i, 1).code();
+            if (last != sofab::Error::Incomplete) break;
+        }
+        CHECK(last == sofab::Error::InvalidMessage,
+              "bound-vs-cap: the dribbled over-maxlen string is INVALID too");
+    }
+
+    /* The same for a declared `count`: id 2 is `array<u8>, count 4` and the wire
+     * claims 100 elements — §7.1 INVALID, not a capacity rejection. */
+    {
+        const std::vector<uint8_t> overCount = {0x13, 0x64}; /* id2 array-unsigned, count 100 */
+        sofab::IStreamObject<BoundedMsg> in(sofab::Limits{cap});
+        auto r = in.feed(overCount.data(), overCount.size());
+        CHECK(r.code() == sofab::Error::InvalidMessage,
+              "bound-vs-cap: an over-count array stays INVALID under a smaller cap");
+        CHECK((*in).a.empty(), "bound-vs-cap: the rejected array leaves its destination alone");
+    }
+
+    /* The cap still governs where the schema does not: id 3 is unbounded, so the
+     * oversized claim is the receiver's capacity call — LimitExceeded, and never
+     * folded into INVALID (§6.2.1). */
+    {
+        const std::vector<uint8_t> overCap = {0x1a, 0xa2, 0x06}; /* id3 fixlen string, len 100 */
+        sofab::IStreamObject<BoundedMsg> in(sofab::Limits{cap});
+        auto r = in.feed(overCap.data(), overCap.size());
+        CHECK(r.code() == sofab::Error::LimitExceeded,
+              "bound-vs-cap: an unbounded over-cap string is still LimitExceeded");
+        CHECK(r.limitExceeded() && !r.invalid(),
+              "bound-vs-cap: the policy code stays distinct from INVALID");
+        CHECK((*in).u.empty(), "bound-vs-cap: no value is delivered for the capped field");
+    }
+
+    /* And it is still refused *before* anything is materialised: an unbounded
+     * array claiming a million elements whose payload never arrives allocates
+     * nothing, cap or no schema bound. */
+    {
+        std::vector<uint8_t> huge = {0x23}; /* id4, array-unsigned */
+        appendVarint(huge, 1000000);
+        sofab::IStreamObject<BoundedMsg> in(sofab::Limits{cap});
+        const unsigned long before = g_allocCount;
+        auto r = in.feed(huge.data(), huge.size());
+        CHECK(r.code() == sofab::Error::LimitExceeded,
+              "bound-vs-cap: an unbounded over-cap array is LimitExceeded");
+        CHECK(g_allocCount == before,
+              "bound-vs-cap: the rejected array count allocates nothing");
+        CHECK((*in).v.empty(), "bound-vs-cap: no elements are materialised for it");
+    }
+
+    /* A legal bounded field under the cap is untouched by any of this. */
+    {
+        const std::vector<uint8_t> ok = {0x0a, 0x22, 'a', 'b', 'c', 'd'}; /* id1, len 4 */
+        sofab::IStreamObject<BoundedMsg> in(sofab::Limits{cap});
+        auto r = in.feed(ok.data(), ok.size());
+        CHECK(r.code() == sofab::Error::None, "bound-vs-cap: a legal bounded field decodes COMPLETE");
+        CHECK((*in).s == "abcd", "bound-vs-cap: the legal bounded field round-trips");
     }
 }
 
@@ -4584,6 +4705,7 @@ int main()
     sequenceDepthBookkeeping();
     maxDepth();
     bufferLimits();
+    schemaBoundOutranksCap();
     strictUtf8();
     messageLayerFraming();
     wrapperArrayCollectors();

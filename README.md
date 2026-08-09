@@ -263,8 +263,22 @@ check is **chunk-independent**: the same field is rejected whether fed whole or
 byte by byte. This is a receiver-side **policy** code, kept distinct from
 `invalid()` / `Error::InvalidMessage` — exceeding a local limit is not wire
 malformation. The default is **no cap** (`SIZE_MAX`), so streams are unbounded
-unless you opt in; generated code derives the value from the schema's configured
-`max_dyn_*` limits. Bytes are never clamped or truncated — the `feed()` simply fails.
+unless you opt in. Bytes are never clamped or truncated — the `feed()` simply fails.
+
+**A schema bound outranks the cap.** Spec §6.2.1 forbids applying a receiver-side
+limit "to a field the schema already bounds", and §6.3 says `LimitExceeded` is
+"never raised for a field the schema bounds — there an over-bound value is
+`InvalidMessage`". So a declared length past a `maxlen`, or a count past a
+`count:`, is `Error::InvalidMessage` **whatever** the cap is set to: the same
+bytes cannot decode as a *validity* failure on one receiver and a *capacity*
+refusal on another merely because the second sized its buffer smaller. To make
+that work, an over-cap field is still delivered to its deliver callback — that is
+the only place the declared `maxlen`/`count` is known — but with its **payload
+withheld**: `readString`/`readArray`/… settle the wire type (§7.3) and the schema
+bound (§7.1) as usual and then report `Incomplete` instead of materialising
+anything, so a field the cap refuses copies no bytes, resizes no destination and
+allocates nothing. Only a field the schema leaves *unbounded* ends in
+`LimitExceeded`.
 
 #### Strict UTF-8 validation (`SOFAB_STRICT_UTF8`, default ON)
 
