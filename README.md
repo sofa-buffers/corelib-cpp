@@ -9,6 +9,7 @@
 
 ## SofaBuffers C++ library
 
+[![CI](https://github.com/sofa-buffers/corelib-cpp/actions/workflows/build-gcc-x86_64.yaml/badge.svg?branch=main)](https://github.com/sofa-buffers/corelib-cpp/actions/workflows/build-gcc-x86_64.yaml)
 [![Coverage](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/sofa-buffers/corelib-cpp/badges/coverage-cpp.json)](https://github.com/sofa-buffers/corelib-cpp/actions/workflows/coverage.yaml)
 [![Docs](https://img.shields.io/badge/docs-online-blue)](https://sofa-buffers.github.io/corelib-cpp/)
 
@@ -44,7 +45,9 @@ C backend.
 Non-native targets are built and run under [QEMU](https://www.qemu.org/)
 user-mode emulation in CI, reproducible locally without the real hardware. Both
 x86_64 legs build and run the full suite twice — in `Debug` **and** in `Release`
-(`-O3 -DNDEBUG`) — so a defect only the optimiser exposes cannot ship green.
+(`-O3 -DNDEBUG`) — so a defect only the optimiser exposes cannot ship green. The
+**CI** badge at the top of this section tracks the first row; the table is the
+whole matrix.
 
 | Target | Status |
 | - | - |
@@ -311,6 +314,15 @@ folds away entirely and payloads are stored **verbatim** — raw, never lossy. T
 option is a validation *policy*, never a wire-format switch, so peers with
 different settings interoperate on all valid data; conformance and the shared
 vectors run with it **ON**.
+
+`SOFAB_STRICT_UTF8` is also the **only** compile-time knob this library has: the
+header always compiles the full wire format, with no `#ifdef` gating of wire
+types and nothing else to configure. (The conformance harness recognises the
+family's `SOFAB_DISABLE_*` names only so it can skip the matching vectors when
+validating a feature-reduced profile; the defines do **not** change this
+library.) For a strictly minimal binary, use the C corelib
+[`corelib-c-cpp`](https://github.com/sofa-buffers/corelib-c-cpp), which does gate
+wire features.
 
 ### Code generator
 
@@ -648,21 +660,6 @@ These three types are deliberately identical, in name and behaviour, to
 `corelib-c-cpp`'s, so generated code for a bounded field is the same whichever C++
 corelib it targets.
 
-## Feature flags
-
-**Almost none.** This header-only C++20 port always compiles the full wire
-format — there is no `#ifdef` gating of wire types and nothing to configure. (The
-conformance harness recognises the family's `SOFAB_DISABLE_*` names only so it can
-skip the matching vectors when validating a feature-reduced profile; the defines
-do **not** change this library.) For a strictly minimal binary, use the C corelib
-[`corelib-c-cpp`](https://github.com/sofa-buffers/corelib-c-cpp).
-
-The one compile-time knob is **`SOFAB_STRICT_UTF8`** (default `1`): the strict
-UTF-8 validation policy documented under
-[Strict UTF-8 validation](#strict-utf-8-validation-sofab_strict_utf8-default-on).
-Define it to `0` for a non-strict build that stores `string` payloads verbatim
-(raw, never lossy). It gates a validation policy only, never the wire format.
-
 ## Build & test
 
 ```sh
@@ -680,7 +677,7 @@ Run it in both configurations — `-DCMAKE_BUILD_TYPE=Debug` and
 (strict aliasing, UB the optimiser acts on, an uninitialised field) is invisible
 to a Debug-only run.
 
-Four suites run under CTest:
+Five suites run under CTest:
 
 - **`test_roundtrip`** — encode/decode/nested/chunked/skip checks plus the
   three-valued decode outcome (§7: COMPLETE / INCOMPLETE / INVALID), malformed-input
@@ -728,6 +725,14 @@ Four suites run under CTest:
   strategy matrix sets `fail-fast: false`. `${{ matrix.build_type }}` is resolved
   against the workflow's own `build_type:` axis. Skipped in a source tree
   without `.github/workflows/`.
+- **`test_readme_structure`** — the other document-level check: CORELIB_PLAN §9
+  fixes this README's section list, their order and the badge block for the whole
+  corelib family, and nothing in the library can notice that shape drifting. It
+  reads `README.md` and requires the §9.1 header block, a §9.2 badge block
+  carrying CI, coverage and Docs in that order, exactly the §9 top-level sections
+  with no invented ones, no API-documentation section (§9.4), and the §9.8
+  two-corelib comparison as a subsection of
+  [Benchmarks](#benchmarks). Skipped in a tree without a README.
 
 ### Coverage and API docs
 
@@ -785,7 +790,7 @@ build/bench/bench encode_typical   # one operation, then exit (Callgrind mode)
 
 `ctest -R test_bench_tools` guards that sharing.
 
-## Choosing between the two C++ corelibs
+### Choosing between the two C++ corelibs
 
 SofaBuffers ships **two** C++ implementations of the same wire format, tuned for
 opposite ends of the spectrum:
@@ -810,7 +815,7 @@ porting between them is mostly mechanical.
 | Feature gating | Always full format (no `#ifdef`) | `SOFAB_DISABLE_*` compile out unused wire features |
 | Target | Desktop / server | Bare metal / embedded C and C++ |
 
-### Instruction counts (Callgrind)
+#### Instruction counts (Callgrind)
 
 Machine-independent instruction counts from the shared benchmark tooling, this
 library against the C corelib and its C++ wrapper on identical workloads (lower

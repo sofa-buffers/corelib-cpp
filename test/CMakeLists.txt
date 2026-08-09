@@ -37,6 +37,18 @@ add_test(NAME test_ci_workflows
             ${PROJECT_SOURCE_DIR}/.github/workflows)
 set_tests_properties(test_ci_workflows PROPERTIES SKIP_RETURN_CODE 77)
 
+# CORELIB_PLAN §9 fixes the README's section list, their order, and the §9.2
+# badge block for the whole corelib family — the shared shape is what makes one
+# port's README navigable to a reader who knows another. That is a property of
+# the document, so no C++ test can notice it drifting: this check reads
+# README.md and fails on an invented or reordered top-level section, a missing
+# CI/coverage/Docs badge, or the §9.8 two-corelib comparison escaping from
+# under `## Benchmarks`.
+add_test(NAME test_readme_structure
+    COMMAND bash ${CMAKE_CURRENT_LIST_DIR}/test_readme_structure.sh
+            ${PROJECT_SOURCE_DIR}/README.md)
+set_tests_properties(test_readme_structure PROPERTIES SKIP_RETURN_CODE 77)
+
 if(SOFAB_ENABLE_COVERAGE)
     target_link_libraries(test_roundtrip PRIVATE sofab_coverage)
     target_link_libraries(test_vectors PRIVATE sofab_coverage)
