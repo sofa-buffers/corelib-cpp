@@ -868,7 +868,7 @@ porting between them is mostly mechanical.
 |---|---|---|
 | Primary goal | Maximum throughput | Minimum footprint |
 | Implementation | Pure C++20, header-only | C core + C++ wrapper header |
-| Decode model | In place over caller buffer, views into it | Deferred-copy into address-stable destinations |
+| Decode model | In place over the caller's buffer, each value copied out before `feed()` returns | Deferred-copy into address-stable destinations |
 | Feature gating | Always full format (no `#ifdef`) | `SOFAB_DISABLE_*` compile out unused wire features |
 | Target | Desktop / server | Bare metal / embedded C and C++ |
 
@@ -876,53 +876,59 @@ porting between them is mostly mechanical.
 
 Machine-independent instruction counts from the shared benchmark tooling, this
 library against the C corelib and its C++ wrapper on identical workloads (lower
-is better). All three are compiled at `-O3` so the comparison is like-for-like:
+is better, **bold** is the row's winner). All three are compiled at `-O3` so the
+comparison is like-for-like, and BENCH_SPEC's full ten rows are now measured on
+both sides:
 
 | Workload | C | C++ wrapper | this (pure C++20) |
 |---|--:|--:|--:|
-| encode: u64 array (1000) | 124 992 | 125 021 | **35 046** (−72 %) |
-| encode: typical message  |     908 |   1 008 | **226** (−75 %) |
-| decode: u64 array (1000) | 289 941 | 289 942 | **43 839** (−85 %) |
-| decode: typical message  |   2 057 |   2 056 | **1 275** (−38 %) |
+| encode: u64 array (1000)   |    125 999 |    126 028 | **35 046** (−72 %) |
+| encode: typical message    |        966 |      1 063 | **226** (−77 %) |
+| encode: blob 1MB one-shot  | 10 000 162 | 10 000 191 | **1 000 026** (−90 %) |
+| encode: blob 1MB streaming | **10 004 819** | 10 009 790 | 13 009 127 (+30 %) |
+| encode: composite          |     16 164 |     16 501 | **11 514** (−29 %) |
+| decode: u64 array (1000)   |    300 432 |    300 433 | **43 839** (−85 %) |
+| decode: typical message    |      2 109 |      2 108 | **1 275** (−40 %) |
+| decode: blob 1MB           | 25 011 323 | 25 011 327 | **3 654 639** (−85 %) |
+| decode: composite          |     32 168 |     36 533 | **22 417** (−30 %) |
+| decode: composite skip-all |     25 411 |     25 411 | **7 671** (−70 %) |
 
-The four columns were measured together on one machine and the percentages are
-against the C column. The last column has since been re-measured on its own —
-only this library's code moved — and is the current reading; the two C columns
-are the joint run's. Reproduce with `bash bench/run_callgrind.sh` here and the
-same script in `corelib-c-cpp`.
+Percentages are against the C column. The last column is this tree, reproduced
+with `bash bench/run_callgrind.sh`; the two C columns are the current reading
+[published by `corelib-c-cpp`](https://github.com/sofa-buffers/corelib-c-cpp#what-the-speed-difference-actually-is),
+taken on its own machine with the same script. Ir/op is what makes mixing the
+two runs legitimate — it depends on the executed code and not on the host clock
+or scheduler — which is also why it is the figure both ports quote.
+
+Two pairs of rows are worth reading against each other rather than alone. The
+`blob 1MB` pair costs this library **13× more instructions** to put the same
+megabyte through a 4096-byte buffer with a flush sink than to write it
+contiguously — 13 instructions per payload byte against one. That is the whole
+price of CORELIB_PLAN §5.1's divisible-run path here, and it comes from
+`pushBytes` falling back to a byte-at-a-time `pushByte` loop the moment the run
+does not fit the buffer; the one-shot row takes the `memcpy` branch. Nothing else
+in the suite reaches that fallback. `decode: composite skip-all` is the other:
+walking the message and materialising nothing costs **7 671** against **22 417**
+to decode it, so about two-thirds of a decode is the destinations, not the parse.
+
+**`encode: blob 1MB streaming` is the one row this library loses**, and the two
+readings are the same fact from opposite sides. The C core has no fast path to
+fall out of — it pushes every payload byte through one bounds-checked path, so
+streaming costs it what the one-shot write cost (+0.05 %) — while this library
+pays 13× its own one-shot figure the moment the run stops fitting. Optimising for
+the buffer that holds the whole message does not pay when the buffer deliberately
+cannot, and the gap is not small: **1.3× more instructions** than the C core.
+Closing it means a bounded `memcpy` per flush window instead of the byte loop.
 
 The two message rows read 224 and 1199 before the suite grew to BENCH_SPEC's
 full ten workloads, and the library did not change: GCC's inlining budget is
 per-translation-unit, so a bigger `bench.cpp` was enough to move them (to 330 and
 1355, in fact, before the entry points were marked `flatten`). `flatten` pins
 each Callgrind toggle point to its own call tree, which is what makes a figure
-comparable from one release to the next; the four rows above then measure
-identically whether the file holds four workloads or ten, at a couple of percent
-above the absolute minimum an unconstrained GCC finds for a small file. That
-trade is deliberate — a stable number is worth more here than a minimal one.
-
-The six BENCH_SPEC rows this table does not compare (no C figures exist for them
-yet) round the picture out:
-
-| Workload | Ir/op | bytes |
-|---|--:|--:|
-| encode: blob 1MB one-shot  |  1 000 026 | 1 000 005 |
-| encode: blob 1MB streaming | 13 009 127 | 1 000 005 |
-| encode: composite          |     11 514 |       956 |
-| decode: blob 1MB           |  3 654 639 | 1 000 005 |
-| decode: composite          |     22 417 |       956 |
-| decode: composite skip-all |      7 671 |       956 |
-
-The `blob 1MB` pair is the one to read together: **13× more instructions** to put
-the same megabyte through a 4096-byte buffer with a flush sink than to write it
-contiguously — 13 instructions per payload byte against one. That is the whole
-cost of CORELIB_PLAN §5.1's divisible-run path here, and it comes from
-`pushBytes` falling back to a byte-at-a-time `pushByte` loop the moment the run
-does not fit the buffer; the one-shot row takes the `memcpy` branch and pays a
-single instruction per byte. Nothing else in the suite reaches that fallback.
-`decode: composite skip-all` is the other pair-wise reading: walking the message
-and materialising nothing costs **7 671** against **22 417** to decode it, so
-about two-thirds of a decode is the destinations rather than the parse.
+comparable from one release to the next; the rows above then measure identically
+whether the file holds four workloads or ten, at a couple of percent above the
+absolute minimum an unconstrained GCC finds for a small file. That trade is
+deliberate — a stable number is worth more here than a minimal one.
 
 The encode figures include the §2 sequence hold-back — the price of never
 framing an all-default sub-message, see
@@ -931,9 +937,15 @@ That cost was **+68 Ir/op (+24 %)** on `encode: typical message` when it landed;
 the absolutes it was measured against (285 → 353) predate the varint fast paths
 below, so they no longer match the table.
 
-The pure-C++20 port wins on instructions across the board because it fuses
-header+value writes, composes fields straight into the buffer, and parses in
-place without the C port's per-field bookkeeping. The array workloads pull
+On the nine rows it wins, the pure-C++20 port is **1.4× to 10× cheaper** in
+instructions because it fuses header+value writes, composes fields straight into
+the buffer, and parses in place without the C port's per-field bookkeeping. The
+narrowest margins are the `composite` rows (−29 % / −30 %), where the message is
+mostly small varlen fields and per-field work dominates; the widest are the bulk
+ones. What the C core buys with those instructions is its own contract —
+deferred-copy into caller-owned, address-stable storage with no heap and a fixed
+footprint — so most of the gap is a deliberate trade, not a defect on either
+side. The array workloads pull
 furthest ahead because their varint runs establish the ten-byte window once and
 then move whole 64-bit words — eight varint bytes per store on encode, one load
 plus a terminator scan on decode — instead of testing bounds and continuation a
