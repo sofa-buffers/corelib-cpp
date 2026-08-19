@@ -1,9 +1,10 @@
 name: Doxygen
 
+# Docs build on main only, as in every other corelib repo: a pull request that
+# breaks the Doxygen build is caught by the main run right after the merge, and
+# the PR run could never publish anything anyway.
 on:
   push:
-    branches: [ main ]
-  pull_request:
     branches: [ main ]
 
 permissions:
@@ -28,7 +29,7 @@ jobs:
       - name: Install Doxygen
         run: |
           sudo apt-get update
-          sudo apt-get install -y \
+          sudo apt-get install -y --no-install-recommends \
             cmake doxygen graphviz
 
       - name: Configure with CMake
@@ -44,8 +45,8 @@ jobs:
         with:
           path: build/docs/html
 
-  # Publish only on pushes to main; pull requests just build the docs above to
-  # verify they compile, without overwriting the live site.
+  # Publish only on pushes to main; the guard is kept so the job stays correct
+  # if the workflow ever gains another trigger.
   deploy:
     needs: build
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
