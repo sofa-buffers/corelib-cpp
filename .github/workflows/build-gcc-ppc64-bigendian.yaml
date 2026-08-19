@@ -11,6 +11,12 @@ on:
   pull_request:
     branches: [ main ]
 
+# A superseded push must release its runner slots instead of queueing behind
+# itself; on main we never cancel, so a push there keeps its full run.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -22,7 +28,7 @@ jobs:
       - name: Install cross toolchain and qemu
         run: |
           sudo apt-get update
-          sudo apt-get install -y \
+          sudo apt-get install -y --no-install-recommends \
             cmake g++-powerpc64-linux-gnu gcc-powerpc64-linux-gnu qemu-user-static
 
       - name: Configure with CMake (cross, static)

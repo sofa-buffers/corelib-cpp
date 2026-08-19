@@ -2,13 +2,18 @@ name: Version consistency
 
 # The git tag is the source of truth for the version: every package manifest
 # and the CMake project() version must match it. Each config is checked in its
-# own step. On branch/PR runs the latest tag is used as the reference.
+# own step. The comparison is only meaningful once a tag exists, so this runs
+# on tag pushes only -- on a branch or PR it compared the manifests against
+# whatever the newest tag happened to be, which says nothing about the commit.
 on:
   push:
-    branches: [ main ]
     tags: [ 'v*' ]
-  pull_request:
-    branches: [ main ]
+
+# A superseded push must release its runner slots instead of queueing behind
+# itself; on main we never cancel, so a push there keeps its full run.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 jobs:
   check:
@@ -25,8 +30,8 @@ jobs:
           if [[ "${GITHUB_REF_TYPE:-}" == "tag" ]]; then
             ref_version=${GITHUB_REF_NAME#v}
           else
-            # Latest tag on branch/PR runs; empty if the repo has no tags yet,
-            # in which case the version comparison is skipped (name/license only).
+            # Not reachable through the tag trigger above; kept so a manual or
+            # future non-tag run degrades to the newest tag instead of failing.
             ref_version=$(git describe --tags --abbrev=0 2>/dev/null | sed 's/^v//' || true)
             [[ -n "$ref_version" ]] || echo "::notice::no git tag found; skipping version comparison"
           fi
