@@ -60,13 +60,19 @@ static int g_checks = 0;
  * lets holdBackAllocationFailure() both COUNT allocations (proving the shallow
  * path makes none) and fail one on demand (proving a failed spill is reported
  * as an error instead of terminating the process). Under -fno-exceptions the
- * arming flag is never set and this stays a plain counting allocator. */
+ * arming flag is never set and this stays a plain counting allocator.
+ *
+ * The byte total beside the count is what messageSeqStorageProfiles() needs: a
+ * decoder talked into sizing a row from an announced count allocates ONCE, so
+ * the count alone cannot tell a 3-element row from a 2^31-element one. */
 static unsigned long g_allocCount = 0;
+static unsigned long g_allocBytes = 0;
 static bool g_failNextAlloc = false;
 
 void *operator new(size_t n)
 {
     ++g_allocCount;
+    g_allocBytes += n;
 #if defined(__cpp_exceptions) && __cpp_exceptions
     if (g_failNextAlloc) { g_failNextAlloc = false; throw std::bad_alloc(); }
 #endif
@@ -2873,6 +2879,62 @@ struct CappedMsg : sofab::IStreamMessage
     }
 };
 
+/* --- MessageSeq is templated on the CONTAINER ------------------------------
+ *
+ * The same wrapper array, collected into both storage profiles: a growable
+ * `std::vector` and a heap-free `InlineVector`. The collector call is spelled
+ * identically for the two, exactly as StringSeq / BlobSeq already are, and the
+ * ELEMENT spelling `MessageSeq<SeqRow>` that CappedMsg above still uses keeps
+ * meaning `std::vector<SeqRow>`. --- */
+
+static_assert(std::is_same_v<sofab::MessageSeq<SeqRow>::Container, std::vector<SeqRow>>,
+              "the element spelling still names a std::vector destination");
+static_assert(std::is_same_v<sofab::MessageSeq<std::vector<uint32_t>>::Container,
+                             std::vector<std::vector<uint32_t>>>,
+              "a native-scalar ROW is an element, not a destination");
+static_assert(std::is_same_v<sofab::MessageSeq<std::vector<SeqRow>>::Container,
+                             std::vector<SeqRow>>,
+              "a container of messages is the destination");
+static_assert(std::is_same_v<sofab::MessageSeq<sofab::InlineVector<SeqRow, 3>>::Container,
+                             sofab::InlineVector<SeqRow, 3>>,
+              "a heap-free container of messages is the destination");
+static_assert(std::is_same_v<
+                  sofab::MessageSeq<sofab::InlineVector<sofab::InlineVector<uint32_t, 2>, 3>>::Container,
+                  sofab::InlineVector<sofab::InlineVector<uint32_t, 2>, 3>>,
+              "a heap-free container of rows is the destination");
+
+/* Growable storage, addressed by the container spelling; `count: 3` on id 1. */
+struct DynRowsMsg : sofab::IStreamMessage
+{
+    std::vector<SeqRow> rows;                       /* id 1 -- count 3 */
+    std::vector<std::vector<uint32_t>> matrix;      /* id 4 -- unbounded rows */
+    void deserialize(sofab::IStreamImpl &is, sofab::id id, size_t, size_t) noexcept override
+    {
+        switch (id)
+        {
+            case 1: { sofab::MessageSeq<std::vector<SeqRow>> c; c.out = &rows; c.cap = 3; is.read(c); break; }
+            case 4: { sofab::MessageSeq<std::vector<std::vector<uint32_t>>> c; c.out = &matrix; is.read(c); break; }
+        }
+    }
+};
+
+/* The heap-free twin: the same schema in fixed storage. No `cap` is set on
+ * purpose -- the container's own capacity is what bounds the element id. */
+struct FixedRowsMsg : sofab::IStreamMessage
+{
+    sofab::InlineVector<SeqRow, 3> rows;                              /* id 1 -- count 3 */
+    sofab::InlineVector<sofab::InlineVector<uint32_t, 2>, 3> matrix;  /* id 4 -- count 3, row count 2 */
+    void deserialize(sofab::IStreamImpl &is, sofab::id id, size_t, size_t) noexcept override
+    {
+        switch (id)
+        {
+            case 1: { sofab::MessageSeq<sofab::InlineVector<SeqRow, 3>> c; c.out = &rows; is.read(c); break; }
+            case 4: { sofab::MessageSeq<sofab::InlineVector<sofab::InlineVector<uint32_t, 2>, 3>> c;
+                      c.out = &matrix; is.read(c); break; }
+        }
+    }
+};
+
 static void messageLayerFraming()
 {
     const SeqRow dflt{};
@@ -3223,6 +3285,128 @@ struct F41GenMsg : sofab::IStreamMessage
         if (id == 202) { F41GenSeq c; c.out = &rows; c.cap = 5; is.read(c); }
     }
 };
+
+/* --- MessageSeq: one collector, both storage profiles ----------------------
+ *
+ * Templating it on the container is what lets a heap-free destination use it,
+ * and none of what that decides is visible on the wire: two implementations can
+ * disagree about a gap-filled row, about how much an announced count may
+ * allocate, or about an index sitting exactly at the capacity, and still emit
+ * byte-identical output. The shared vectors cannot reach any of that, so these
+ * checks are the only ones that can. --- */
+static void messageSeqStorageProfiles()
+{
+    /* elements at id 0 and id 2, id 1 absent -- the auditor's M3 wire, at field
+     * id 1, which both destinations below decode. */
+    const auto gapWire = fromHex("0e060005071600090707");
+
+    {
+        /* the container spelling on growable storage: placement as before. */
+        sofab::IStreamObject<DynRowsMsg> in;
+        auto r = in.feed(gapWire.data(), gapWire.size());
+        CHECK(r.complete(), "MessageSeq<std::vector<T>>: the id-gap wire decodes COMPLETE");
+        CHECK((*in).rows.size() == 3, "MessageSeq<std::vector<T>>: the id gap is filled, length 3");
+        if ((*in).rows.size() == 3)
+            CHECK((*in).rows[0].a == 5 && (*in).rows[1].a == 0 && (*in).rows[2].a == 9,
+                  "MessageSeq<std::vector<T>>: every element lands at its id: [5, 0, 9]");
+    }
+    {
+        /* ...and on the heap-free destination, which is what the re-template
+         * adds. Its decode allocates nothing: the elements live in the message. */
+        const unsigned long allocBefore = g_allocCount;
+        sofab::IStreamObject<FixedRowsMsg> in;
+        auto r = in.feed(gapWire.data(), gapWire.size());
+        CHECK(r.complete(), "MessageSeq<InlineVector<T,N>>: the id-gap wire decodes COMPLETE");
+        CHECK((*in).rows.size() == 3, "MessageSeq<InlineVector<T,N>>: the id gap is filled, length 3");
+        if ((*in).rows.size() == 3)
+            CHECK((*in).rows[0].a == 5 && (*in).rows[1].a == 0 && (*in).rows[2].a == 9,
+                  "MessageSeq<InlineVector<T,N>>: every element lands at its id: [5, 0, 9]");
+        CHECK(g_allocCount == allocBefore,
+              "MessageSeq: collecting into heap-free storage allocates nothing");
+    }
+    {
+        /* §5.1/§7.4: a repeated element id continues the element already placed
+         * at that index -- it does not append a second one. */
+        sofab::IStreamObject<DynRowsMsg> in;
+        auto w = fromHex("0e0600050706000907" "07");
+        CHECK(in.feed(w.data(), w.size()).complete(), "a repeated element id decodes COMPLETE");
+        CHECK((*in).rows.size() == 1, "a repeated element id replaces, it does not append");
+        if ((*in).rows.size() == 1)
+            CHECK((*in).rows[0].a == 9, "the later occurrence of an element id wins");
+    }
+
+    /* --- capacity edges. The heap-free destination declares no `cap`, so its
+     *     own capacity is the bound: without one, emplace_back would stop
+     *     advancing at N and the gap fill would never reach the id. --- */
+    {
+        sofab::MessageSeq<sofab::InlineVector<SeqRow, 3>> fixed;
+        sofab::MessageSeq<std::vector<SeqRow>> growable;
+        CHECK(fixed.cap == 3, "a heap-free destination bounds the element id by its capacity");
+        CHECK(growable.cap == -1, "a growable destination stays unbounded unless a count says otherwise");
+    }
+    {
+        /* id == cap - 1 is the last legal index, and it grows the array to N. */
+        sofab::IStreamObject<FixedRowsMsg> in;
+        auto w = fromHex("0e" "1600090707");
+        CHECK(in.feed(w.data(), w.size()).complete(), "an element at id N-1 decodes COMPLETE");
+        CHECK((*in).rows.size() == 3, "an element at id N-1 grows the array to exactly N");
+        if ((*in).rows.size() == 3)
+            CHECK((*in).rows[2].a == 9, "the element at id N-1 lands at index N-1");
+    }
+    {
+        /* id == cap is one past it: INVALID (§5.1/§7), decided from the id alone,
+         * with nothing placed and nothing grown. */
+        sofab::IStreamObject<FixedRowsMsg> in;
+        auto w = fromHex("0e" "1e00090707");
+        CHECK(in.feed(w.data(), w.size()).invalid(), "an element at id N is INVALID");
+        CHECK((*in).rows.empty(), "the rejected element grows nothing");
+    }
+    {
+        /* the same reject on growable storage, where `cap` is the schema
+         * `count: 3` rather than the container. */
+        sofab::IStreamObject<DynRowsMsg> in;
+        auto w = fromHex("0e" "1e00090707");
+        /* Counted from HERE, not from the top of the block: constructing the
+         * decoder and the wire vector allocates, and folding that in would make
+         * the check pass or fail on setup rather than on the rejected element. */
+        const unsigned long allocBefore = g_allocCount;
+        CHECK(in.feed(w.data(), w.size()).invalid(), "count: 3 rejects an element at id 3");
+        CHECK((*in).rows.empty() && g_allocCount == allocBefore,
+              "the rejected element is never allocated for");
+    }
+
+    /* --- native-scalar rows, whose length is an announced count: unauthenticated
+     *     input until the ceilings have run. --- */
+    {
+        sofab::IStreamObject<FixedRowsMsg> in;
+        auto w = fromHex("26" "03" "02" "0102" "07");   /* field 4, row 0 = [1, 2] */
+        CHECK(in.feed(w.data(), w.size()).complete(), "a heap-free row at its capacity decodes COMPLETE");
+        CHECK((*in).matrix.size() == 1 && (*in).matrix[0].size() == 2 &&
+                  (*in).matrix[0][0] == 1 && (*in).matrix[0][1] == 2,
+              "a heap-free row keeps the wire elements");
+    }
+    {
+        /* §3: a row count past what the row can hold is refused, never truncated
+         * into it -- and INVALID rather than LimitExceeded, because a heap-free
+         * row's capacity IS the schema `count` it was generated for. */
+        sofab::IStreamObject<FixedRowsMsg> in;
+        auto w = fromHex("26" "03" "03" "010203" "07");
+        CHECK(in.feed(w.data(), w.size()).invalid(),
+              "a row count past the row's capacity is INVALID, not a silent truncation");
+    }
+    {
+        /* adversarial: an announced row count near 2^31 with three payload bytes.
+         * The count must not become an allocation -- the row grows only as far as
+         * the bytes in hand could ever fill. */
+        const unsigned long bytesBefore = g_allocBytes;
+        sofab::IStreamObject<DynRowsMsg> in;
+        auto w = fromHex("26" "03" "8080808008" "010203" "07");
+        auto r = in.feed(w.data(), w.size());
+        CHECK(!r.complete(), "a row whose announced count outruns its payload is not COMPLETE");
+        CHECK(g_allocBytes - bytesBefore < 4096,
+              "an announced row count near 2^31 allocates for the bytes in hand, not for the count");
+    }
+}
 
 static void overIndexSkipOrdering()
 {
@@ -5882,6 +6066,8 @@ static void decoderReuseAcrossTypes()
     checkStreamReuse<RowsAtOneMsg>("RowsAtOneMsg");
     checkStreamReuse<BoundedSeqMsg>("BoundedSeqMsg");
     checkStreamReuse<CappedMsg>("CappedMsg");
+    checkStreamReuse<DynRowsMsg>("DynRowsMsg");
+    checkStreamReuse<FixedRowsMsg>("FixedRowsMsg");
     checkStreamReuse<F41Msg>("F41Msg");
     checkStreamReuse<F41GenMsg>("F41GenMsg");
     checkStreamReuse<F56Msg>("F56Msg");
@@ -5923,6 +6109,7 @@ int main()
     strictUtf8();
     messageLayerFraming();
     wrapperArrayCollectors();
+    messageSeqStorageProfiles();
     overIndexSkipOrdering();
     skippedSubtreeSuspendsBound();
     truncatedNestedFieldIsNotDeclined();

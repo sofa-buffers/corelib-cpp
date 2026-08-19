@@ -618,17 +618,23 @@ alongside the growable ones:
 | `array`, `count N` | `std::vector<T>` | `sofab::InlineVector<T, N>` |
 
 ```cpp
-sofab::FixedString<24>                       name;    // maxlen 24
+sofab::FixedString<24>                        name;   // maxlen 24
 sofab::InlineVector<sofab::FixedString<8>, 4> tags;   // count 4, maxlen 8
+sofab::InlineVector<Reading, 4>               rows;   // count 4, struct elements
 
 case 1: is.readString(name, 24); break;               // same call either way
 case 2: { sofab::StringSeq c{tags, 4, 8}; is.read(c); } break;
+case 3: { sofab::MessageSeq<decltype(rows)> c; c.out = &rows; is.read(c); } break;
 ```
 
 The call sites are spelled identically for both storage kinds — `readString`,
 `readBlob` and `readArray` pick the branch off the destination's own capabilities,
-and the collectors deduce their container — so switching a field's storage is a
-change of member type and nothing else. The wire is unaffected in both directions.
+and every collector — `StringSeq`, `BlobSeq` and `MessageSeq` alike — is templated
+on the *container*, so switching a field's storage is a change of member type and
+nothing else. The wire is unaffected in both directions. A `MessageSeq` given a
+heap-free destination takes that container's capacity as its element bound unless
+a schema `count` sets `cap` explicitly, since a full inline container cannot grow
+to reach a higher index.
 
 Semantics are unchanged too: a payload past the declared bound is `INVALID`
 (§7.1) rather than truncated, and one past the container's own capacity is

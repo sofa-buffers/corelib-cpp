@@ -4666,25 +4666,80 @@ namespace sofab
         }
     };
 
+    namespace detail
+    {
+        /**
+         * @brief Whether a @ref MessageSeq template argument names the destination
+         *        **container** rather than the element type.
+         *
+         * @ref MessageSeq is templated on the container, exactly as @ref StringSeq
+         * is, which is what lets it collect into an @ref InlineVector as well as a
+         * @c std::vector. It used to be templated on the ELEMENT, with
+         * `std::vector<T>` hard-wired as the destination, and that spelling keeps
+         * working: the two readings are told apart here, from the argument alone.
+         *
+         * An argument names a container when its `value_type` is something this
+         * collector reads as an element — a message, or a row container. The two
+         * readings can only collide for an argument whose `value_type` is itself
+         * one of those two, i.e. an element that is a sequence of messages or a row
+         * of rows; under the element reading such an element is handed to
+         * @ref IStreamImpl::read, which has no overload for it, so what the
+         * container reading takes over is code that never compiled.
+         */
+        template <typename A>
+        constexpr bool namesSeqContainer() noexcept
+        {
+            if constexpr (requires { typename A::value_type; })
+            {
+                using V = typename A::value_type;
+                return std::is_base_of_v<IStreamMessage, V> || requires { typename V::value_type; };
+            }
+            else
+            {
+                return false;
+            }
+        }
+    } // namespace detail
+
     /**
-     * @brief Collects a struct/union or nested-array wrapper sequence into a
-     *        `std::vector<T>`.
+     * @brief Collects a struct/union or nested-array wrapper sequence into the
+     *        container it is handed.
      *
-     * One element is emplaced and read per child: @ref IStreamImpl::read descends
-     * into a struct/union element's own sub-sequence, or reads a nested array row,
-     * exactly as it would for a scalar field.
+     * One element is placed and read per child: @ref IStreamImpl::read descends
+     * into a struct/union element's own sub-sequence, and a native-scalar row goes
+     * through @ref IStreamImpl::readArray — exactly as a top-level field of that
+     * type would be read.
      *
      * The target is held by pointer rather than a bound reference so one instance
      * can serve several fields.
      *
-     * @tparam T Element type — an @ref IStreamMessage, or a container for a
-     *           nested-array row.
+     * @tparam A Destination **container**, as @ref StringSeq takes it:
+     *           `std::vector<T>` for the growable storage mode,
+     *           `InlineVector<T, N>` for the heap-free one; its `value_type` is the
+     *           element type. The older ELEMENT spelling `MessageSeq<T>`, which
+     *           always collected into a `std::vector<T>`, still compiles — see
+     *           @ref detail::namesSeqContainer for how the two are told apart.
      */
-    template <typename T>
+    template <typename A>
     struct MessageSeq : IStreamMessage
     {
-        std::vector<T> *out = nullptr;
-        long cap = -1;   /**< Schema `count` N, or -1; an id at or past N is INVALID (§5.1/§7). */
+        /** Destination container: @p A itself, or `std::vector<A>` for the element spelling. */
+        using Container = std::conditional_t<detail::namesSeqContainer<A>(), A, std::vector<A>>;
+        /** Element type — an @ref IStreamMessage, or a container for a nested-array row. */
+        using Elem = typename Container::value_type;
+
+        Container *out = nullptr;  /**< Destination; a null one collects nothing. */
+
+        /**
+         * @brief Schema `count` N, or -1; an id at or past N is INVALID (§5.1/§7).
+         *
+         * Defaults to the destination's own capacity when it publishes one
+         * (@ref detail::destCapacity), so a heap-free container arrives bounded
+         * even when the caller declares nothing — its `emplace_back` reuses the
+         * last slot once full, which is a length the gap fill below would never
+         * reach. `-1`, i.e. unbounded, for a growable container, as before.
+         */
+        long cap = detail::destCapacity<Container>();
 
         /**
          * @brief The declared element type, published to the stream (§7.3), as
@@ -4696,15 +4751,15 @@ namespace sofab
          * neither rule covers, which leaves the bound to the check below.
          */
         static constexpr int elemWire = []() constexpr -> int {
-            if constexpr (std::is_base_of_v<IStreamMessage, T>)
+            if constexpr (std::is_base_of_v<IStreamMessage, Elem>)
                 return static_cast<int>(detail::Wire::SequenceStart);
-            else if constexpr (requires { typename T::value_type; })
+            else if constexpr (requires { typename Elem::value_type; })
             {
-                using Elem = typename T::value_type;
-                if constexpr (std::is_integral_v<Elem> && !std::is_same_v<Elem, bool>)
-                    return static_cast<int>(std::is_unsigned_v<Elem> ? detail::Wire::ArrayUnsigned
-                                                                     : detail::Wire::ArraySigned);
-                else if constexpr (std::is_same_v<Elem, float> || std::is_same_v<Elem, double>)
+                using RowElem = typename Elem::value_type;
+                if constexpr (std::is_integral_v<RowElem> && !std::is_same_v<RowElem, bool>)
+                    return static_cast<int>(std::is_unsigned_v<RowElem> ? detail::Wire::ArrayUnsigned
+                                                                       : detail::Wire::ArraySigned);
+                else if constexpr (std::is_same_v<RowElem, float> || std::is_same_v<RowElem, double>)
                     return static_cast<int>(detail::Wire::ArrayFixlen);
                 else
                     return -1;
@@ -4716,23 +4771,33 @@ namespace sofab
         /** §7.4 replace-whole, and absent ⇒ never called: @copydoc StringSeq::prepare */
         void prepare() noexcept { if (out) out->clear(); }
 
-        void deserialize(IStreamImpl &is, sofab::id id, size_t, size_t count) noexcept override
+        void deserialize(IStreamImpl &is, sofab::id id, size_t, size_t) noexcept override
         {
-            /* §5.1/§7 over-index reject, as a backstop for a direct call. Coming
-             * through @ref IStreamImpl::read this is unreachable: `cap` is handed
-             * to the stream as its element bound and rejected one step earlier,
-             * before a truncated element could outrun it -- which is why
-             * @ref StringSeq / @ref BlobSeq carry no copy of it. Kept here because
-             * `deserialize` is public. §7.3 runs first here too, in the same order
-             * the stream uses, so the two entry points cannot disagree: an element
-             * whose wire type contradicts @ref elemWire is not an element, and an
-             * id that is not an index cannot breach the index bound. */
-            if (cap >= 0 && static_cast<size_t>(id) >= static_cast<size_t>(cap))
+            if (!out) return;
+            /* §7.3 first, in the same order the stream uses, so the two entry points
+             * cannot disagree: an element whose wire type contradicts @ref elemWire
+             * is not this array's element at all. It is skipped like an unknown id,
+             * which means the destination has to be left exactly as it was -- so the
+             * decision comes before the placement below -- and an id that is not an
+             * index cannot breach the index bound either. Coming through
+             * @ref IStreamImpl::read the same test has already run one step earlier
+             * whenever this collector publishes a bound; it is kept here because
+             * `deserialize` is public and an unbounded array publishes none. */
+            if constexpr (elemWire >= 0)
             {
-                if constexpr (elemWire >= 0)
-                {
-                    if (static_cast<int>(is.wire()) != elemWire) return; /* §7.3 */
-                }
+                if (static_cast<int>(is.wire()) != elemWire) return; /* §7.3 */
+            }
+            /* §5.1/§7 over-index reject, decided from the id alone and before the
+             * container grows, which is also what keeps an announced index from
+             * becoming an allocation. The bound is `cap`, and the container's own
+             * capacity whenever `cap` declares none: a heap-free destination must be
+             * bounded by something, since its `emplace_back` stops advancing at the
+             * capacity and the gap fill would then never reach the id. Growable
+             * containers fold this to the `cap` test they had. */
+            constexpr long fixedCap = detail::destCapacity<Container>();
+            if (const long bound = cap >= 0 ? cap : fixedCap;
+                bound >= 0 && static_cast<size_t>(id) >= static_cast<size_t>(bound))
+            {
                 is.invalidate();
                 return;
             }
@@ -4743,17 +4808,32 @@ namespace sofab
              * Appending instead would silently SHORTEN the array by the size of
              * the gap: wire `06 0005 07 16 0009 07` (elements at id 0 and id 2,
              * id 1 absent) is the 3-element array `[5, 0, 9]`, not `[5, 9]`.
-             * Same placement rule as @ref StringSeq / @ref BlobSeq; the growth is
-             * bounded by the `cap` reject above whenever the schema declares a
-             * `count`. */
-            while (out->size() <= static_cast<size_t>(id)) out->emplace_back();
-            T &row = (*out)[id];
-            /* A count-less native-array row is a std::vector the span read fills
-             * only up to its current size, so size it to the row's wire count
-             * first. Struct/union rows and fixed std::array rows have no resize(). */
-            if constexpr (requires { row.resize(count); } && !std::is_base_of_v<IStreamMessage, T>)
-                row.resize(count);
-            is.read(row);
+             * Same placement rule as @ref StringSeq / @ref BlobSeq. */
+            while (out->size() <= static_cast<size_t>(id)) (void)out->emplace_back();
+            Elem &row = (*out)[static_cast<size_t>(id)];
+            if constexpr (std::is_base_of_v<IStreamMessage, Elem>)
+            {
+                is.read(row); /* the element's own sub-sequence */
+            }
+            else if constexpr (requires { row.resize(size_t{}); })
+            {
+                /* A native-scalar row is sized by the wire count, and
+                 * @ref IStreamImpl::readArray is what owns that: it settles the
+                 * row's array tag, refuses a count the row cannot hold instead of
+                 * truncating into it (§3), and grows only as far as the bytes in
+                 * hand could ever fill -- so an announced count of 2^31 never
+                 * becomes an allocation. A bare `resize(count)` here got all three
+                 * wrong. A heap-free row's capacity IS the schema `count` it was
+                 * generated for, so it is passed as one and a row past it is the
+                 * INVALID of §7.1 rather than a receiver-side LimitExceeded. */
+                (void)is.readArray(row, detail::destCapacity<Elem>());
+            }
+            else
+            {
+                /* A fixed-extent row (`std::array`, a bound span) publishes no
+                 * resize: read()'s low-level contract fills what it holds. */
+                is.read(row);
+            }
         }
     };
 
