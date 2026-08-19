@@ -18,6 +18,11 @@ concurrency:
 jobs:
   check:
     runs-on: ubuntu-latest
+    # A hung step must fail fast and name itself: only 20 Actions jobs can run
+    # at once across this family, and a job left on the 360-minute default
+    # holds one of those slots away from every other repo. The value below is
+    # many times the observed runtime -- this job has never taken 1.5 min.
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v7
         with:

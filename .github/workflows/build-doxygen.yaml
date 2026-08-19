@@ -21,6 +21,11 @@ concurrency:
 jobs:
   build:
     runs-on: ubuntu-latest
+    # A hung step must fail fast and name itself: only 20 Actions jobs can run
+    # at once across this family, and a job left on the 360-minute default
+    # holds one of those slots away from every other repo. The values below are
+    # many times the observed runtime -- no job here has taken over 1.5 min.
+    timeout-minutes: 15
 
     steps:
       - name: Checkout repository
@@ -28,9 +33,18 @@ jobs:
 
       - name: Install Doxygen
         run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            cmake doxygen graphviz
+          # Transient apt mirror failures are the single most common way a
+          # runner is lost here, so retry before giving up.
+          for i in 1 2 3; do
+            sudo apt-get update \
+              && sudo apt-get install -y --no-install-recommends \
+                   cmake doxygen graphviz \
+              && exit 0
+            echo "::warning::apt attempt $i failed, retrying in 15s"
+            sleep 15
+          done
+          echo "::error::apt failed after 3 attempts"
+          exit 1
 
       - name: Configure with CMake
         run: |
@@ -51,6 +65,7 @@ jobs:
     needs: build
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
+    timeout-minutes: 10
 
     environment:
       name: github-pages

@@ -20,6 +20,11 @@ concurrency:
 jobs:
   build:
     runs-on: ubuntu-latest
+    # A hung step must fail fast and name itself: only 20 Actions jobs can run
+    # at once across this family, and a job left on the 360-minute default
+    # holds one of those slots away from every other repo. The value below is
+    # many times the observed runtime -- this job has never taken 1.5 min.
+    timeout-minutes: 15
 
     steps:
       - name: Checkout repository
@@ -27,9 +32,18 @@ jobs:
 
       - name: Install cross toolchain and qemu
         run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            cmake g++-powerpc64-linux-gnu gcc-powerpc64-linux-gnu qemu-user-static
+          # Transient apt mirror failures are the single most common way a
+          # runner is lost here, so retry before giving up.
+          for i in 1 2 3; do
+            sudo apt-get update \
+              && sudo apt-get install -y --no-install-recommends \
+                   cmake g++-powerpc64-linux-gnu gcc-powerpc64-linux-gnu qemu-user-static \
+              && exit 0
+            echo "::warning::apt attempt $i failed, retrying in 15s"
+            sleep 15
+          done
+          echo "::error::apt failed after 3 attempts"
+          exit 1
 
       - name: Configure with CMake (cross, static)
         run: |
