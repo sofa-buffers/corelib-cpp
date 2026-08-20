@@ -208,6 +208,11 @@ jobs:
 
   # ---- moved from coverage.yaml
   coverage:
+    # Scoped to this job alone: it is the only one that writes, and it
+    # writes exactly one file to the badges branch. The permission used to
+    # sit at workflow level in coverage.yaml and was lost when the job moved.
+    permissions:
+      contents: write
     needs: [gate]
     runs-on: ubuntu-latest
     # A hung step must fail fast and name itself: only 20 Actions jobs can run
