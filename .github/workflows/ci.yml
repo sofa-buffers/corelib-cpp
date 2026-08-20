@@ -1,0 +1,293 @@
+name: CI
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+jobs:
+  # ---------------------------------------------------------------- the gate
+  # One compile on the host before anything fans out. `needs:` cannot cross
+  # workflow files, so as long as each target was its own file nothing could be
+  # sequenced in front of them and a broken build was found by every job
+  # separately. It compiles and does not test: a gate that runs the suite is a
+  # second pipeline, not a gate.
+  gate:
+    name: build (gate)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Install build dependencies
+        run: |
+          for i in 1 2 3; do
+            sudo apt-get update \
+              && sudo apt-get install -y --no-install-recommends build-essential cmake \
+              && exit 0
+            echo "::warning::apt attempt $i failed, retrying in 15s"
+            sleep 15
+          done
+          echo "::error::apt failed after 3 attempts"
+          exit 1
+
+      - name: Compile (Debug, g++)
+        run: |
+          cmake -S . -B build/gate \
+            -DCMAKE_BUILD_TYPE=Debug \
+            -DCMAKE_CXX_COMPILER=g++
+          cmake --build build/gate --parallel "$(nproc)"
+
+  # ---- moved from build-gcc-x86_64.yaml
+  gcc-x86_64:
+    needs: [gate]
+    name: x86_64 (GCC, ${{ matrix.build_type }})
+    runs-on: ubuntu-latest
+    # A hung step must fail fast and name itself: only 20 Actions jobs can run
+    # at once across this family, and a job left on the 360-minute default
+    # holds one of those slots away from every other repo. The value below is
+    # many times the observed runtime -- this job has never taken 1.5 min.
+    timeout-minutes: 15
+
+    strategy:
+      fail-fast: false
+      matrix:
+        build_type: [ Debug, Release ]
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Install build dependencies
+        run: |
+          # Transient apt mirror failures are the single most common way a
+          # runner is lost here, so retry before giving up.
+          for i in 1 2 3; do
+            sudo apt-get update \
+              && sudo apt-get install -y --no-install-recommends \
+                   build-essential cmake \
+              && exit 0
+            echo "::warning::apt attempt $i failed, retrying in 15s"
+            sleep 15
+          done
+          echo "::error::apt failed after 3 attempts"
+          exit 1
+
+      - name: Configure with CMake
+        run: |
+          cmake -S . -B build \
+            -DCMAKE_BUILD_TYPE=${{ matrix.build_type }} \
+            -DCMAKE_CXX_COMPILER=g++
+
+      - name: Build project
+        run: cmake --build build --parallel "$(nproc)"
+
+      - name: Run tests
+        working-directory: build
+        run: ctest --output-on-failure --verbose
+
+      # Guard the non-strict UTF-8 build (SOFAB_STRICT_UTF8=0): it must still
+      # compile, pass the positive vectors, and skip the invalid_utf8 group.
+      - name: Configure (strict UTF-8 OFF)
+        run: |
+          cmake -S . -B build-utf8-off \
+            -DCMAKE_BUILD_TYPE=${{ matrix.build_type }} \
+            -DCMAKE_CXX_COMPILER=g++ \
+            -DCMAKE_CXX_FLAGS="-DSOFAB_STRICT_UTF8=0"
+
+      - name: Build project (strict UTF-8 OFF)
+        run: cmake --build build-utf8-off --parallel "$(nproc)"
+
+      - name: Run tests (strict UTF-8 OFF)
+        working-directory: build-utf8-off
+        run: ctest --output-on-failure --verbose
+
+  # ---- moved from build-clang-x86_64.yaml
+  clang-x86_64:
+    needs: [gate]
+    name: x86_64 (Clang, ${{ matrix.build_type }})
+    runs-on: ubuntu-latest
+    # A hung step must fail fast and name itself: only 20 Actions jobs can run
+    # at once across this family, and a job left on the 360-minute default
+    # holds one of those slots away from every other repo. The value below is
+    # many times the observed runtime -- this job has never taken 1.5 min.
+    timeout-minutes: 15
+
+    strategy:
+      fail-fast: false
+      matrix:
+        build_type: [ Debug, Release ]
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Install build dependencies
+        run: |
+          # Transient apt mirror failures are the single most common way a
+          # runner is lost here, so retry before giving up.
+          for i in 1 2 3; do
+            sudo apt-get update \
+              && sudo apt-get install -y --no-install-recommends \
+                   build-essential cmake clang \
+              && exit 0
+            echo "::warning::apt attempt $i failed, retrying in 15s"
+            sleep 15
+          done
+          echo "::error::apt failed after 3 attempts"
+          exit 1
+
+      - name: Configure with CMake
+        run: |
+          cmake -S . -B build \
+            -DCMAKE_BUILD_TYPE=${{ matrix.build_type }} \
+            -DCMAKE_CXX_COMPILER=clang++
+
+      - name: Build project
+        run: cmake --build build --parallel "$(nproc)"
+
+      - name: Run tests
+        working-directory: build
+        run: ctest --output-on-failure --verbose
+
+  # ---- moved from build-gcc-ppc64-bigendian.yaml
+  ppc64-be:
+    needs: [gate]
+    name: ppc64 (big endian)
+    runs-on: ubuntu-latest
+    # A hung step must fail fast and name itself: only 20 Actions jobs can run
+    # at once across this family, and a job left on the 360-minute default
+    # holds one of those slots away from every other repo. The value below is
+    # many times the observed runtime -- this job has never taken 1.5 min.
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Install cross toolchain and qemu
+        run: |
+          # Transient apt mirror failures are the single most common way a
+          # runner is lost here, so retry before giving up.
+          for i in 1 2 3; do
+            sudo apt-get update \
+              && sudo apt-get install -y --no-install-recommends \
+                   cmake g++-powerpc64-linux-gnu gcc-powerpc64-linux-gnu qemu-user-static \
+              && exit 0
+            echo "::warning::apt attempt $i failed, retrying in 15s"
+            sleep 15
+          done
+          echo "::error::apt failed after 3 attempts"
+          exit 1
+
+      - name: Configure with CMake (cross, static)
+        run: |
+          cmake -S . -B build \
+            -DCMAKE_BUILD_TYPE=Debug \
+            -DCMAKE_SYSTEM_NAME=Linux \
+            -DCMAKE_SYSTEM_PROCESSOR=ppc64 \
+            -DCMAKE_C_COMPILER=powerpc64-linux-gnu-gcc \
+            -DCMAKE_CXX_COMPILER=powerpc64-linux-gnu-g++ \
+            -DCMAKE_EXE_LINKER_FLAGS=-static
+
+      - name: Build project
+        run: cmake --build build --parallel "$(nproc)"
+
+      - name: Confirm binaries are big-endian PowerPC
+        run: file build/test_roundtrip build/test_vectors
+
+      - name: Run tests (under qemu via binfmt)
+        working-directory: build
+        run: ctest --output-on-failure --verbose
+
+  # ---- moved from coverage.yaml
+  coverage:
+    needs: [gate]
+    runs-on: ubuntu-latest
+    # A hung step must fail fast and name itself: only 20 Actions jobs can run
+    # at once across this family, and a job left on the 360-minute default
+    # holds one of those slots away from every other repo. The value below is
+    # many times the observed runtime -- this job has never taken 1.5 min.
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Install build dependencies
+        run: |
+          # Transient apt mirror failures are the single most common way a
+          # runner is lost here, so retry before giving up.
+          for i in 1 2 3; do
+            sudo apt-get update \
+              && sudo apt-get install -y --no-install-recommends \
+                   build-essential cmake gcovr jq \
+              && exit 0
+            echo "::warning::apt attempt $i failed, retrying in 15s"
+            sleep 15
+          done
+          echo "::error::apt failed after 3 attempts"
+          exit 1
+
+      - name: Configure with CMake
+        run: |
+          cmake -S . -B build \
+            -DCMAKE_BUILD_TYPE=Debug \
+            -DSOFAB_ENABLE_COVERAGE=ON
+
+      - name: Build project
+        run: cmake --build build --parallel "$(nproc)"
+
+      - name: Run tests
+        working-directory: build
+        run: ctest --output-on-failure --verbose
+
+      - name: Test coverage report
+        run: |
+          gcovr \
+            --root . \
+            --filter '^include/sofab/.*\.hpp$' \
+            --exclude-directories '.*/_deps/.*' \
+            --object-directory build \
+            --print-summary
+
+      - name: Test coverage badge JSON
+        run: |
+          gcovr \
+            --root . \
+            --filter '^include/sofab/.*\.hpp$' \
+            --exclude-directories '.*/_deps/.*' \
+            --object-directory build \
+            --json-summary coverage.json
+          jq -n --argjson cov "$(<coverage.json)" '
+            ($cov.line_covered / $cov.line_total * 100) as $pct |
+            {
+              schemaVersion: 1,
+              label: "gcovr",
+              message: ($pct | tostring[0:4] + "%"),
+              color: (if $pct >= 90 then "brightgreen" elif $pct >= 75 then "yellow" else "red" end)
+            }
+          ' > badge.json
+          echo "$(<badge.json)"
+
+      - name: Publish coverage badge
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          mkdir badge-out
+          cp badge.json badge-out/coverage-cpp.json
+          cd badge-out
+          git init -q
+          git checkout -q -b badges
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add coverage-cpp.json
+          git commit -q -m "ci: update C++ coverage badge"
+          git push -f "https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" badges

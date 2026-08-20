@@ -9,8 +9,8 @@
 
 ## SofaBuffers C++ library
 
-[![CI](https://github.com/sofa-buffers/corelib-cpp/actions/workflows/build-gcc-x86_64.yaml/badge.svg?branch=main)](https://github.com/sofa-buffers/corelib-cpp/actions/workflows/build-gcc-x86_64.yaml)
-[![Coverage](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/sofa-buffers/corelib-cpp/badges/coverage-cpp.json)](https://github.com/sofa-buffers/corelib-cpp/actions/workflows/coverage.yaml)
+[![CI](https://github.com/sofa-buffers/corelib-cpp/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/sofa-buffers/corelib-cpp/actions/workflows/ci.yml)
+[![Coverage](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/sofa-buffers/corelib-cpp/badges/coverage-cpp.json)](https://github.com/sofa-buffers/corelib-cpp/actions/workflows/ci.yml)
 [![Docs](https://img.shields.io/badge/docs-online-blue)](https://sofa-buffers.github.io/corelib-cpp/)
 
 [GitHub repository](https://github.com/sofa-buffers/corelib-cpp)
@@ -46,14 +46,19 @@ Non-native targets are built and run under [QEMU](https://www.qemu.org/)
 user-mode emulation in CI, reproducible locally without the real hardware. Both
 x86_64 legs build and run the full suite twice — in `Debug` **and** in `Release`
 (`-O3 -DNDEBUG`) — so a defect only the optimiser exposes cannot ship green. The
-**CI** badge at the top of this section tracks the first row; the table is the
-whole matrix.
+**CI** badge at the top of this section covers the whole pipeline; the table
+below says what that pipeline builds.
 
-| Target | Status |
-| - | - |
-| GCC x86_64 (little endian) | [![badge](https://github.com/sofa-buffers/corelib-cpp/actions/workflows/build-gcc-x86_64.yaml/badge.svg)](https://github.com/sofa-buffers/corelib-cpp/actions/workflows/build-gcc-x86_64.yaml) |
-| Clang x86_64 (little endian) | [![badge](https://github.com/sofa-buffers/corelib-cpp/actions/workflows/build-clang-x86_64.yaml/badge.svg)](https://github.com/sofa-buffers/corelib-cpp/actions/workflows/build-clang-x86_64.yaml) |
-| GCC ppc64 (big endian) | [![badge](https://github.com/sofa-buffers/corelib-cpp/actions/workflows/build-gcc-ppc64-bigendian.yaml/badge.svg)](https://github.com/sofa-buffers/corelib-cpp/actions/workflows/build-gcc-ppc64-bigendian.yaml) |
+| Target | Compiler | Runs |
+| - | - | - |
+| x86_64 (little endian) | GCC, Debug and Release | build + test suite |
+| x86_64 (little endian) | Clang, Debug and Release | build + test suite |
+| ppc64 (big endian) | GCC, cross + static | build + test suite under QEMU |
+
+The badge above covers all of them: GitHub publishes one badge per workflow
+file, and these are one pipeline now. The
+[CI run](https://github.com/sofa-buffers/corelib-cpp/actions/workflows/ci.yml)
+shows the per-target result.
 
 ### Packaging
 
