@@ -23,6 +23,18 @@
 #      is a *subsection* of `## Benchmarks` — its final one — not a section of
 #      its own after it.
 #
+# Checks 1-5 guard the document's *shape*. The rest guard its *content*, which
+# is the half a shrink threatens: a section can keep its heading and lose the
+# fact a reader came for, and nothing inside the library notices that either.
+#
+#   6. §9.5 the Usage chapter still shows each example the plan lists.
+#   7. §6.4 the strict-UTF-8 knob is documented, and §9.6 states
+#      MIN_OUTPUT_BUFFER *in the memory chapter* — the number a caller needs
+#      before it can size a streaming buffer, in the section they read to find
+#      out who allocates what.
+#   8. §6.1.1 no spelling outside the closed generated-object name set.
+#   9. Every in-document link still resolves to a heading.
+#
 # Usage: test_readme_structure.sh <path-to-README.md>
 #
 # SPDX-License-Identifier: MIT
@@ -143,6 +155,73 @@ else
     else
         fail "§9.8 the comparison sits under '$owner', not under ## Benchmarks"
     fi
+fi
+
+# ------------------------------------------- §9.5 the Usage chapter's examples
+
+# §9.5 lists the examples every port must carry, and they are what a reader
+# opens Usage for. Dropping one drops a use case, not prose. The wording is the
+# family's; only the code inside each is per-language.
+for want in "Serialize" "Serialize stream" "Deserialize" "Deserialize stream" "Code generator"; do
+    if grep -qxF "### $want" "$PROSE"; then
+        ok "§9.5 Usage shows '$want'"
+    else
+        fail "§9.5 Usage has no '### $want' example"
+    fi
+done
+
+# ------------------------------- §6.4 / §9.6 facts no heading check can see
+
+# Two things the plan obliges this port to state are plain prose. A
+# byte-container target must document its strict-UTF-8 knob (§6.4). And §9.6
+# puts MIN_OUTPUT_BUFFER in the memory chapter specifically: it is the number a
+# caller needs before it can size a streaming buffer, and the memory chapter is
+# where they go to find out who allocates what, so stating it elsewhere does not
+# reach them.
+if grep -q 'SOFAB_STRICT_UTF8' "$README"; then
+    ok "§6.4 the strict-UTF-8 knob is documented"
+else
+    fail "§6.4 SOFAB_STRICT_UTF8 is never documented (a byte-container port must expose it)"
+fi
+
+memory="$(awk '/^## Memory handling$/ { inside = 1; next } /^## / { inside = 0 } inside' "$PROSE")"
+if printf '%s\n' "$memory" | grep -q 'MIN_OUTPUT_BUFFER'; then
+    ok "§9.6 MIN_OUTPUT_BUFFER is stated in the memory chapter"
+else
+    fail "§9.6 the memory chapter never states MIN_OUTPUT_BUFFER"
+fi
+
+# --------------------------------------- §6.1.1 the closed generated-name set
+
+# §6.1.1 closes the generated-object layer to encode / decode / try_decode /
+# serialize / deserialize / decoder, and lists the spellings a port must not
+# invent beside them. Teaching one in the docs sends a reader looking for a
+# surface sofabgen does not emit — as effectively as emitting it would.
+if bad="$(grep -inE '\b(marshal|unmarshal|serialize_to|to_bytes|from_bytes|decode_from|decode_into)\b' "$README")"; then
+    fail "§6.1.1 a name outside the closed generated-object set:"
+    printf '%s\n' "$bad" | sed 's/^/      /' >&2
+else
+    ok "§6.1.1 no name outside the closed generated-object set"
+fi
+
+# ---------------------------------------------- in-document links resolve
+
+# A heading that moves takes its anchor with it. That is the cheapest way for a
+# restructuring to break navigation while breaking nothing a build can see.
+anchors="$(grep -E '^#+ +' "$PROSE" | sed -E 's/^#+ +//' \
+    | tr 'A-Z' 'a-z' | sed -E 's/[^a-z0-9 _-]//g; s/ /-/g')"
+links="$(grep -oE '\]\(#[^)]+\)' "$README" | sed -E 's/^\]\(#//; s/\)$//' | sort -u)"
+if [ -z "$links" ]; then
+    fail "no in-document links found; the link scan is broken"
+else
+    broken=0
+    for link in $links; do
+        if ! printf '%s\n' "$anchors" | grep -qxF "$link"; then
+            fail "link to #$link matches no heading"
+            broken=1
+        fi
+    done
+    [ "$broken" -eq 0 ] && ok "every in-document link resolves to a heading"
 fi
 
 if [ "$fails" -ne 0 ]; then
