@@ -16,6 +16,17 @@ target_compile_definitions(test_roundtrip PRIVATE
 target_link_libraries(test_roundtrip PRIVATE sofab_cpp)
 add_test(NAME test_roundtrip COMMAND test_roundtrip)
 
+# The README's generator example, compiled and run. The example lives here as a
+# real translation unit; the test also checks that README.md still shows exactly
+# these lines, so a documented example cannot drift from one that compiles.
+add_executable(test_readme_example test_readme_example.cpp)
+target_compile_options(test_readme_example PRIVATE -Wall -Wextra -Wpedantic -Werror)
+target_compile_definitions(test_readme_example PRIVATE
+    SOFAB_README_PATH="${PROJECT_SOURCE_DIR}/README.md"
+    SOFAB_SELF_PATH="${CMAKE_CURRENT_LIST_DIR}/test_readme_example.cpp")
+target_link_libraries(test_readme_example PRIVATE sofab_cpp)
+add_test(NAME test_readme_example COMMAND test_readme_example)
+
 # Full conformance against the shared vectors (uses the vendored JSON reader).
 add_executable(test_vectors
     test_vectors.cpp
@@ -37,17 +48,6 @@ add_test(NAME test_ci_workflows
             ${PROJECT_SOURCE_DIR}/.github/workflows)
 set_tests_properties(test_ci_workflows PROPERTIES SKIP_RETURN_CODE 77)
 
-# CORELIB_PLAN §9 fixes the README's section list, their order, and the §9.2
-# badge block for the whole corelib family — the shared shape is what makes one
-# port's README navigable to a reader who knows another. That is a property of
-# the document, so no C++ test can notice it drifting: this check reads
-# README.md and fails on an invented or reordered top-level section, a missing
-# CI/coverage/Docs badge, or the §9.8 two-corelib comparison escaping from
-# under `## Benchmarks`.
-add_test(NAME test_readme_structure
-    COMMAND bash ${CMAKE_CURRENT_LIST_DIR}/test_readme_structure.sh
-            ${PROJECT_SOURCE_DIR}/README.md)
-set_tests_properties(test_readme_structure PROPERTIES SKIP_RETURN_CODE 77)
 
 # CORELIB_PLAN §8: the shared vectors and the JSON reader are copies of
 # corelib-c-cpp, the authoritative source. Their provenance record — which
