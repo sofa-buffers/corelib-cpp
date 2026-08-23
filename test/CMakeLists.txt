@@ -16,6 +16,17 @@ target_compile_definitions(test_roundtrip PRIVATE
 target_link_libraries(test_roundtrip PRIVATE sofab_cpp)
 add_test(NAME test_roundtrip COMMAND test_roundtrip)
 
+# The README's generator example, compiled and run. The example lives here as a
+# real translation unit; the test also checks that README.md still shows exactly
+# these lines, so a documented example cannot drift from one that compiles.
+add_executable(test_readme_example test_readme_example.cpp)
+target_compile_options(test_readme_example PRIVATE -Wall -Wextra -Wpedantic -Werror)
+target_compile_definitions(test_readme_example PRIVATE
+    SOFAB_README_PATH="${PROJECT_SOURCE_DIR}/README.md"
+    SOFAB_SELF_PATH="${CMAKE_CURRENT_LIST_DIR}/test_readme_example.cpp")
+target_link_libraries(test_readme_example PRIVATE sofab_cpp)
+add_test(NAME test_readme_example COMMAND test_readme_example)
+
 # Full conformance against the shared vectors (uses the vendored JSON reader).
 add_executable(test_vectors
     test_vectors.cpp
