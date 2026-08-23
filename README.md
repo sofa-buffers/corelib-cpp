@@ -577,23 +577,16 @@ machine-independent per-op cost; `bench` reports throughput;
 `bench/run_callgrind.sh` runs each workload under Callgrind for a deterministic
 instructions-per-operation figure, which is what the comparison below uses.
 
-On this machine (GCC 15, `-O3`, x86-64) the throughput table reads:
-
-```
-encode: u64 array (1000)         4295.75      decode: u64 array (1000)     3529.74
-encode: typical message          2051.08      decode: typical message       377.27
-encode: blob 1MB one-shot       42063.92      decode: blob 1MB            16696.61
-encode: blob 1MB streaming        970.19      decode: composite             539.41
-encode: composite                 922.58      decode: composite skip-all   1705.72
-```
-
 Five bytes of the `blob 1MB` message are metadata and a million are payload, so
 its MB/s is the host's `memcpy` and its memory bandwidth — **read the one-shot
 and streaming rows against each other, never either alone.** Their difference is
-what the divisible-run path costs: 42.1 GB/s in one contiguous write against
-0.97 GB/s through a 4096-byte buffer with a flush sink. `blob 1MB passthrough`,
-BENCH_SPEC's optional row, is absent because this port implements no
-pass-through permission.
+what the divisible-run path costs. `blob 1MB passthrough`, BENCH_SPEC's optional
+row, is absent because this port implements no pass-through permission.
+
+Measured throughput is not reproduced here — it belongs to the cross-language
+benchmark arena, which runs every port on one host under one methodology. The
+head-to-head instruction counts below stay, because they are the only place the
+two C++ corelibs can be compared at all.
 
 All three tools read **one** workload list — the table in `bench/bench.cpp`,
 published by `bench --list` — so a workload cannot be renamed in one tool and go
