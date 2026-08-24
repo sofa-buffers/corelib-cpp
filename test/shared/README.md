@@ -23,11 +23,19 @@ re-pinning its row turns red instead of drifting silently.
 load the shared conformance vectors so `test/test_vectors.cpp` can replay them
 through this repo's pure-C++20 `sofab::OStream` / `sofab::IStream`.
 
+The file carries three top-level groups and this repo runs all three: `vectors`
+(the wire-format ground truth), `invalid_utf8` (negative `string` payloads) and
+`sequence_growth` (CORELIB_PLAN §7.2 item 8 — a wrapper array's container growth,
+keyed by a delivery sequence of element ids rather than by bytes, with indices
+relative to the port's own configured `max_dyn_array_count`). The growth block is
+gated by a `dynamic_arrays` capability tag: a statically bounded profile never
+grows and skips it. This corelib collects into `std::vector`, so it runs it.
+
 The vectors it loads are **also vendored**, from the same upstream:
 
 | File | Upstream source | Pinned at | `md5` |
 |------|-----------------|-----------|-------|
-| `../../assets/test_vectors.json` | [`sofa-buffers/corelib-c-cpp`](https://github.com/sofa-buffers/corelib-c-cpp) → `assets/test_vectors.json` | commit `f30244e3f29e` (2026-07-28) | `f542c66bfa6aecb3636282ec6e802a1b` |
+| `../../assets/test_vectors.json` | [`sofa-buffers/corelib-c-cpp`](https://github.com/sofa-buffers/corelib-c-cpp) → `assets/test_vectors.json` | commit `bf29d26fe041` (2026-08-24) | `1ed3e93b7104299aa964a2ef44f14af6` |
 
 `test_vectors.json` is the cross-language source of truth for the wire format and
 is copied verbatim into every SofaBuffers corelib. We track the copy vendored in
@@ -68,7 +76,7 @@ happens:
    authoritative format description.
 
    The **envelope** — the file's top-level keys — is upstream's too, and it has
-   grown a key before (`invalid_utf8`). `test/test_vectors.cpp` reads and parses
+   grown a key twice (`invalid_utf8`, then `sequence_growth`). `test/test_vectors.cpp` reads and parses
    the file exactly once and walks every group off that single parse; each walker
    demands its own top-level key and fails the run when it is absent, renamed or
    empty. A re-sync that reshapes the envelope therefore shows up as a red

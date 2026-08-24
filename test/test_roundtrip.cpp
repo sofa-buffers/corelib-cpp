@@ -3640,6 +3640,28 @@ static void wrapperArrayIndexCaps()
               "index cap: a collector's own dynCap overrides the stream fallback");
     }
 
+    /* --- growth GEOMETRY (§7.2 item 8's last paragraph): "extending to at least
+     *     `id + 1` rather than exactly `id + 1`, so a sparse array does not cost
+     *     O(n²) copies -- is the one property here needing the language's own
+     *     allocation-counting facility. Test it where the language offers one".
+     *     C++ offers one, so this port tests it rather than declaring it
+     *     untested in the README. --- */
+    {
+        constexpr long kSparse = 4095;
+        const auto w = strAt(kSparse);
+        sofab::IStreamObject<CapStringMsg> in;
+        (*in).dynCap = kSparse + 1;
+        const unsigned long before = g_allocCount;
+        CHECK(in.feed(w.data(), w.size()).complete(), "growth geometry: the sparse index decodes COMPLETE");
+        CHECK((*in).tags.size() == static_cast<size_t>(kSparse) + 1,
+              "growth geometry: the array is highest-present-id + 1 long");
+        /* Geometric growth is O(log n) reallocations; element-by-element growth
+         * would be O(n) -- 4096 of them. The empty std::string elements the gap
+         * is filled with are SSO and allocate nothing themselves. */
+        CHECK(g_allocCount - before < 64,
+              "growth geometry: filling 4096 slots costs O(log n) allocations, not O(n)");
+    }
+
     checkStreamReuse<CapStringMsg>("CapStringMsg");
     checkStreamReuse<CapBlobMsg>("CapBlobMsg");
     checkStreamReuse<FixedStringSeqMsg>("FixedStringSeqMsg");
