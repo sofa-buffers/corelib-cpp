@@ -499,12 +499,14 @@ Call sites are spelled identically for both storage kinds, so switching a field'
 storage is a change of member type and nothing else. Semantics are unchanged: a
 payload past the declared bound is `INVALID` (§7.1) rather than truncated, and
 one past the container's own capacity is refused as well — a decode never drops
-what it cannot store. The two refusals stay in different categories:
+what it cannot store. Which refusal it is follows CORELIB_PLAN §6.3's three
+tiers, in that order:
 
-| ceiling that was passed | outcome | why |
-|---|---|---|
-| a declared `maxlen` / `count` | `INVALID` | the schema makes the message malformed (§7.1) |
-| the destination's capacity, nothing declared | `readArray`: `LimitExceeded`<br>`readString` / `readBlob`: `INVALID` | the bytes are well-formed — the same message decodes into a growable destination — so this is the receiver-side category of §6.2.1 |
+| ceiling that was passed | outcome |
+|---|---|
+| a declared `maxlen` / `count` | `InvalidMessage` (`DecodeStatus::Invalid`) |
+| a configured receiver cap (`Limits::max_buffered_field`, `readArray`'s `dynCap`) on a field the schema does not bound | `LimitExceeded` (`DecodeStatus::LimitExceeded`) |
+| neither of the above, and the destination this caller passed is too short | `InvalidArgument` (`DecodeStatus::InvalidArgument`) |
 
 A decode into fully bounded fields performs **no allocation at all**;
 `test_roundtrip.cpp`'s `heapFreeStorage()` checks that against the `operator new`

@@ -2540,6 +2540,144 @@ static void schemaBoundOutranksCap()
     }
 }
 
+/* --- §6.3's three refusal tiers, on one message, in one place ---------------
+ *
+ * "Three ways a value can be refused, and only one means the bytes are bad":
+ * a value past a bound the SCHEMA declares is `InvalidMessage`; a value past a
+ * CONFIGURED receiver cap on a schema-unbounded field is `LimitExceeded`; a
+ * value that broke neither and simply does not fit the DESTINATION the caller
+ * handed over is `InvalidArgument` (§6.3, §6.6.3).
+ *
+ * The third tier is the one this port used to answer two different ways -- INVALID
+ * from readString/readBlob, LimitExceeded from readArray -- neither of them the
+ * right one (A2-0022). --- */
+
+struct TierMsg : sofab::IStreamMessage
+{
+    sofab::FixedString<8> bounded;   /* id 1: string, maxlen 4, dest capacity 8 */
+    sofab::FixedString<8> plain;     /* id 2: string, unbounded, dest capacity 8 */
+    sofab::FixedBytes<8> blob;       /* id 3: blob,   unbounded, dest capacity 8 */
+    sofab::InlineVector<uint32_t, 4> arr; /* id 4: array<u32>, unbounded, capacity 4 */
+    long dynCap = -1;                /* configured receiver cap for id 4, or none */
+
+    void deserialize(sofab::IStreamImpl &is, sofab::id id, size_t, size_t) noexcept override
+    {
+        switch (id)
+        {
+            case 1: is.readString(bounded, 4); break;
+            case 2: is.readString(plain);      break;
+            case 3: is.readBlob(blob);         break;
+            case 4: is.readArray(arr, -1, dynCap); break;
+        }
+    }
+};
+
+static void refusalTiers()
+{
+    auto fixlen = [](uint8_t idAndType, sofab::detail::Fix sub, const std::string &payload) {
+        std::vector<uint8_t> w{idAndType, static_cast<uint8_t>((payload.size() << 3) |
+                                                               static_cast<unsigned>(sub))};
+        w.insert(w.end(), payload.begin(), payload.end());
+        return w;
+    };
+
+    /* Tier 1 -- the schema's `maxlen 4`, breached by a five-byte payload that
+     * the FixedString<8> destination could hold perfectly well. */
+    {
+        const auto w = fixlen(0x0a, sofab::detail::Fix::String, "12345");
+        sofab::IStreamObject<TierMsg> in;
+        auto r = in.feed(w.data(), w.size());
+        CHECK(r.code() == sofab::Error::InvalidMessage && r.invalid(),
+              "tiers: past the schema maxlen is InvalidMessage");
+        CHECK(r.status() == sofab::DecodeStatus::Invalid, "tiers: and status() says Invalid");
+        CHECK((*in).bounded.empty(), "tiers: the schema reject leaves the destination alone");
+    }
+
+    /* Tier 2 -- no schema bound, a configured receiver cap. `max_buffered_field`
+     * is this port's cap surface for a scalar payload; the array's is `dynCap`. */
+    {
+        const auto w = fixlen(0x12, sofab::detail::Fix::String, "1234567");
+        sofab::IStreamObject<TierMsg> in(sofab::Limits{4});
+        auto r = in.feed(w.data(), w.size());
+        CHECK(r.code() == sofab::Error::LimitExceeded && r.limitExceeded() && !r.invalid(),
+              "tiers: past a configured cap is LimitExceeded");
+        CHECK(r.status() == sofab::DecodeStatus::LimitExceeded,
+              "tiers: and status() keeps it out of Invalid");
+        CHECK((*in).plain.empty(), "tiers: the policy reject leaves the destination alone");
+    }
+    {
+        std::vector<uint8_t> w = {0x23}; /* id 4, array-unsigned */
+        appendVarint(w, 3);
+        for (uint32_t v : {1u, 2u, 3u}) appendVarint(w, v);
+        sofab::IStreamObject<TierMsg> in;
+        (*in).dynCap = 2;
+        auto r = in.feed(w.data(), w.size());
+        CHECK(r.code() == sofab::Error::LimitExceeded && !r.invalid() && !r.invalidArgument(),
+              "tiers: an array past its configured dynCap is LimitExceeded");
+    }
+
+    /* Tier 3 -- no schema bound, no configured cap: the value is beyond
+     * reproach and only this caller's storage is too small. */
+    {
+        const auto w = fixlen(0x12, sofab::detail::Fix::String, "123456789");
+        sofab::IStreamObject<TierMsg> in;
+        auto r = in.feed(w.data(), w.size());
+        CHECK(r.code() == sofab::Error::InvalidArgument && r.invalidArgument(),
+              "tiers: a string past the destination capacity is InvalidArgument");
+        CHECK(!r.invalid() && !r.limitExceeded(),
+              "tiers: and it is neither InvalidMessage nor LimitExceeded");
+        CHECK(r.status() == sofab::DecodeStatus::InvalidArgument,
+              "tiers: status() carries the third tier too");
+        CHECK((*in).plain.empty(), "tiers: the refused string leaves the destination alone");
+    }
+    {
+        const auto w = fixlen(0x1a, sofab::detail::Fix::Blob, "123456789");
+        sofab::IStreamObject<TierMsg> in;
+        auto r = in.feed(w.data(), w.size());
+        CHECK(r.code() == sofab::Error::InvalidArgument,
+              "tiers: a blob past the destination capacity is InvalidArgument");
+        CHECK((*in).blob.empty(), "tiers: the refused blob leaves the destination alone");
+    }
+    {
+        std::vector<uint8_t> w = {0x23}; /* id 4, array-unsigned, 5 elements > capacity 4 */
+        appendVarint(w, 5);
+        for (uint32_t v : {1u, 2u, 3u, 4u, 5u}) appendVarint(w, v);
+        sofab::IStreamObject<TierMsg> in;
+        auto r = in.feed(w.data(), w.size());
+        CHECK(r.code() == sofab::Error::InvalidArgument && !r.limitExceeded() && !r.invalid(),
+              "tiers: an array past the destination capacity is InvalidArgument");
+        CHECK((*in).arr.empty(), "tiers: the refused array leaves the destination alone");
+    }
+
+    /* The third tier is terminal and chunk-independent, like the other two: the
+     * same bytes dribbled one at a time reach the same code. */
+    {
+        const auto w = fixlen(0x12, sofab::detail::Fix::String, "123456789");
+        sofab::IStreamObject<TierMsg> in;
+        sofab::Error last = sofab::Error::None;
+        for (size_t i = 0; i < w.size(); ++i)
+        {
+            last = in.feed(w.data() + i, 1).code();
+            if (last != sofab::Error::Incomplete) break;
+        }
+        CHECK(last == sofab::Error::InvalidArgument,
+              "tiers: the dribbled over-capacity string is InvalidArgument too");
+        CHECK(in.feed(w.data(), w.size()).code() == sofab::Error::InvalidArgument,
+              "tiers: and the verdict is latched on the stream");
+    }
+
+    /* A value that fits every tier is untouched by any of this. */
+    {
+        const auto w = fixlen(0x12, sofab::detail::Fix::String, "12345678");
+        sofab::IStreamObject<TierMsg> in;
+        CHECK(in.feed(w.data(), w.size()).code() == sofab::Error::None,
+              "tiers: a value inside every tier decodes COMPLETE");
+        CHECK((*in).plain.view() == "12345678", "tiers: and lands in the destination");
+    }
+
+    checkStreamReuse<TierMsg>("TierMsg");
+}
+
 /* --- strict UTF-8 (spec MESSAGE_SPEC §8, CORELIB_PLAN §6.4). The validator
  *     itself is always available (utf8_valid); the SOFAB_STRICT_UTF8 gate only
  *     decides whether encode/decode invoke it. --- */
@@ -3987,9 +4125,12 @@ static void heapFreeStorage()
     (void)in.serialize(ros);
     CHECK(toHex({db, ros.bytesUsed()}) == fHex, "heapfree: decode -> encode round-trips byte-exact");
 
-    /* --- 3. §7.1: a payload past the destination's capacity is INVALID, never
-     *     truncated. `name` is FixedString<8>; feed nine characters with the
-     *     declared bound lifted so the capacity itself is what rejects. --- */
+    /* --- 3. §6.3's third tier: a payload past the destination's capacity is
+     *     InvalidArgument, never truncated. `name` is FixedString<8>; feed nine
+     *     characters with the declared bound lifted so the capacity itself is what
+     *     rejects. The message is well-formed and within every bound it declares,
+     *     so neither InvalidMessage nor LimitExceeded is the truth about it
+     *     (§6.6.3, A2-0022). --- */
     {
         struct NoBoundMsg : sofab::IStreamMessage
         {
@@ -4004,8 +4145,11 @@ static void heapFreeStorage()
         sofab::OStreamView os{buf, sizeof(buf)};
         (void)os.write(1, std::string_view{"123456789"}); /* 9 > capacity 8 */
         sofab::IStreamObject<NoBoundMsg> is;
-        CHECK(is.feed(buf, os.bytesUsed()).invalid(),
-              "heapfree: payload past FixedString capacity is INVALID, not truncated");
+        const auto rNoBound = is.feed(buf, os.bytesUsed());
+        CHECK(rNoBound.invalidArgument() && !rNoBound.invalid() && !rNoBound.limitExceeded(),
+              "heapfree: payload past FixedString capacity is InvalidArgument, not truncated");
+        CHECK(rNoBound.status() == sofab::DecodeStatus::InvalidArgument,
+              "heapfree: status() keeps the destination refusal out of Invalid");
         CHECK((*is).name.empty(), "heapfree: a rejected payload leaves the destination untouched");
     }
 
@@ -4102,10 +4246,11 @@ static void heapFreeStorage()
         {
             sofab::IStreamObject<UnboundedArrayMsg> is;
             auto r = is.feed(buf, os.bytesUsed());
-            CHECK(r.limitExceeded() && !r.complete() && !r.invalid() && !r.incomplete(),
-                  "heapfree: an unbounded array past InlineVector capacity is LimitExceeded");
-            CHECK(r.code() == sofab::Error::LimitExceeded,
-                  "heapfree: the over-capacity array reports LimitExceeded, not InvalidMessage");
+            CHECK(r.invalidArgument() && !r.complete() && !r.invalid() && !r.incomplete() &&
+                      !r.limitExceeded(),
+                  "heapfree: an unbounded array past InlineVector capacity is InvalidArgument");
+            CHECK(r.code() == sofab::Error::InvalidArgument,
+                  "heapfree: the over-capacity array is neither InvalidMessage nor LimitExceeded");
             CHECK((*is).v.empty(),
                   "heapfree: the rejected array leaves the destination untouched, not truncated");
         }
@@ -4143,7 +4288,7 @@ static void heapFreeStorage()
             (void)fos.write(2, std::span<const float>{six, 6});
             sofab::IStreamObject<FloatArrayMsg> is;
             auto r = is.feed(fbuf, fos.bytesUsed());
-            CHECK(r.limitExceeded() && !r.complete(),
+            CHECK(r.invalidArgument() && !r.complete(),
                   "heapfree: an over-capacity fp32 array is rejected, not memcpy-truncated");
             CHECK((*is).v.empty(), "heapfree: the rejected fp32 array leaves the destination untouched");
         }
@@ -5734,13 +5879,14 @@ static void sweepFloatArray(const char *name)
     }
 
     if constexpr (requires { C::capacity(); })
-    {   /* one element past what the destination can hold: §6.2.1 policy, not
-         * malformation, because the same bytes decode into a growable one. */
+    {   /* one element past what the destination can hold: §6.3's third tier --
+         * neither malformation nor a configured limit, because the same bytes
+         * decode into a growable destination and no cap was ever set. */
         const auto w = wire(n + 1, n + 1);
         sofab::IStreamObject<SweepArrMsg<C>> in;
         auto r = in.feed(w.data(), w.size());
-        CHECK(r.code() == sofab::Error::LimitExceeded && !r.invalid(),
-              say("an over-capacity count is LimitExceeded, never truncated in"));
+        CHECK(r.code() == sofab::Error::InvalidArgument && !r.invalid() && !r.limitExceeded(),
+              say("an over-capacity count is InvalidArgument, never truncated in"));
         sofab::IStreamObject<SweepArrMsg<C>> declared;
         (*declared).count = static_cast<long>(n);
         CHECK(declared.feed(w.data(), w.size()).code() == sofab::Error::InvalidMessage,
@@ -5752,11 +5898,12 @@ static void sweepFloatArray(const char *name)
 
 /* A destination that publishes a static capacity() -- the heap-free containers
  * -- refuses a count it cannot hold instead of truncating into it (issue #81).
- * WHICH refusal it is depends on where the ceiling comes from: with no declared
- * `count` the capacity is this receiver's own technical limit and the same
- * bytes decode into a growable destination, so §6.2.1 makes it LimitExceeded;
- * with a `count` declared the schema governs and the verdict stays the INVALID
- * an over-count payload always gets (§7.1). */
+ * WHICH refusal it is follows §6.3's three tiers, in order: a count past a
+ * declared `count` is the schema's business and stays INVALID (§7.1); a count
+ * past a configured receiver cap is LimitExceeded (§6.2.1); a count that broke
+ * neither and merely outgrows the destination this caller handed over is
+ * InvalidArgument (§6.6.3) -- "a mistake in the **call**, not a property of the
+ * message or of the deployment". */
 template <typename C>
 static void sweepCappedDestination(const char *name)
 {
@@ -5786,8 +5933,8 @@ static void sweepCappedDestination(const char *name)
         const auto w = intArrayWire(false, over);
         sofab::IStreamObject<SweepArrMsg<C>> in;
         auto r = in.feed(w.data(), w.size());
-        CHECK(r.code() == sofab::Error::LimitExceeded && !r.invalid(),
-              say("an over-capacity count with no declared `count` is LimitExceeded"));
+        CHECK(r.code() == sofab::Error::InvalidArgument && !r.invalid() && !r.limitExceeded(),
+              say("an over-capacity count with no declared `count` is InvalidArgument"));
     }
     {
         const auto w = intArrayWire(false, over);
@@ -6113,6 +6260,7 @@ int main()
     maxDepth();
     bufferLimits();
     schemaBoundOutranksCap();
+    refusalTiers();
     utf8ValidatorSweep();
     strictUtf8();
     messageLayerFraming();

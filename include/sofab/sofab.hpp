@@ -155,7 +155,20 @@ namespace sofab
          * more sequence header back (see @ref OStreamImpl::sequenceBeginLazy).
          */
         BufferFull = 3,
-        InvalidArgument = 1, /**< An argument was out of range (e.g. a field id above the limit). */
+        /**
+         * An argument was out of range (e.g. a field id above the limit) — and,
+         * on the decode side, §6.3's **third refusal tier**: a value that broke
+         * neither the schema bound nor a receiver cap but does not fit the
+         * **destination the caller handed over** (§6.6.3).
+         *
+         * "The third is a mistake in the **call**, not a property of the message
+         * or of the deployment, and the other two codes each say something untrue
+         * about it. `InvalidMessage` would mark a well-formed message malformed —
+         * the same bytes decode for a caller who passes a larger destination, and
+         * no §5.2.2 condition is present. `LimitExceeded` would promise a limit to
+         * raise that was never configured." (§6.3)
+         */
+        InvalidArgument = 1,
         InvalidMessage = 4,  /**< The input bytes are malformed (decode: `INVALID`, §7). */
         /**
          * Decode-only: the fed bytes end **inside** a field — a partial varint
@@ -200,6 +213,29 @@ namespace sofab
         Complete = 0,   /**< Consumed bytes end **exactly** at a field boundary — a valid message. */
         Incomplete = 1, /**< Consumed bytes end **inside** a field or with an open sequence. Not an error. */
         Invalid = 2,    /**< Bytes are malformed **regardless of what follows**. Terminal. */
+        /**
+         * A configured receiver-side limit (§6.2.1) was exceeded on a
+         * schema-**unbounded** field. The bytes are **well-formed** — the same
+         * message decodes under a looser limit — so this is a *policy* rejection
+         * and **not** @ref Invalid: §6.3 requires an implementation to "keep the
+         * two distinguishable to the caller" and forbids reporting it as
+         * `InvalidMessage`. Terminal.
+         *
+         * §6.3 offers two ways to surface it, "either a **fourth decode
+         * outcome**, or a terminal failure carrying the `LimitExceeded` code on
+         * the error channel"; this port does both, so a caller switching on
+         * @ref sofab::IStreamImpl::Result::status alone cannot mistake it for
+         * malformation.
+         */
+        LimitExceeded = 3,
+        /**
+         * The value broke neither the schema bound nor a receiver cap, but does
+         * not fit the **destination this caller handed over** (§6.6.3, §6.3's
+         * third refusal tier). A mistake in the call, not in the message: the
+         * same bytes decode for a caller who passes a larger destination.
+         * Terminal.
+         */
+        InvalidArgument = 4,
     };
 
     /** Field identifier on the wire. Valid range is `[0, INT32_MAX]`. */
@@ -2605,20 +2641,31 @@ namespace sofab
             /** @return `true` only for `COMPLETE`; `false` for both @ref incomplete and @ref invalid. */
             [[nodiscard]] bool ok() const noexcept { return error_ == Error::None; }
             /**
-             * @return The three-valued §7 outcome as a @ref DecodeStatus. A
-             *         @ref Error::LimitExceeded result is a receiver-side policy
-             *         failure, **not** one of the three wire outcomes — it maps to
-             *         @ref DecodeStatus::Invalid here only as a coarse fallback;
-             *         callers distinguishing policy from malformation must use
-             *         @ref code / @ref limitExceeded / @ref invalid.
+             * @return The outcome as a @ref DecodeStatus, **one value per
+             *         category**. The three §5.2 wire outcomes map to
+             *         @ref DecodeStatus::Complete / @ref DecodeStatus::Incomplete /
+             *         @ref DecodeStatus::Invalid; the two non-wire refusals keep
+             *         values of their own — @ref DecodeStatus::LimitExceeded for a
+             *         receiver policy cap (§6.2.1) and
+             *         @ref DecodeStatus::InvalidArgument for a destination too
+             *         short for a well-formed value (§6.6.3).
+             *
+             * @note These used to fold into @ref DecodeStatus::Invalid "as a coarse
+             *       fallback", which §6.2.1 forbids outright — "An implementation
+             *       **MUST NOT** report it as `InvalidMessage` and **MUST NOT**
+             *       fold it into the `INVALID` outcome" — and `status()` is the
+             *       accessor a caller writing `switch (r.status())` reaches for
+             *       first (A2-0024).
              */
             [[nodiscard]] DecodeStatus status() const noexcept
             {
                 switch (error_)
                 {
-                    case Error::None:        return DecodeStatus::Complete;
-                    case Error::Incomplete:  return DecodeStatus::Incomplete;
-                    default:                 return DecodeStatus::Invalid;
+                    case Error::None:           return DecodeStatus::Complete;
+                    case Error::Incomplete:     return DecodeStatus::Incomplete;
+                    case Error::LimitExceeded:  return DecodeStatus::LimitExceeded;
+                    case Error::InvalidArgument:return DecodeStatus::InvalidArgument;
+                    default:                    return DecodeStatus::Invalid;
                 }
             }
             /** @return `true` if the consumed bytes end exactly at a field boundary (`COMPLETE`). */
@@ -2630,9 +2677,15 @@ namespace sofab
              *         @ref limitExceeded result — a policy cap is not wire malformation.
              */
             [[nodiscard]] bool invalid() const noexcept { return error_ == Error::InvalidMessage; }
-            /** @return `true` if a field exceeded @ref Limits::max_buffered_field. Distinct from @ref invalid. */
+            /** @return `true` if a receiver-side limit (§6.2.1) was exceeded. Distinct from @ref invalid. */
             [[nodiscard]] bool limitExceeded() const noexcept { return error_ == Error::LimitExceeded; }
-            /** @return The status code (@ref Error::None, @ref Error::Incomplete, @ref Error::InvalidMessage or @ref Error::LimitExceeded). */
+            /**
+             * @return `true` if a well-formed value did not fit the destination
+             *         the caller handed over (§6.3's third tier, §6.6.3). Distinct
+             *         from both @ref invalid and @ref limitExceeded.
+             */
+            [[nodiscard]] bool invalidArgument() const noexcept { return error_ == Error::InvalidArgument; }
+            /** @return The status code (@ref Error::None, @ref Error::Incomplete, @ref Error::InvalidMessage, @ref Error::LimitExceeded or @ref Error::InvalidArgument). */
             [[nodiscard]] Error code() const noexcept { return error_; }
             /** @return `true` if the status code equals @p e. */
             bool operator==(Error e) const noexcept { return error_ == e; }
@@ -2653,17 +2706,29 @@ namespace sofab
         size_t count_ = 0;             /**< Element count of the current array field. */
         bool consumed_ = false;        /**< Set once the callback has read the current field's value. */
         bool error_ = false;           /**< Sticky decode-error flag for the current @ref feed. */
-        bool limitExceeded_ = false;   /**< Sticky flag: a field crossed @ref maxBufferedField_ this @ref feed. */
+        bool limitExceeded_ = false;   /**< Sticky flag: a field crossed a receiver-side limit this @ref feed. */
+        /**
+         * @brief Sticky flag: a well-formed value did not fit the destination the
+         *        caller handed over (§6.3's third refusal tier, §6.6.3).
+         *
+         * Lives for exactly one @ref feed, like @ref error_ and
+         * @ref limitExceeded_, and is latched into @ref terminal_ as
+         * @ref Error::InvalidArgument by the feed that saw it.
+         */
+        bool argError_ = false;
         /**
          * @brief The stream's latched terminal verdict, or @ref Error::None while
          *        the stream is still usable (§5.2, §6.3).
          *
-         * @ref error_ and @ref limitExceeded_ live for exactly one @ref feed; this
-         * outlives it. `INVALID` is terminal — §5.2 answers "can more bytes change
-         * it?" with "no — terminal" — and `LimitExceeded` is "a terminal,
-         * receiver-local policy rejection" (§6.3). So once either is the answer it
-         * stays the answer for every later @ref feed, until @ref reset starts a new
-         * message. Without the latch the verdict would depend on where the chunk
+         * @ref error_, @ref limitExceeded_ and @ref argError_ live for exactly one
+         * @ref feed; this outlives it. `INVALID` is terminal — §5.2 answers "can
+         * more bytes change it?" with "no — terminal" — and `LimitExceeded` is "a
+         * terminal, receiver-local policy rejection" (§6.3). `InvalidArgument`
+         * (§6.3's third tier) is terminal for the same reason the other two are:
+         * the field was refused rather than consumed, and letting a later chunk
+         * "recover" it would make the verdict depend on where the chunk boundaries
+         * fell. So once any of the three is the answer it stays the answer for
+         * every later @ref feed, until @ref reset starts a new message. Without the latch the verdict would depend on where the chunk
          * boundaries fell: feed()'s fast path returns before the offending bytes
          * reach @ref acc_ and the next call starts from a clean slate, while the
          * continuation path re-parses them out of @ref acc_ and keeps failing —
@@ -3034,7 +3099,7 @@ namespace sofab
         template <typename Cb>
         void dispatchLevel(Cb &&cb, bool stopAtEnd) noexcept
         {
-            while (p_ < end_ && !error_ && !incomplete_)
+            while (p_ < end_ && !error_ && !argError_ && !incomplete_)
             {
                 /* #26: a sequence's own bulk accrues field by field — bound it as it
                  * grows, catching many-small-fields that no single payload check
@@ -3121,6 +3186,11 @@ namespace sofab
                     return;
                 }
 
+                /* A refusal is not a decline: the field was offered, wanted and
+                 * turned down (§6.3's tiers). Skipping its payload here would walk
+                 * on past a verdict that is already terminal. */
+                if (error_ || limitExceeded_ || argError_) return;
+
                 if (!consumed_)
                 {
                     p_ = payload;
@@ -3130,7 +3200,7 @@ namespace sofab
             /* §7: the bytes ran out with this sequence still open -- INCOMPLETE,
              * not malformed. The whole top-level field is delivered again once the
              * remaining bytes arrive. */
-            if (stopAtEnd && !error_) incomplete_ = true;
+            if (stopAtEnd && !error_ && !argError_) incomplete_ = true;
         }
 
         /**
@@ -3291,12 +3361,16 @@ namespace sofab
             {
                 error_ = false;
                 limitExceeded_ = false;
+                argError_ = false;
                 const uint8_t *stop = parseTopLevel(buffer, buffer + buflen);
                 /* #26: a field over the buffering cap fails as policy — checked
                  * before the incomplete tail is copied into acc_, so a claimed
                  * oversize is rejected even though its payload never arrived. */
                 if (limitExceeded_) { terminal_ = Error::LimitExceeded; return Result{terminal_, skipped_}; }
                 if (error_) { terminal_ = Error::InvalidMessage; return Result{terminal_, skipped_}; }
+                /* §6.3's third tier, last of the three: a destination too short is
+                 * only reached once the message itself is beyond reproach. */
+                if (argError_) { terminal_ = Error::InvalidArgument; return Result{terminal_, skipped_}; }
                 if (stop != buffer + buflen)
                 {
                     /* §7: bytes remain that begin but do not finish a field (or an
@@ -3312,12 +3386,14 @@ namespace sofab
             appendBytes(acc_, buffer, buflen);
             error_ = false;
             limitExceeded_ = false;
+            argError_ = false;
             const uint8_t *base = acc_.data();
             const uint8_t *stop = parseTopLevel(base + topPos_, base + acc_.size());
             /* #26: re-checked from the buffered tail, so the cap is chunk-independent —
              * the same field crosses it whether fed whole or dribbled byte by byte. */
             if (limitExceeded_) { terminal_ = Error::LimitExceeded; return Result{terminal_, skipped_}; }
             if (error_) { terminal_ = Error::InvalidMessage; return Result{terminal_, skipped_}; }
+            if (argError_) { terminal_ = Error::InvalidArgument; return Result{terminal_, skipped_}; }
             topPos_ = static_cast<size_t>(stop - base);
             if (topPos_ == acc_.size()) /* fully drained: COMPLETE */
             {
@@ -3365,6 +3441,7 @@ namespace sofab
             consumed_ = false;
             error_ = false;
             limitExceeded_ = false;
+            argError_ = false;
             terminal_ = Error::None;
             incomplete_ = false;
             declined_ = false;
@@ -3462,7 +3539,7 @@ namespace sofab
                  * offered again -- it said no once, and the answer cannot change.
                  * Only a field whose VALUE was wanted is re-delivered. */
                 if (!declined_) topCallback_(fieldId_, fixLen_, count_);
-                if (error_ || limitExceeded_) return fieldStart;
+                if (error_ || limitExceeded_ || argError_) return fieldStart;
                 /* Not enough bytes yet: rewind to the field header and buffer it. The
                  * whole field is delivered again once it is complete; every generated
                  * destination is either reset wholesale (readArray, prepare()) or
@@ -4093,11 +4170,18 @@ namespace sofab
             { error_ = true; return false; }
             if constexpr (requires { value.set_len(size_t{}); S::capacity(); })
             {
-                /* A heap-free destination is sized by the schema, so a payload past
-                 * its capacity is the §7.1 reject -- never a silent truncation, and
-                 * never a resize. Checked before any byte is written, so a rejected
+                /* §6.3's THIRD refusal tier. Both bounds that can speak about the
+                 * message have already spoken -- the schema `maxlen` above, and the
+                 * receiver cap wherever generated code applies one -- so a payload
+                 * that still does not fit is neither malformed nor over a
+                 * configured limit: it does not fit THIS CALLER'S destination.
+                 * "`InvalidMessage` would mark a well-formed message malformed --
+                 * the same bytes decode for a caller who passes a larger
+                 * destination ... `LimitExceeded` would promise a limit to raise
+                 * that was never configured." (§6.3). Never a silent truncation and
+                 * never a resize; checked before any byte is written, so a refused
                  * field leaves the destination alone (§7.4). */
-                if (fixLen_ > S::capacity()) { error_ = true; return false; }
+                if (fixLen_ > S::capacity()) { argError_ = true; return false; }
                 if (static_cast<size_t>(end_ - p_) < fixLen_)
                 { incomplete_ = true; return false; }
 #if SOFAB_STRICT_UTF8
@@ -4145,8 +4229,9 @@ namespace sofab
             }
             if constexpr (requires { value.set_len(size_t{}); B::capacity(); })
             {
-                /* §7.1 over-capacity reject, as in readString. */
-                if (fixLen_ > B::capacity()) { error_ = true; return false; }
+                /* §6.3's third tier, as in readString: the destination is too
+                 * short for a value the message and the deployment both allow. */
+                if (fixLen_ > B::capacity()) { argError_ = true; return false; }
                 std::memcpy(value.data(), p_, fixLen_);
                 value.set_len(fixLen_);
             }
@@ -4168,14 +4253,14 @@ namespace sofab
          *    id; nothing else runs, so neither bound below can be applied to a field
          *    that is not this field's value.
          * 2. **Schema `count`** (§7.1/§5.2) → `INVALID`. Malformed input.
-         * 3. **Receiver capacity** → `LimitExceeded`. Two ceilings of one kind: the
-         *    configured policy cap (@p dynCap, generator#102), and — for a
-         *    destination that publishes one — its own capacity, so a count it
-         *    cannot hold is refused instead of silently truncated into it
-         *    (MESSAGE_SPEC §3). Deliberately *not* INVALID: the bytes are fine and
-         *    the same message decodes into a growable destination. The one
-         *    exception is a capacity passed *under* a declared `count`, where the
-         *    schema governs and the verdict stays step 2's `INVALID`.
+         * 3. **Configured receiver cap** (@p dynCap, §6.2.1) → `LimitExceeded`.
+         *    Deliberately *not* INVALID: the bytes are fine and the same message
+         *    decodes under a looser cap.
+         * 3b. **The destination's own capacity**, for a destination that publishes
+         *    one → `InvalidArgument` (§6.3's third tier, §6.6.3): a count it cannot
+         *    hold is refused instead of silently truncated into it (MESSAGE_SPEC
+         *    §3), and by this point neither the schema nor the deployment has
+         *    anything left to object to — only this caller's storage.
          * 4. **Reset, then fill.** The destination is resized (dynamic container) or
          *    value-initialized (fixed extent) only now, so an occurrence skipped at
          *    step 1 cannot wipe a valid earlier one (§7.4). A destination pre-sized
@@ -4236,20 +4321,21 @@ namespace sofab
              * silently missing (issue #81). The same gate readString / readBlob
              * already apply to a FixedString / FixedBytes payload.
              *
-             * Which category depends on where the ceiling comes from. With no
-             * declared `count` the capacity is the receiver's own technical limit
-             * and the message is well-formed — the same bytes decode into a
-             * growable destination — so §6.2.1 / §6.3 make it LimitExceeded and
-             * forbid folding it into INVALID. With a `count` declared the schema
-             * governs (§7.1): a destination narrower than the bound it was
-             * generated for cannot hold a legal value either way, and the verdict
-             * stays the INVALID that the same field's over-count payload gets at
-             * step 2. */
+             * The category is §6.3's THIRD tier, and it does not depend on where
+             * the ceiling came from: both bounds that speak about the *message*
+             * have already spoken by the time this runs — the schema `count` at
+             * step 2 and the configured cap at step 3 — so what is left is a
+             * destination too short for a value both of them admit. That is
+             * `InvalidArgument`: "The third is a mistake in the **call**, not a
+             * property of the message or of the deployment, and the other two
+             * codes each say something untrue about it." (§6.3). This used to
+             * report INVALID under a declared `count` and LimitExceeded without
+             * one — two answers, neither of them this one (A2-0022). */
             if constexpr (constexpr long destCap = detail::destCapacity<T>(); destCap >= 0)
             {
                 if (count_ > static_cast<size_t>(destCap))
                 {
-                    (schemaCount >= 0 ? error_ : limitExceeded_) = true;
+                    argError_ = true;
                     return false;
                 }
             }
