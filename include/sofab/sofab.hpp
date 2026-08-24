@@ -1169,28 +1169,26 @@ namespace sofab
          *        whose header has not been written yet (@ref sequenceBeginLazy).
          *
          * Always a contiguous suffix of the open sequences — writing any field
-         * commits the whole run at once — and it grows **without a bound of its
-         * own**: CORELIB_PLAN §6 ("How deep the hold-back reaches") lets only a
-         * heap-free profile stop holding back at some depth and frame eagerly
-         * beyond it, at the cost of canonicality. This port can allocate, so it
-         * holds back to the full @ref MAX_DEPTH and has no eager fallback path.
-         * @ref MAX_DEPTH is what bounds the nesting, hence the run, at 255 ids.
+         * commits the whole run at once — and it is **fixed-size state**
+         * (CORELIB_PLAN §6.6.2), sized to its full extent when the stream is
+         * constructed: "The pending run is fixed-size state (§6.6.2): at most
+         * `MAX_DEPTH` ids, **sized at construction**. An implementation **MUST**
+         * hold back to the full `MAX_DEPTH` (§6.2) and is thereby canonical at
+         * every depth." (§6.0.1, "How deep the hold-back reaches"). @ref MAX_DEPTH
+         * is what bounds the nesting, hence the run; @ref sequenceBeginLazy
+         * refuses past it, so the array below can never be outrun.
          */
         class PendingRun
         {
             /**
-             * Ids up to this depth live inside the stream object; deeper ones
-             * spill onto the heap. This is **not** a window on the hold-back —
-             * nothing about the emitted bytes changes at the boundary, only
-             * where an id is stored — it is the depth up to which the run is
-             * free. Sized for the nesting real schemas reach, so the ordinary
-             * encode allocates nothing, and a stream that never opens a
-             * sequence allocates nothing either.
+             * The whole run, inside the stream object. Deliberately **not**
+             * value-initialized: only the first @ref n_ entries are ever read, so
+             * zeroing a kilobyte on every stream construction would be a cost with
+             * no observable effect (§10 — `encode: typical message` is a
+             * three-figure instruction count, and this array is larger than it).
              */
-            static constexpr size_t kInline = 8;
-            sofab::id inline_[kInline] = {};
-            std::vector<sofab::id> spill_; /**< ids at depth >= kInline, in order */
-            size_t n_ = 0;                 /**< total ids held back */
+            sofab::id ids_[static_cast<size_t>(MAX_DEPTH)];
+            size_t n_ = 0; /**< total ids held back */
 
         public:
             /** @return `true` while no header is held back. */
@@ -1198,33 +1196,21 @@ namespace sofab
             /** @return How many headers are held back. */
             [[nodiscard]] size_t size() const noexcept { return n_; }
             /** @return The @p i-th held-back id, outermost first. */
-            [[nodiscard]] sofab::id operator[](size_t i) const noexcept
-            {
-                return i < kInline ? inline_[i] : spill_[i - kInline];
-            }
+            [[nodiscard]] sofab::id operator[](size_t i) const noexcept { return ids_[i]; }
             /**
              * @brief Hold back one more id (the new innermost open sequence).
              *
-             * Past `kInline` this grows the spill vector, the one allocation
-             * an encode can make. A failed allocation is **reported, not fatal**:
-             * the `bad_alloc` is caught here and turned into a `false`, which
-             * @ref OStreamImpl::sequenceBeginLazy surfaces as
-             * @ref Error::BufferFull. (A build with exceptions disabled has no
-             * such option — there `push_back` on a failed allocation terminates,
-             * as it does anywhere else in that build.)
+             * Allocates nothing — the run was sized at construction. The `false`
+             * return is kept for the caller that already handles it, but it can
+             * only be reached by a push past @ref MAX_DEPTH, which
+             * @ref OStreamImpl::sequenceBeginLazy rejects one step earlier.
              *
-             * @return `true` if the id is held back, `false` if it could not be.
+             * @return `true` if the id is held back, `false` if the run is full.
              */
             [[nodiscard]] bool push(sofab::id v) noexcept
             {
-                if (n_ < kInline) { inline_[n_++] = v; return true; }
-#if defined(__cpp_exceptions) && __cpp_exceptions
-                try { spill_.push_back(v); }
-                catch (...) { return false; }
-#else
-                spill_.push_back(v);
-#endif
-                ++n_;
+                if (n_ >= static_cast<size_t>(MAX_DEPTH)) [[unlikely]] return false;
+                ids_[n_++] = v;
                 return true;
             }
             /** Drop the innermost held-back id — its sequence got no content. */
@@ -1232,10 +1218,9 @@ namespace sofab
             {
                 if (n_ == 0) return;
                 --n_;
-                if (n_ >= kInline) spill_.pop_back();
             }
             /** Forget the whole run (it has just been written out). */
-            void clear() noexcept { n_ = 0; spill_.clear(); }
+            void clear() noexcept { n_ = 0; }
         };
         PendingRun pending_;
         /**
@@ -2143,20 +2128,16 @@ namespace sofab
          * a contentless one survives: @ref sequenceEnd drops it, @ref sequenceEndKeep
          * forces the frame out.
          *
-         * The hold-back has **no depth window**: the pending run grows on demand
-         * to whatever nesting @ref MAX_DEPTH allows, so the output is canonical at
-         * every legal depth (CORELIB_PLAN §6, "How deep the hold-back reaches" —
-         * only a heap-free profile may bound the run and frame eagerly past the
-         * bound). Nesting up to @ref PendingRun's inline depth costs no
-         * allocation at all; deeper runs spill to the heap. If that allocation
-         * fails, the sequence is not opened and the call returns
-         * @ref Error::BufferFull with @ref ok turned false — an exceptions-enabled
-         * build never terminates over it.
+         * The hold-back has **no depth window**: the pending run is sized at
+         * construction to the full @ref MAX_DEPTH, so the output is canonical at
+         * every legal depth and no nesting depth allocates (CORELIB_PLAN §6.0.1,
+         * "How deep the hold-back reaches" — only a constrained profile may bound
+         * the run below @ref MAX_DEPTH and frame eagerly past the bound, and this
+         * port takes no such allowance).
          *
          * @param fieldId Field identifier of the sub-message.
          * @return A @ref Result carrying @ref Error::None on success,
-         *         @ref Error::InvalidArgument past @ref MAX_DEPTH or @ref ID_MAX,
-         *         @ref Error::BufferFull if the hold-back could not grow.
+         *         @ref Error::InvalidArgument past @ref MAX_DEPTH or @ref ID_MAX.
          */
         Result sequenceBeginLazy(sofab::id fieldId) noexcept
         {
@@ -2164,15 +2145,15 @@ namespace sofab
                 return Result{*this, latch(Error::InvalidArgument)};
             if (fieldId > ID_MAX) [[unlikely]]
                 return Result{*this, latch(Error::InvalidArgument)};
-            /* The run grows on demand — no window, no eager fallback. The only
-             * ceiling is the MAX_DEPTH just checked, so the hold-back is
-             * canonical at every legal depth (CORELIB_PLAN §6). Past the run's
-             * inline depth that growth allocates; if the allocation fails the
-             * sequence is NOT opened and the stream is condemned (sticky
-             * @ref failure_), because the caller's matching close would otherwise
-             * end an enclosing sequence instead of this one. */
-            if (!pending_.push(fieldId))
-                return Result{*this, latch(Error::BufferFull)};
+            /* The run is MAX_DEPTH ids wide and was sized at construction — no
+             * window, no eager fallback, no allocator call (CORELIB_PLAN §6.0.1 /
+             * §6.6.2). The MAX_DEPTH check above is what keeps it in range, so the
+             * push cannot fail; the branch stays because a sequence that was NOT
+             * opened must condemn the stream (sticky @ref failure_), the caller's
+             * matching close would otherwise end an enclosing sequence instead of
+             * this one. */
+            if (!pending_.push(fieldId)) [[unlikely]]
+                return Result{*this, latch(Error::InvalidArgument)};
             ++seqDepth_;
             return Result{*this, Error::None};
         }

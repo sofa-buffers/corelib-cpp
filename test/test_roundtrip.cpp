@@ -55,27 +55,21 @@ static int g_checks = 0;
 
 /* --- allocation hook -------------------------------------------------------
  *
- * The encoder is allocation-free except for one place: the held-back sequence
- * run spills to the heap past its inline depth. Replacing global operator new
- * lets holdBackAllocationFailure() both COUNT allocations (proving the shallow
- * path makes none) and fail one on demand (proving a failed spill is reported
- * as an error instead of terminating the process). Under -fno-exceptions the
- * arming flag is never set and this stays a plain counting allocator.
+ * The encoder allocates nothing at all: the held-back sequence run is fixed
+ * MAX_DEPTH state sized at construction (§6.0.1). Replacing global operator new
+ * is what lets the suite MEASURE that -- §6.6.4 requires an allocation count
+ * over a complete encode and a complete decode, not merely a source reading.
  *
  * The byte total beside the count is what messageSeqStorageProfiles() needs: a
  * decoder talked into sizing a row from an announced count allocates ONCE, so
  * the count alone cannot tell a 3-element row from a 2^31-element one. */
 static unsigned long g_allocCount = 0;
 static unsigned long g_allocBytes = 0;
-static bool g_failNextAlloc = false;
 
 void *operator new(size_t n)
 {
     ++g_allocCount;
     g_allocBytes += n;
-#if defined(__cpp_exceptions) && __cpp_exceptions
-    if (g_failNextAlloc) { g_failNextAlloc = false; throw std::bad_alloc(); }
-#endif
     if (n == 0) n = 1;
     void *p = std::malloc(n);
 #if defined(__cpp_exceptions) && __cpp_exceptions
@@ -2154,53 +2148,67 @@ static void bufferFullCondemnsTheRun()
     }
 }
 
-/* --- the hold-back's own allocation: past the run's inline depth the ids spill
- *     to the heap, and a failed allocation there must be REPORTED (BufferFull +
- *     ok() == false), never fatal. Needs exceptions to observe: the replacement
- *     operator new below throws on demand. --- */
+/* --- the hold-back is FIXED-SIZE STATE, sized at construction ---------------
+ *
+ * CORELIB_PLAN §6.0.1: "The pending run is fixed-size state (§6.6.2): at most
+ * `MAX_DEPTH` ids, **sized at construction**. An implementation **MUST** hold
+ * back to the full `MAX_DEPTH` (§6.2) and is thereby canonical at every depth",
+ * and §6.6 forbids growing such state afterwards "even where the ceiling it
+ * grows towards is correct: a pending run that doubles as nesting deepens
+ * allocates on a `write` path, and that is what this section forbids".
+ *
+ * This used to assert zero allocations for the first eight opens and then fail
+ * the ninth allocation on purpose — the assertion stopped exactly where the
+ * violation started (A2-0017). It now runs the whole legal depth range. --- */
 
-static void holdBackAllocationFailure()
+static void holdBackIsFixedSizeState()
 {
-#if defined(__cpp_exceptions) && __cpp_exceptions
-    sofab::OStreamInline<64> os;
+    /* Every legal depth, opened and closed, with the counter armed AFTER
+     * construction (§6.6.4: "measured after the codec's one-time
+     * construction"). MAX_DEPTH starts + one field + MAX_DEPTH ends. */
+    {
+        sofab::OStreamInline<1024> os;
+        g_allocCount = 0;
+        g_allocBytes = 0;
+        int opened = 0;
+        for (int i = 0; i < sofab::MAX_DEPTH; ++i)
+            if (os.sequenceBeginLazy(sofab::id(1)).ok()) ++opened;
+        os.write(0, uint64_t{42});
+        for (int i = 0; i < sofab::MAX_DEPTH; ++i) os.sequenceEnd();
+        CHECK(opened == sofab::MAX_DEPTH, "hold-back: every legal depth opens");
+        CHECK(os.ok(), "hold-back: nesting to MAX_DEPTH encodes cleanly");
+        CHECK(g_allocCount == 0,
+              "hold-back: nesting to MAX_DEPTH allocates nothing (§6.0.1/§6.6.2)");
+    }
 
-    /* the shallow part of the run must not allocate at all */
-    g_allocCount = 0;
-    int opened = 0;
-    for (int i = 0; i < 8; ++i)
-        if (os.sequenceBeginLazy(sofab::id(1)).ok()) ++opened;
-    CHECK(opened == 8, "hold-back: the inline levels all open");
-    CHECK(g_allocCount == 0, "hold-back: nesting to the inline depth allocates nothing");
+    /* One past MAX_DEPTH is refused as an argument error -- the run is never
+     * asked to grow, and the refused level is NOT opened. */
+    {
+        sofab::OStreamInline<1024> os;
+        for (int i = 0; i < sofab::MAX_DEPTH; ++i) (void)os.sequenceBeginLazy(sofab::id(1));
+        g_allocCount = 0;
+        const auto refused = os.sequenceBeginLazy(sofab::id(2));
+        CHECK(refused.code() == sofab::Error::InvalidArgument,
+              "hold-back: an open past MAX_DEPTH is InvalidArgument");
+        CHECK(g_allocCount == 0, "hold-back: a refused open allocates nothing");
+    }
 
-    /* the next one spills -- fail that allocation */
-    g_failNextAlloc = true;
-    const auto refused = os.sequenceBeginLazy(sofab::id(2));
-    g_failNextAlloc = false;
-    CHECK(refused.code() == sofab::Error::BufferFull,
-          "hold-back: a failed spill allocation is reported as BufferFull");
-    CHECK(!refused.ok() && !os.ok(),
-          "hold-back: a failed spill allocation condemns the stream");
-
-    /* the refused level was NOT opened: writing now commits exactly the eight
-     * ids that were accepted. */
-    os.write(0, uint64_t{42});
-    CHECK(toHex(std::span<const uint8_t>(os.data(), os.bytesUsed())) == "0e0e0e0e0e0e0e0e002a",
-          "hold-back: a refused open leaves the run untouched");
-
-    /* and a spill that CAN allocate still works (same stream, deeper) */
+    /* A run deeper than the old inline window still reaches the wire in order:
+     * what used to spill to the heap is now plain fixed state. */
     {
         sofab::OStreamInline<64> deep;
+        g_allocCount = 0;
         int ok = 0;
         for (int i = 0; i < 12; ++i)
             if (deep.sequenceBeginLazy(sofab::id(1)).ok()) ++ok;
         deep.write(0, uint64_t{42});
         for (int i = 0; i < 12; ++i) deep.sequenceEnd();
-        CHECK(ok == 12 && deep.ok(), "hold-back: a spill that allocates succeeds");
+        CHECK(ok == 12 && deep.ok(), "hold-back: a 12-deep run succeeds");
+        CHECK(g_allocCount == 0, "hold-back: a 12-deep run allocates nothing");
         CHECK(toHex(std::span<const uint8_t>(deep.data(), deep.bytesUsed())) ==
                   "0e0e0e0e0e0e0e0e0e0e0e0e002a070707070707070707070707",
-              "hold-back: the spilled ids reach the wire in order");
+              "hold-back: the held-back ids reach the wire in order");
     }
-#endif
 }
 
 /* --- depth bookkeeping: BOTH closers must give the nesting budget back, or a
@@ -6100,7 +6108,7 @@ int main()
     lazySequenceFraming();
     deepHoldBack();
     bufferFullCondemnsTheRun();
-    holdBackAllocationFailure();
+    holdBackIsFixedSizeState();
     sequenceDepthBookkeeping();
     maxDepth();
     bufferLimits();
