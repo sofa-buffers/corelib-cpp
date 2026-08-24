@@ -2538,6 +2538,25 @@ namespace sofab
          * withheld, so it can be judged without being materialised.
          */
         size_t max_buffered_field = SIZE_MAX;
+
+        /**
+         * @brief §6.2.1's `max_dyn_array_count`: the cap on the element **index**
+         *        of a schema-unbounded wrapper array. `SIZE_MAX` (the default)
+         *        means no cap.
+         *
+         * A wrapper array has no count header, so there is nothing else for a cap
+         * to bind: "a wrapper array's length is *highest present id + 1*
+         * (MESSAGE_SPEC §5.1), so the index is what has to be checked". Breaching
+         * it is @ref Error::LimitExceeded — a policy rejection, never `INVALID`.
+         *
+         * It is the **fallback** for a collector that declares no `dynCap` of its
+         * own: generated code, which knows the schema, states the cap per field;
+         * a caller driving the corelib directly (§6.1's other audience) states it
+         * once here. Like @ref max_buffered_field it is a mechanism, not a number
+         * the codec invents — §6.2.1 puts the values in generated code — and it is
+         * never applied to a field the schema already bounds.
+         */
+        size_t max_dyn_array_count = SIZE_MAX;
     };
 
     /**
@@ -2739,7 +2758,19 @@ namespace sofab
         size_t skipped_ = 0;           /**< §7.3 type-mismatch skips seen so far (@ref skipped). */
         bool incomplete_ = false;      /**< The field being delivered needs more bytes (§7 INCOMPLETE, not malformed). */
         bool declined_ = false;        /**< The buffered field was already offered and not read: skip it, do not deliver again. */
-        long elemBound_ = -1;          /**< Element-index bound of the wrapper sequence being read (§5.1); -1 = none. */
+        /**
+         * @brief The tightest armed element-index bound of the wrapper sequence
+         *        being read (§5.1); -1 = none.
+         *
+         * A fast gate only — it answers "is any bound crossed?" in one compare.
+         * Which of §6.3's three tiers a crossing belongs to is decided by
+         * @ref rejectElementIndex from the three bounds below, and only once a
+         * crossing has actually happened.
+         */
+        long elemBound_ = -1;
+        long elemSchema_ = -1; /**< Schema `count` N: an id at or past it is `InvalidMessage` (§7.1). */
+        long elemDyn_ = -1;    /**< Configured `max_dyn_array_count`: `LimitExceeded` (§6.2.1). */
+        long elemDest_ = -1;   /**< The destination container's own capacity: `InvalidArgument` (§6.6.3). */
         int elemWire_ = -1;            /**< §7.3 wire type its elements must carry (a @ref Wire as int); -1 = the collector decides the bound itself. */
         int elemFix_ = -1;             /**< §7.3 fixlen subtype for that element type (a @ref Fix as int); -1 = the element type has none. */
         sofab::id fieldId_ = 0;        /**< Id of the field being delivered. */
@@ -2747,6 +2778,7 @@ namespace sofab
 
         /** Cap on the reassembly buffer's growth for one incomplete field (@ref Limits::max_buffered_field). */
         size_t maxBufferedField_ = SIZE_MAX;
+        long maxDynArrayCount_ = -1; /**< §6.2.1 index cap fallback; -1 = none (@ref Limits::max_dyn_array_count). */
 
 
         std::function<void(sofab::id, size_t, size_t)> topCallback_; /**< Delivers each top-level field. */
@@ -2754,7 +2786,15 @@ namespace sofab
         /** Construct an empty stream; a derived class installs @ref topCallback_. */
         IStreamImpl() noexcept = default;
         /** Construct with receiver-side @ref Limits; a derived class installs @ref topCallback_. */
-        explicit IStreamImpl(Limits limits) noexcept : maxBufferedField_(limits.max_buffered_field) {}
+        explicit IStreamImpl(Limits limits) noexcept
+            : maxBufferedField_(limits.max_buffered_field),
+              maxDynArrayCount_(limits.max_dyn_array_count == SIZE_MAX
+                                    ? -1L
+                                    : static_cast<long>(limits.max_dyn_array_count >
+                                                                static_cast<size_t>(ID_MAX)
+                                                            ? static_cast<size_t>(ID_MAX)
+                                                            : limits.max_dyn_array_count))
+        {}
 
         /**
          * @brief Read one varint, given that a full varint window is in the buffer.
@@ -3138,7 +3178,7 @@ namespace sofab
                     static_cast<long>(fieldId) >= elemBound_)
                 {
                     if (static_cast<int>(type_) != elemWire_) { skipElem = true; ++skipped_; }
-                    else if (type_ != Wire::Fixlen) { error_ = true; return; }
+                    else if (type_ != Wire::Fixlen) { rejectElementIndex(fieldId); return; }
                     else boundPending = true; /* decided at the fixlen word */
                 }
 
@@ -3160,7 +3200,7 @@ namespace sofab
                 {
                     if (elemFix_ >= 0 && static_cast<int>(fixType_) != elemFix_)
                     { skipElem = true; ++skipped_; }
-                    else { error_ = true; return; }
+                    else { rejectElementIndex(fieldId); return; }
                 }
 
                 consumed_ = false;
@@ -3448,6 +3488,9 @@ namespace sofab
             seqDepth_ = 0;
             skipped_ = 0;
             elemBound_ = -1;
+            elemSchema_ = -1;
+            elemDyn_ = -1;
+            elemDest_ = -1;
             elemWire_ = -1;
             elemFix_ = -1;
         }
@@ -3480,6 +3523,52 @@ namespace sofab
          * no-op outside a @ref feed since every feed clears the flag on entry.
          */
         void exceedLimit() noexcept { limitExceeded_ = true; }
+
+        /**
+         * @brief Refuse the current field because the caller's **destination** is
+         *        too short for it (§6.3's third refusal tier, §6.6.3).
+         *
+         * The sibling of @ref invalidate and @ref exceedLimit, for the one refusal
+         * that is about neither the message nor the deployment: the value broke no
+         * schema bound and no configured cap, and simply does not fit the storage
+         * this caller handed over. §6.3: "`InvalidMessage` would mark a well-formed
+         * message malformed … `LimitExceeded` would promise a limit to raise that
+         * was never configured." The surrounding @ref feed stops dispatching and
+         * returns @ref Error::InvalidArgument. Idempotent; a no-op outside a
+         * @ref feed since every feed clears the flag on entry.
+         */
+        void rejectDestination() noexcept { argError_ = true; }
+
+        /**
+         * @return The configured cap on a wrapper array's element index
+         *         (@ref Limits::max_dyn_array_count, §6.2.1), or -1 when none was
+         *         configured. The fallback a collector uses when it declares no
+         *         `dynCap` of its own.
+         */
+        [[nodiscard]] long dynArrayCap() const noexcept { return maxDynArrayCount_; }
+
+        /**
+         * @brief Refuse a wrapper-array element whose **index** is at or past a
+         *        bound, in the category §6.3 gives that bound.
+         *
+         * MESSAGE_SPEC §5.1 makes a wrapper array's length *highest present id +
+         * 1*, so the element index **is** the length and is what has to be
+         * checked — "A limit **MUST** be enforced … before the container it
+         * indexes into is extended" (§6.2.1). Three bounds can be armed at once
+         * and they do not share a verdict, so they are consulted in §6.3's order:
+         * the schema `count` first (`InvalidMessage`), then the configured
+         * receiver cap (`LimitExceeded`), then the destination's own capacity
+         * (`InvalidArgument`).
+         *
+         * @param bad The element index that crossed a bound.
+         */
+        void rejectElementIndex(sofab::id bad) noexcept
+        {
+            const long i = static_cast<long>(bad);
+            if (elemSchema_ >= 0 && i >= elemSchema_)   error_ = true;
+            else if (elemDyn_ >= 0 && i >= elemDyn_)    limitExceeded_ = true;
+            else                                        argError_ = true;
+        }
 
 
     protected:
@@ -4065,8 +4154,30 @@ namespace sofab
                  * caller would not expect the re-delivery that follows. */
                 const bool outerConsumed = consumed_;
                 consumed_ = false;
-                if constexpr (requires { value.cap; }) elemBound_ = value.cap;
-                else                                   elemBound_ = -1;
+                /* Three bounds, three categories (§6.3), one fast gate. A
+                 * collector declares the schema `count` as `cap`, the configured
+                 * receiver cap as `dynCap` (§6.2.1's `max_dyn_array_count` — the
+                 * INDEX is what it binds, a wrapper array having no count header
+                 * to bind) and the destination's own capacity as the static
+                 * `elemDestCap`. @ref elemBound_ is the tightest armed one, so the
+                 * per-element test stays a single compare; @ref rejectElementIndex
+                 * sorts out which tier spoke, and only when one has. */
+                const long outerSchema = elemSchema_, outerDyn = elemDyn_, outerDest = elemDest_;
+                if constexpr (requires { value.cap; }) elemSchema_ = value.cap;
+                else                                   elemSchema_ = -1;
+                if constexpr (requires { value.dynCap; })
+                    elemDyn_ = value.dynCap >= 0 ? value.dynCap : maxDynArrayCount_;
+                else
+                    elemDyn_ = maxDynArrayCount_;
+                if constexpr (requires { T::elemDestCap; }) elemDest_ = static_cast<long>(T::elemDestCap);
+                else                                        elemDest_ = -1;
+                /* §6.2.1: a receiver limit "MUST NOT be applied to a field the
+                 * schema already bounds. There the schema bound governs and its
+                 * violation is INVALID." */
+                if (elemSchema_ >= 0) elemDyn_ = -1;
+                elemBound_ = -1;
+                for (long b : {elemSchema_, elemDyn_, elemDest_})
+                    if (b >= 0 && (elemBound_ < 0 || b < elemBound_)) elemBound_ = b;
                 if constexpr (requires { T::elemWire; }) elemWire_ = static_cast<int>(T::elemWire);
                 else                                     elemWire_ = -1;
                 if constexpr (requires { T::elemFix; })  elemFix_ = static_cast<int>(T::elemFix);
@@ -4082,6 +4193,9 @@ namespace sofab
                     value.deserialize(*this, i, s, c);
                 }, /*stopAtEnd*/ true);
                 elemBound_ = outerBound;
+                elemSchema_ = outerSchema;
+                elemDyn_ = outerDyn;
+                elemDest_ = outerDest;
                 elemWire_ = outerElemWire;
                 elemFix_ = outerElemFix;
                 --seqDepth_;
@@ -4600,6 +4714,60 @@ namespace sofab
     /* Wrapper-sequence collectors and encode helpers                         */
     /* ---------------------------------------------------------------------- */
 
+    namespace detail
+    {
+        /**
+         * @brief Admit or refuse a wrapper-array element **index**, in §6.3's
+         *        categories, before the container it indexes into is extended.
+         *
+         * MESSAGE_SPEC §5.1 makes the array's length *highest present id + 1*, so
+         * the index **is** the length: "for a **sequence array** it surfaces the
+         * **index** of the element in hand … there being no count header to
+         * check", and "A limit **MUST** be enforced … before the container it
+         * indexes into is extended" (§6.2.1).
+         *
+         * The three bounds do not share a verdict, so they are consulted in
+         * §6.3's order. A schema `count` shuts the receiver cap out entirely —
+         * a receiver limit "**MUST NOT** be applied to a field the schema already
+         * bounds" (§6.2.1).
+         *
+         * The stream applies the same three bounds one step earlier, at the
+         * element header (@ref IStreamImpl::rejectElementIndex), which is where a
+         * truncated element cannot outrun them. This is the second gate, for a
+         * `deserialize` reached directly — it is a public entry point — and for a
+         * collector that publishes no element type for the stream to key on.
+         *
+         * @param is       Stream to record the refusal on.
+         * @param id       The element index in hand.
+         * @param cap      Schema `count` N, or negative.
+         * @param dynCap   Configured `max_dyn_array_count`, or negative to fall
+         *                 back to the stream's own @ref IStreamImpl::dynArrayCap.
+         * @param destCap  The destination container's capacity, or negative.
+         * @return `true` when the index may be placed.
+         */
+        inline bool seqIndexAdmitted(IStreamImpl &is, sofab::id id, long cap, long dynCap,
+                                     long destCap) noexcept
+        {
+            const long i = static_cast<long>(id);
+            const long dyn = dynCap >= 0 ? dynCap : is.dynArrayCap();
+            if (cap >= 0)
+            {
+                if (i >= cap) { is.invalidate(); return false; } /* §7.1 */
+            }
+            else if (dyn >= 0 && i >= dyn)
+            {
+                is.exceedLimit(); /* §6.2.1 — policy, never INVALID */
+                return false;
+            }
+            if (destCap >= 0 && i >= destCap)
+            {
+                is.rejectDestination(); /* §6.3's third tier */
+                return false;
+            }
+            return true;
+        }
+    } // namespace detail
+
     /**
      * @brief Collects the elements of a `string` wrapper-sequence array.
      *
@@ -4628,6 +4796,40 @@ namespace sofab
         C &out;
         long cap;
         long emax;
+        /**
+         * @brief The configured receiver cap on the element **index**
+         *        (`max_dyn_array_count`, §6.2.1); negative means none.
+         *
+         * A wrapper array carries no count header, so there is no count word for a
+         * cap to bind: "for a **sequence array** it surfaces the **index** of the
+         * element in hand — a wrapper array's length is *highest present id + 1*
+         * (MESSAGE_SPEC §5.1), so the index is what has to be checked, there being
+         * no count header to check." An id at or past this is
+         * @ref Error::LimitExceeded, decided **before** @ref out is extended, so an
+         * announced index never becomes an allocation.
+         *
+         * Deliberately **not** @ref cap: `cap` is the schema `count` and its
+         * breach is `InvalidMessage` — the bytes contradict the schema both peers
+         * agreed on — while this is a *policy* rejection the same bytes survive
+         * under a looser cap, and §6.2.1 forbids folding the two. It is also
+         * ignored while `cap` is armed, since a receiver limit "MUST NOT be
+         * applied to a field the schema already bounds". The number itself is
+         * generated code's to supply (§6.2.1: "The numbers and the allocation are
+         * not the codec's"), which is why the default is "no cap" rather than an
+         * invented one. (corelib-cpp#124)
+         */
+        long dynCap = -1;
+
+        /**
+         * @brief The destination's own capacity, or -1 for a growable container.
+         *
+         * §6.3's third tier: an index the container cannot hold, with neither the
+         * schema nor the deployment objecting, is @ref Error::InvalidArgument. For
+         * a fixed-capacity container this is also what keeps the placement loop
+         * below terminating — @ref InlineVector::emplace_back reuses the last slot
+         * once full, so `out.size()` would never pass a large id.
+         */
+        static constexpr long elemDestCap = detail::destCapacity<C>();
 
         /**
          * @brief The declared element type, published to the stream (§7.3).
@@ -4652,8 +4854,9 @@ namespace sofab
          * @param elemMax Element `maxlen`, or -1. A longer element is INVALID
          *                (§7.1), never truncated.
          */
-        explicit StringSeq(C &o, long capacity = -1, long elemMax = -1) noexcept
-            : out(o), cap(capacity), emax(elemMax) {}
+        explicit StringSeq(C &o, long capacity = -1, long elemMax = -1,
+                           long indexCap = -1) noexcept
+            : out(o), cap(capacity), emax(elemMax), dynCap(indexCap) {}
 
         /**
          * §7.4: the sequence IS the array's value, so a repeated field id replaces
@@ -4691,6 +4894,7 @@ namespace sofab
              * temporary is a stack object, so this costs no allocation. */
             typename C::value_type s{};
             if (!is.readString(s, emax)) return;
+            if (!detail::seqIndexAdmitted(is, id, cap, dynCap, elemDestCap)) return;
             while (out.size() <= static_cast<size_t>(id)) out.emplace_back();
             out[static_cast<size_t>(id)] = std::move(s);
         }
@@ -4709,6 +4913,10 @@ namespace sofab
         C &out;
         long cap;
         long emax;
+        /** @copydoc StringSeq::dynCap */
+        long dynCap = -1;
+        /** @copydoc StringSeq::elemDestCap */
+        static constexpr long elemDestCap = detail::destCapacity<C>();
 
         /** @copydoc StringSeq::elemWire */
         static constexpr int elemWire = static_cast<int>(detail::Wire::Fixlen);
@@ -4716,8 +4924,9 @@ namespace sofab
         static constexpr int elemFix = static_cast<int>(detail::Fix::Blob);
 
         /** @copydoc StringSeq::StringSeq */
-        explicit BlobSeq(C &o, long capacity = -1, long elemMax = -1) noexcept
-            : out(o), cap(capacity), emax(elemMax) {}
+        explicit BlobSeq(C &o, long capacity = -1, long elemMax = -1,
+                         long indexCap = -1) noexcept
+            : out(o), cap(capacity), emax(elemMax), dynCap(indexCap) {}
 
         /** @copydoc StringSeq::prepare */
         void prepare() noexcept { out.clear(); }
@@ -4728,6 +4937,7 @@ namespace sofab
             /* Temporary first, then place -- see StringSeq::deserialize. */
             typename C::value_type b{};
             if (!is.readBlob(b, emax)) return; /* §7.3 + §7.1, see StringSeq */
+            if (!detail::seqIndexAdmitted(is, id, cap, dynCap, elemDestCap)) return;
             while (out.size() <= static_cast<size_t>(id)) out.emplace_back();
             out[static_cast<size_t>(id)] = std::move(b);
         }
@@ -4798,15 +5008,20 @@ namespace sofab
         Container *out = nullptr;  /**< Destination; a null one collects nothing. */
 
         /**
-         * @brief Schema `count` N, or -1; an id at or past N is INVALID (§5.1/§7).
+         * @brief Schema `count` N, or -1; an id at or past N is
+         *        @ref Error::InvalidMessage (§5.1/§7.1).
          *
-         * Defaults to the destination's own capacity when it publishes one
-         * (@ref detail::destCapacity), so a heap-free container arrives bounded
-         * even when the caller declares nothing — its `emplace_back` reuses the
-         * last slot once full, which is a length the gap fill below would never
-         * reach. `-1`, i.e. unbounded, for a growable container, as before.
+         * It used to default to the destination's own capacity, which bounded a
+         * heap-free container but reported the wrong category for it: a
+         * destination too short is neither a malformed message nor a configured
+         * limit. That bound now lives in @ref elemDestCap, in §6.3's third
+         * category, and this member carries only what the **schema** said.
          */
-        long cap = detail::destCapacity<Container>();
+        long cap = -1;
+        /** @copydoc StringSeq::dynCap */
+        long dynCap = -1;
+        /** @copydoc StringSeq::elemDestCap */
+        static constexpr long elemDestCap = detail::destCapacity<Container>();
 
         /**
          * @brief The declared element type, published to the stream (§7.3), as
@@ -4854,20 +5069,13 @@ namespace sofab
             {
                 if (static_cast<int>(is.wire()) != elemWire) return; /* §7.3 */
             }
-            /* §5.1/§7 over-index reject, decided from the id alone and before the
-             * container grows, which is also what keeps an announced index from
-             * becoming an allocation. The bound is `cap`, and the container's own
-             * capacity whenever `cap` declares none: a heap-free destination must be
-             * bounded by something, since its `emplace_back` stops advancing at the
-             * capacity and the gap fill would then never reach the id. Growable
-             * containers fold this to the `cap` test they had. */
-            constexpr long fixedCap = detail::destCapacity<Container>();
-            if (const long bound = cap >= 0 ? cap : fixedCap;
-                bound >= 0 && static_cast<size_t>(id) >= static_cast<size_t>(bound))
-            {
-                is.invalidate();
-                return;
-            }
+            /* §5.1/§6.2.1 over-index reject, decided from the id alone and before
+             * the container grows, which is also what keeps an announced index from
+             * becoming an allocation — and, for a fixed-capacity container, what
+             * keeps the gap fill below terminating at all, its `emplace_back`
+             * stopping at the capacity so `out->size()` would never reach the id.
+             * Three bounds, three categories (§6.3). */
+            if (!detail::seqIndexAdmitted(is, id, cap, dynCap, elemDestCap)) return;
             /* §5.1: the element id IS the array index, so an element is PLACED at
              * `dest[id]`, never appended. The ids may contain gaps -- a decoder
              * MUST accept them and recover a dynamic array's length as *highest

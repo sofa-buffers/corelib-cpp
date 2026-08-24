@@ -3432,6 +3432,220 @@ struct F41GenMsg : sofab::IStreamMessage
     }
 };
 
+/* --- §6.2.1 / §7.2 item 8: a wrapper array's element INDEX is the bound -------
+ *
+ * "for a **sequence array** it surfaces the **index** of the element in hand — a
+ * wrapper array's length is *highest present id + 1* (MESSAGE_SPEC §5.1), so the
+ * index is what has to be checked, there being no count header to check", and
+ * "A limit **MUST** be enforced … before the container it indexes into is
+ * extended."
+ *
+ * Before A2-0018 / corelib-cpp#124 the leaf collectors had no bound at all:
+ * `StringSeq` into a `std::vector` turned an eight-byte message into a 134 MB
+ * high-water mark, and into a fixed-capacity container the placement loop never
+ * terminated, because `InlineVector::emplace_back` reuses slot N-1 once full so
+ * `out.size()` never passes the id. --- */
+
+struct CapStringMsg : sofab::IStreamMessage
+{
+    std::vector<std::string> tags;
+    long dynCap = -1;
+    void deserialize(sofab::IStreamImpl &is, sofab::id id, size_t, size_t) noexcept override
+    {
+        if (id == 1) { sofab::StringSeq c{tags, -1, -1, dynCap}; is.read(c); }
+    }
+};
+
+struct CapBlobMsg : sofab::IStreamMessage
+{
+    std::vector<std::vector<uint8_t>> blobs;
+    long dynCap = -1;
+    void deserialize(sofab::IStreamImpl &is, sofab::id id, size_t, size_t) noexcept override
+    {
+        if (id == 1) { sofab::BlobSeq c{blobs, -1, -1, dynCap}; is.read(c); }
+    }
+};
+
+struct FixedStringSeqMsg : sofab::IStreamMessage
+{
+    sofab::InlineVector<sofab::FixedString<8>, 4> tags;
+    void deserialize(sofab::IStreamImpl &is, sofab::id id, size_t, size_t) noexcept override
+    {
+        if (id == 1) { sofab::StringSeq c{tags}; is.read(c); }
+    }
+};
+
+struct CapRowsMsg : sofab::IStreamMessage
+{
+    std::vector<SeqRow> rows;
+    long dynCap = -1;
+    void deserialize(sofab::IStreamImpl &is, sofab::id id, size_t, size_t) noexcept override
+    {
+        if (id == 1)
+        {
+            sofab::MessageSeq<std::vector<SeqRow>> c;
+            c.out = &rows;
+            c.dynCap = dynCap;
+            is.read(c);
+        }
+    }
+};
+
+static void wrapperArrayIndexCaps()
+{
+    /* One `string` element at id 0, one at `id`. */
+    auto strAt = [](uint64_t id) {
+        std::vector<uint8_t> w = {0x0e, 0x02, 0x0a, 'a'};
+        appendVarint(w, (id << 3) | 2u); /* element header: id, Wire::Fixlen */
+        w.push_back(0x0a);               /* fixlen_word: len 1, Fix::String  */
+        w.push_back('b');
+        w.push_back(0x07);
+        return w;
+    };
+
+    /* --- the growable destination, with the cap generated code supplies. --- */
+    {
+        const auto w = strAt(3); /* cap - 1: the last legal index */
+        sofab::IStreamObject<CapStringMsg> in;
+        (*in).dynCap = 4;
+        CHECK(in.feed(w.data(), w.size()).complete(), "index cap: id == cap-1 decodes COMPLETE");
+        CHECK((*in).tags.size() == 4 && (*in).tags[3] == "b",
+              "index cap: the array is cap long, the gap filled with the element default");
+    }
+    {
+        const auto w = strAt(4); /* the cap itself */
+        sofab::IStreamObject<CapStringMsg> in;
+        (*in).dynCap = 4;
+        const unsigned long before = g_allocCount;
+        auto r = in.feed(w.data(), w.size());
+        CHECK(r.limitExceeded() && !r.invalid() && !r.invalidArgument(),
+              "index cap: id == cap is LimitExceeded, not INVALID (§6.2.1)");
+        CHECK((*in).tags.size() <= 1,
+              "index cap: the container is not left extended toward the rejected index");
+        CHECK(g_allocCount - before <= 1,
+              "index cap: the rejected index is refused before the container grows");
+    }
+    {
+        /* the amplification shape, with a cap in place: eight bytes naming a
+         * four-million-element index allocate nothing. */
+        const auto w = strAt(4000000);
+        sofab::IStreamObject<CapStringMsg> in;
+        (*in).dynCap = 4;
+        const unsigned long before = g_allocBytes;
+        CHECK(in.feed(w.data(), w.size()).limitExceeded(),
+              "index cap: a four-million element index is LimitExceeded");
+        CHECK(g_allocBytes - before < 4096,
+              "index cap: and it commits no memory the sender chose");
+    }
+    {
+        /* §6.2.1: the receiver cap is not applied where the schema bounds the
+         * field -- there the schema governs and its breach is INVALID. */
+        std::vector<uint8_t> w = {0x0e, 0x02, 0x0a, 'a', 0x22, 0x0a, 'b', 0x07}; /* id 4 */
+        std::vector<std::string> tags;
+        struct BoundedIdxMsg : sofab::IStreamMessage
+        {
+            std::vector<std::string> *out;
+            void deserialize(sofab::IStreamImpl &is, sofab::id id, size_t, size_t) noexcept override
+            {   /* schema `count: 4` AND a looser receiver cap of 8 */
+                if (id == 1) { sofab::StringSeq c{*out, 4, -1, 8}; is.read(c); }
+            }
+        };
+        BoundedIdxMsg m;
+        m.out = &tags;
+        sofab::IStreamInline is([&](sofab::id i, size_t sz, size_t c) { m.deserialize(is, i, sz, c); });
+        auto r = is.feed(w.data(), w.size());
+        CHECK(r.invalid() && !r.limitExceeded(),
+              "index cap: under a declared `count` the breach stays INVALID (§6.2.1)");
+    }
+
+    /* --- the fixed-capacity destination: the loop that used to hang. --- */
+    {
+        const auto w = strAt(4); /* capacity is 4, so id 4 is one past it */
+        sofab::IStreamObject<FixedStringSeqMsg> in;
+        auto r = in.feed(w.data(), w.size());
+        CHECK(r.invalidArgument() && !r.invalid() && !r.limitExceeded(),
+              "index cap: past a fixed destination's capacity is InvalidArgument");
+        CHECK((*in).tags.size() <= 1, "index cap: and the container is not extended for it");
+    }
+    {
+        const auto w = strAt(4000000);
+        sofab::IStreamObject<FixedStringSeqMsg> in;
+        const unsigned long before = g_allocCount;
+        CHECK(in.feed(w.data(), w.size()).invalidArgument(),
+              "index cap: a huge index into a fixed destination terminates, InvalidArgument");
+        CHECK(g_allocCount == before, "index cap: and allocates nothing at all");
+    }
+    {
+        const auto w = strAt(3); /* capacity - 1 still decodes */
+        sofab::IStreamObject<FixedStringSeqMsg> in;
+        CHECK(in.feed(w.data(), w.size()).complete(),
+              "index cap: id == capacity-1 into a fixed destination decodes COMPLETE");
+        CHECK((*in).tags.size() == 4, "index cap: and the array is capacity long");
+    }
+
+    /* --- BlobSeq carries the same bound. --- */
+    {
+        std::vector<uint8_t> w = {0x0e, 0x02, 0x0b, 0x01}; /* id 0, blob {01} */
+        appendVarint(w, (4ull << 3) | 2u);
+        w.push_back(0x0b);
+        w.push_back(0x02);
+        w.push_back(0x07);
+        sofab::IStreamObject<CapBlobMsg> in;
+        (*in).dynCap = 4;
+        auto r = in.feed(w.data(), w.size());
+        CHECK(r.limitExceeded() && !r.invalid(), "index cap: BlobSeq answers LimitExceeded too");
+        CHECK((*in).blobs.size() <= 1, "index cap: BlobSeq does not extend for the rejected index");
+    }
+
+    /* --- MessageSeq: a framed element reaches the container through the
+     *     sequence path, and the bound is the index there too. --- */
+    {
+        /* elements are sub-sequences carrying one unsigned at id 0 */
+        std::vector<uint8_t> w = {0x0e, 0x06, 0x00, 0x05, 0x07}; /* element id 0 */
+        appendVarint(w, (4ull << 3) | 6u);                       /* element id 4, SequenceStart */
+        w.push_back(0x00); w.push_back(0x09); w.push_back(0x07);
+        w.push_back(0x07);
+        sofab::IStreamObject<CapRowsMsg> in;
+        (*in).dynCap = 4;
+        auto r = in.feed(w.data(), w.size());
+        CHECK(r.limitExceeded() && !r.invalid(),
+              "index cap: a struct element at the cap is LimitExceeded");
+        CHECK((*in).rows.size() <= 1, "index cap: and the row container is not extended");
+    }
+
+    /* --- the stream-level fallback: a caller driving the corelib directly
+     *     states the cap once, in Limits, and every collector that declares
+     *     none of its own inherits it (§6.2.1's max_dyn_array_count). --- */
+    {
+        const auto w = strAt(4);
+        sofab::IStreamObject<CapStringMsg> in(sofab::Limits{SIZE_MAX, 4});
+        auto r = in.feed(w.data(), w.size());
+        CHECK(r.limitExceeded() && !r.invalid(),
+              "index cap: Limits::max_dyn_array_count bounds a collector that declares none");
+        CHECK((*in).tags.size() <= 1, "index cap: and the container is not extended for it");
+    }
+    {
+        const auto w = strAt(3);
+        sofab::IStreamObject<CapStringMsg> in(sofab::Limits{SIZE_MAX, 4});
+        CHECK(in.feed(w.data(), w.size()).complete(),
+              "index cap: cap-1 still decodes under the stream-level cap");
+        CHECK((*in).tags.size() == 4, "index cap: and the array is cap long");
+    }
+    {
+        /* the collector's own dynCap wins over the stream's fallback */
+        const auto w = strAt(4);
+        sofab::IStreamObject<CapStringMsg> in(sofab::Limits{SIZE_MAX, 2});
+        (*in).dynCap = 8;
+        CHECK(in.feed(w.data(), w.size()).complete(),
+              "index cap: a collector's own dynCap overrides the stream fallback");
+    }
+
+    checkStreamReuse<CapStringMsg>("CapStringMsg");
+    checkStreamReuse<CapBlobMsg>("CapBlobMsg");
+    checkStreamReuse<FixedStringSeqMsg>("FixedStringSeqMsg");
+    checkStreamReuse<CapRowsMsg>("CapRowsMsg");
+}
+
 /* --- MessageSeq: one collector, both storage profiles ----------------------
  *
  * Templating it on the container is what lets a heap-free destination use it,
@@ -3483,12 +3697,18 @@ static void messageSeqStorageProfiles()
 
     /* --- capacity edges. The heap-free destination declares no `cap`, so its
      *     own capacity is the bound: without one, emplace_back would stop
-     *     advancing at N and the gap fill would never reach the id. --- */
+     *     advancing at N and the gap fill would never reach the id. It is a
+     *     bound in §6.3's THIRD category, not the schema's, so it rides on
+     *     `elemDestCap` rather than on `cap` (A2-0018). --- */
     {
         sofab::MessageSeq<sofab::InlineVector<SeqRow, 3>> fixed;
         sofab::MessageSeq<std::vector<SeqRow>> growable;
-        CHECK(fixed.cap == 3, "a heap-free destination bounds the element id by its capacity");
-        CHECK(growable.cap == -1, "a growable destination stays unbounded unless a count says otherwise");
+        CHECK(fixed.elemDestCap == 3, "a heap-free destination bounds the element id by its capacity");
+        CHECK(fixed.cap == -1, "and it does so without pretending the schema declared a count");
+        CHECK(growable.elemDestCap == -1 && growable.cap == -1,
+              "a growable destination stays unbounded unless a count says otherwise");
+        CHECK(fixed.dynCap == -1 && growable.dynCap == -1,
+              "neither invents a receiver cap of its own (§6.2.1: the numbers are generated code's)");
     }
     {
         /* id == cap - 1 is the last legal index, and it grows the array to N. */
@@ -3500,11 +3720,14 @@ static void messageSeqStorageProfiles()
             CHECK((*in).rows[2].a == 9, "the element at id N-1 lands at index N-1");
     }
     {
-        /* id == cap is one past it: INVALID (§5.1/§7), decided from the id alone,
-         * with nothing placed and nothing grown. */
+        /* id == capacity is one past it: §6.3's third tier (the destination is
+         * too short; the schema declared nothing and no cap was configured),
+         * decided from the id alone, with nothing placed and nothing grown. */
         sofab::IStreamObject<FixedRowsMsg> in;
         auto w = fromHex("0e" "1e00090707");
-        CHECK(in.feed(w.data(), w.size()).invalid(), "an element at id N is INVALID");
+        auto r = in.feed(w.data(), w.size());
+        CHECK(r.invalidArgument() && !r.invalid() && !r.limitExceeded(),
+              "an element past the destination capacity is InvalidArgument");
         CHECK((*in).rows.empty(), "the rejected element grows nothing");
     }
     {
@@ -6265,6 +6488,7 @@ int main()
     strictUtf8();
     messageLayerFraming();
     wrapperArrayCollectors();
+    wrapperArrayIndexCaps();
     messageSeqStorageProfiles();
     overIndexSkipOrdering();
     skippedSubtreeSuspendsBound();
