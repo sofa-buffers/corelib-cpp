@@ -398,13 +398,13 @@ non-canonical empty frame that every decoder normalizes away, a wrong
 `sequenceEnd` silently changes an array's length — so `write` (keep) is the safe
 default and `writeLazy` the deliberate one. Generated code picks per position.
 
-There is no depth window: the pending run grows on demand up to `MAX_DEPTH`
-(255), so the omission is canonical at every legal depth. The held-back ids are
-encoder state, never buffer content, so a flush can never split a run and a tiny
-output buffer yields byte-identical output. Beyond the run's inline depth the
-ids spill to the heap (see [Memory handling](#memory-handling)); a failed
-allocation there is reported, not fatal — the open is refused with
-`Error::BufferFull` and `ok()` turns false.
+There is no depth window: the pending run is a fixed `MAX_DEPTH` array (255 ids)
+inside the stream object, sized when the stream is constructed, so the omission
+is canonical at every legal depth and no depth of nesting allocates. The
+held-back ids are encoder state, never buffer content, so a flush can never
+split a run and a tiny output buffer yields byte-identical output. An open past
+`MAX_DEPTH` is refused with `Error::InvalidArgument`, `ok()` turns false, and
+the sequence is not opened.
 
 ## Memory handling
 
@@ -540,7 +540,7 @@ A decode of a message fed **whole** into fully bounded fields performs no
 allocation at all; `test_roundtrip.cpp`'s `heapFreeStorage()` and
 `allocationMeasurement()` check that against the `operator new` counter. A
 message fed in **chunks** still allocates the reassembly accumulator described
-under [Memory handling](#memory-handling), whatever the destinations are.
+under `## Memory handling` above, whatever the destinations are.
 
 The three types are deliberately identical, in name and behaviour, to
 `corelib-c-cpp`'s, so generated code for a bounded field is the same whichever

@@ -217,9 +217,9 @@ namespace sofab
          * A configured receiver-side limit (§6.2.1) was exceeded on a
          * schema-**unbounded** field. The bytes are **well-formed** — the same
          * message decodes under a looser limit — so this is a *policy* rejection
-         * and **not** @ref Invalid: §6.3 requires an implementation to "keep the
-         * two distinguishable to the caller" and forbids reporting it as
-         * `InvalidMessage`. Terminal.
+         * and **not** @ref DecodeStatus::Invalid — §6.3 requires an implementation
+         * to "keep the two distinguishable to the caller" and forbids reporting
+         * it as `InvalidMessage`. Terminal.
          *
          * §6.3 offers two ways to surface it, "either a **fourth decode
          * outcome**, or a terminal failure carrying the `LimitExceeded` code on
@@ -4852,7 +4852,7 @@ namespace sofab
          * @ref Error::LimitExceeded, decided **before** @ref out is extended, so an
          * announced index never becomes an allocation.
          *
-         * Deliberately **not** @ref cap: `cap` is the schema `count` and its
+         * Deliberately **not** @ref StringSeq::cap — `cap` is the schema `count` and its
          * breach is `InvalidMessage` — the bytes contradict the schema both peers
          * agreed on — while this is a *policy* rejection the same bytes survive
          * under a looser cap, and §6.2.1 forbids folding the two. It is also
@@ -4897,6 +4897,10 @@ namespace sofab
          *                 allocation.
          * @param elemMax Element `maxlen`, or -1. A longer element is INVALID
          *                (§7.1), never truncated.
+         * @param indexCap Configured `max_dyn_array_count` (@ref dynCap), or -1 to
+         *                 fall back to @ref Limits::max_dyn_array_count. An element
+         *                 id at or past it is @ref Error::LimitExceeded, decided
+         *                 before the container grows.
          */
         explicit StringSeq(C &o, long capacity = -1, long elemMax = -1,
                            long indexCap = -1) noexcept
