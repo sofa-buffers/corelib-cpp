@@ -2666,6 +2666,17 @@ static void refusalTiers()
               "tiers: and the verdict is latched on the stream");
     }
 
+    /* Tier order when two apply at once: the configured cap outranks the
+     * destination, because §6.3 lists it first. Here `plain` is over both the
+     * buffering cap and the FixedString<8> capacity. */
+    {
+        const auto w = fixlen(0x12, sofab::detail::Fix::String, "123456789");
+        sofab::IStreamObject<TierMsg> in(sofab::Limits{4});
+        auto r = in.feed(w.data(), w.size());
+        CHECK(r.limitExceeded() && !r.invalidArgument(),
+              "tiers: a configured cap outranks a destination that is also too short");
+    }
+
     /* A value that fits every tier is untouched by any of this. */
     {
         const auto w = fixlen(0x12, sofab::detail::Fix::String, "12345678");

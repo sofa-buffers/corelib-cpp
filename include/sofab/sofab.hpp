@@ -2756,11 +2756,23 @@ namespace sofab
         size_t fixLen_ = 0;            /**< Payload length (fixlen) or element size (fixlen array), in bytes. */
         size_t count_ = 0;             /**< Element count of the current array field. */
         bool consumed_ = false;        /**< Set once the callback has read the current field's value. */
-        bool error_ = false;           /**< Sticky decode-error flag for the current @ref feed. */
-        bool limitExceeded_ = false;   /**< Sticky flag: a field crossed a receiver-side limit this @ref feed. */
         /**
-         * @brief Sticky flag: a well-formed value did not fit the destination the
-         *        caller handed over (§6.3's third refusal tier, §6.6.3).
+         * @brief Sticky "this feed was refused" flag, and the **only** one the
+         *        parse loops test.
+         *
+         * Raised by every refusal, whichever of §6.3's three tiers it belongs to:
+         * @ref invalidate raises it alone, @ref exceedLimit and
+         * @ref rejectDestination raise it alongside their own category flag. That
+         * keeps the per-field test in @ref dispatchLevel and @ref parseTopLevel a
+         * single load — the categories are read once, by @ref feed, when the
+         * parse has already stopped.
+         */
+        bool error_ = false;
+        bool limitExceeded_ = false;   /**< Category: a receiver-side limit was crossed (§6.2.1). Implies @ref error_. */
+        /**
+         * @brief Category: a well-formed value did not fit the destination the
+         *        caller handed over (§6.3's third refusal tier, §6.6.3). Implies
+         *        @ref error_.
          *
          * Lives for exactly one @ref feed, like @ref error_ and
          * @ref limitExceeded_, and is latched into @ref terminal_ as
@@ -3171,14 +3183,14 @@ namespace sofab
         template <typename Cb>
         void dispatchLevel(Cb &&cb, bool stopAtEnd) noexcept
         {
-            while (p_ < end_ && !error_ && !argError_ && !incomplete_)
+            while (p_ < end_ && !error_ && !incomplete_)
             {
                 /* #26: a sequence's own bulk accrues field by field — bound it as it
                  * grows, catching many-small-fields that no single payload check
                  * would trip. */
                 if (maxBufferedField_ != SIZE_MAX && fieldStart_ &&
                     exceedsBuffer(static_cast<size_t>(p_ - fieldStart_), 0))
-                { limitExceeded_ = true; return; }
+                { exceedLimit(); return; }
                 const uint8_t *fieldStart = p_;
                 if (!parseFieldTag()) return; /* error_ or incomplete_ set */
                 const sofab::id fieldId = fieldId_;
@@ -3258,11 +3270,6 @@ namespace sofab
                     return;
                 }
 
-                /* A refusal is not a decline: the field was offered, wanted and
-                 * turned down (§6.3's tiers). Skipping its payload here would walk
-                 * on past a verdict that is already terminal. */
-                if (error_ || limitExceeded_ || argError_) return;
-
                 if (!consumed_)
                 {
                     p_ = payload;
@@ -3272,7 +3279,7 @@ namespace sofab
             /* §7: the bytes ran out with this sequence still open -- INCOMPLETE,
              * not malformed. The whole top-level field is delivered again once the
              * remaining bytes arrive. */
-            if (stopAtEnd && !error_ && !argError_) incomplete_ = true;
+            if (stopAtEnd && !error_) incomplete_ = true;
         }
 
         /**
@@ -3439,10 +3446,11 @@ namespace sofab
                  * before the incomplete tail is copied into acc_, so a claimed
                  * oversize is rejected even though its payload never arrived. */
                 if (limitExceeded_) { terminal_ = Error::LimitExceeded; return Result{terminal_, skipped_}; }
-                if (error_) { terminal_ = Error::InvalidMessage; return Result{terminal_, skipped_}; }
-                /* §6.3's third tier, last of the three: a destination too short is
-                 * only reached once the message itself is beyond reproach. */
+                /* §6.3's third tier before the first: a destination too short is a
+                 * refusal of a message that is otherwise beyond reproach, and every
+                 * refusal raises @ref error_ so the parse loops need test only it. */
                 if (argError_) { terminal_ = Error::InvalidArgument; return Result{terminal_, skipped_}; }
+                if (error_) { terminal_ = Error::InvalidMessage; return Result{terminal_, skipped_}; }
                 if (stop != buffer + buflen)
                 {
                     /* §7: bytes remain that begin but do not finish a field (or an
@@ -3464,8 +3472,8 @@ namespace sofab
             /* #26: re-checked from the buffered tail, so the cap is chunk-independent —
              * the same field crosses it whether fed whole or dribbled byte by byte. */
             if (limitExceeded_) { terminal_ = Error::LimitExceeded; return Result{terminal_, skipped_}; }
-            if (error_) { terminal_ = Error::InvalidMessage; return Result{terminal_, skipped_}; }
             if (argError_) { terminal_ = Error::InvalidArgument; return Result{terminal_, skipped_}; }
+            if (error_) { terminal_ = Error::InvalidMessage; return Result{terminal_, skipped_}; }
             topPos_ = static_cast<size_t>(stop - base);
             if (topPos_ == acc_.size()) /* fully drained: COMPLETE */
             {
@@ -3554,7 +3562,7 @@ namespace sofab
          * them is receiver policy, not wire malformation (§7). Idempotent; a
          * no-op outside a @ref feed since every feed clears the flag on entry.
          */
-        void exceedLimit() noexcept { limitExceeded_ = true; }
+        void exceedLimit() noexcept { limitExceeded_ = error_ = true; }
 
         /**
          * @brief Refuse the current field because the caller's **destination** is
@@ -3569,7 +3577,7 @@ namespace sofab
          * returns @ref Error::InvalidArgument. Idempotent; a no-op outside a
          * @ref feed since every feed clears the flag on entry.
          */
-        void rejectDestination() noexcept { argError_ = true; }
+        void rejectDestination() noexcept { argError_ = error_ = true; }
 
         /**
          * @return The configured cap on a wrapper array's element index
@@ -3597,9 +3605,9 @@ namespace sofab
         void rejectElementIndex(sofab::id bad) noexcept
         {
             const long i = static_cast<long>(bad);
-            if (elemSchema_ >= 0 && i >= elemSchema_)   error_ = true;
-            else if (elemDyn_ >= 0 && i >= elemDyn_)    limitExceeded_ = true;
-            else                                        argError_ = true;
+            if (elemSchema_ >= 0 && i >= elemSchema_)   invalidate();
+            else if (elemDyn_ >= 0 && i >= elemDyn_)    exceedLimit();
+            else                                        rejectDestination();
         }
 
 
@@ -3648,9 +3656,13 @@ namespace sofab
                         if (!declined_) topCallback_(fieldId_, fixLen_, count_);
                         end_ = held;
                         incomplete_ = false;
-                        if (error_) return fieldStart; /* the schema bound spoke first */
+                        /* The schema bound spoke first — and so does a receiver cap
+                         * the callback applied itself. An ARGUMENT refusal does not:
+                         * §6.3 puts the configured cap ahead of the caller's
+                         * destination, and the cap enforced below is one. */
+                        if (error_ && !argError_) return fieldStart;
                     }
-                    limitExceeded_ = true;
+                    exceedLimit();
                     return fieldStart;
                 }
 
@@ -3660,7 +3672,7 @@ namespace sofab
                  * offered again -- it said no once, and the answer cannot change.
                  * Only a field whose VALUE was wanted is re-delivered. */
                 if (!declined_) topCallback_(fieldId_, fixLen_, count_);
-                if (error_ || limitExceeded_ || argError_) return fieldStart;
+                if (error_) return fieldStart;
                 /* Not enough bytes yet: rewind to the field header and buffer it. The
                  * whole field is delivered again once it is complete; every generated
                  * destination is either reset wholesale (readArray, prepare()) or
@@ -4327,7 +4339,7 @@ namespace sofab
                  * that was never configured." (§6.3). Never a silent truncation and
                  * never a resize; checked before any byte is written, so a refused
                  * field leaves the destination alone (§7.4). */
-                if (fixLen_ > S::capacity()) { argError_ = true; return false; }
+                if (fixLen_ > S::capacity()) { rejectDestination(); return false; }
                 if (static_cast<size_t>(end_ - p_) < fixLen_)
                 { incomplete_ = true; return false; }
 #if SOFAB_STRICT_UTF8
@@ -4377,7 +4389,7 @@ namespace sofab
             {
                 /* §6.3's third tier, as in readString: the destination is too
                  * short for a value the message and the deployment both allow. */
-                if (fixLen_ > B::capacity()) { argError_ = true; return false; }
+                if (fixLen_ > B::capacity()) { rejectDestination(); return false; }
                 std::memcpy(value.data(), p_, fixLen_);
                 value.set_len(fixLen_);
             }
@@ -4453,7 +4465,7 @@ namespace sofab
             }
             if (dynCap >= 0 && count_ > static_cast<size_t>(dynCap))
             {
-                limitExceeded_ = true;
+                exceedLimit();
                 return false;
             }
             /* Step 3's second ceiling: the destination's own capacity. MESSAGE_SPEC
@@ -4481,7 +4493,7 @@ namespace sofab
             {
                 if (count_ > static_cast<size_t>(destCap))
                 {
-                    argError_ = true;
+                    rejectDestination();
                     return false;
                 }
             }
