@@ -2338,8 +2338,9 @@ namespace sofab
      * @p buffer. The counterpart to @ref OStreamInline (buffer inside the object)
      * and @ref OStream (buffer held by a `shared_ptr`) — this is the one for a
      * destination that already exists, such as the `dst` of a generated
-     * `encodeTo`. (As with every stream, nesting deeper than the held-back run's
-     * inline depth allocates that run — see @ref OStreamImpl::sequenceBeginLazy.)
+     * `encodeTo`, or a DMA / transport region a **taking** sink hands on
+     * (§5.1.5). Like every stream it allocates nothing at all after
+     * construction.
      *
      * The buffer must outlive the stream, and it is **not** restored if encoding
      * fails: overflow leaves the bytes written so far in place and @ref ok false.
@@ -2371,16 +2372,47 @@ namespace sofab
             flushCallback_ = std::move(callback);
             initBuffer(buffer, buflen, offset);
         }
+
+        /**
+         * @brief Install a different caller buffer, mid-stream.
+         *
+         * §5.1.1 lists "allow a new output buffer to be installed mid-stream"
+         * among a corelib's required capabilities, and §5.1.5 puts the duty on
+         * the **sink**: "A sink that takes the buffer MUST install a replacement
+         * before returning." This is the call it makes. Without it a taking sink
+         * could only be written against @ref OStream — the `shared_ptr` flavour —
+         * which is the wrong one for the case a taking sink exists for: memory
+         * the caller already owns and hands on (A2-0020).
+         *
+         * The stream keeps no reference to the buffer it gives up. The new one
+         * must outlive the stream, and the same @ref MIN_OUTPUT_BUFFER floor
+         * applies as at construction: behind a sink, `buflen - offset` short of
+         * it is refused with @ref Error::InvalidArgument rather than partway
+         * through a later field (§5.1.4).
+         *
+         * @param buffer New destination; must outlive this stream.
+         * @param buflen Capacity of @p buffer in bytes.
+         * @param offset Number of leading bytes to leave untouched before the cursor.
+         */
+        void setBuffer(uint8_t *buffer, size_t buflen, size_t offset = 0) noexcept
+        {
+            initBuffer(buffer, buflen, offset);
+        }
     };
 
     /**
      * @brief Output stream whose buffer is stored inline (the *buffer* costs no
      *        heap allocation).
      *
-     * The encoded bytes never leave the inline array. The one allocation such a
-     * stream can still make is the held-back sequence run, and only when the
-     * nesting outgrows that run's inline depth (see
-     * @ref OStreamImpl::sequenceBeginLazy).
+     * The encoded bytes never leave the inline array, and the stream allocates
+     * nothing at all — the held-back sequence run is fixed @ref MAX_DEPTH state
+     * sized at construction (§6.6.2).
+     *
+     * Because the buffer **is** the object, this flavour admits only a
+     * **copying** sink: there is nothing to hand over, so a sink must copy the
+     * span it is given and return without installing anything (§5.1.5's other
+     * half). A taking sink wants @ref OStreamView (caller memory, with
+     * @ref OStreamView::setBuffer) or @ref OStream (`shared_ptr` memory).
      *
      * @tparam N Buffer capacity in bytes; must be greater than zero.
      * @tparam Offset Number of leading bytes to reserve before the cursor; must be less than @p N.

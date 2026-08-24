@@ -4319,6 +4319,146 @@ struct FixedStoreMsg : sofab::Message
     }
 };
 
+/* --- §6.6.4: MEASURE, over a complete encode and a complete decode ----------
+ *
+ * "Conformance therefore requires **both**: read — no allocation primitive is
+ * reachable from a codec entry point … and **measure** — an allocation count,
+ * or the heap high-water mark, over a complete encode and a complete decode,
+ * **measured after the codec's one-time construction**, which MUST be zero."
+ *
+ * Every allocation assertion in this file used to sit on the DECODE side and on
+ * the ONE-SHOT path: heapFreeStorage() arms the counter after the serialize()
+ * calls, so no assertion measured a complete encode, and none measured a
+ * chunked feed (A2-0019). Both windows are opened here, over both storage
+ * modes and at chunk sizes {1, whole}. --- */
+
+static void allocationMeasurement()
+{
+    DynStoreMsg d;
+    d.name = "abcdefgh";
+    d.sig = {0xde, 0xad, 0xbe, 0xef};
+    d.nums = {1, 2, 300};
+    d.tags = {"ab", "", "cd"};
+    d.parts = {{0x01, 0x02}, {}, {0x03}};
+
+    FixedStoreMsg f;
+    f.name = "abcdefgh";
+    f.sig = {0xde, 0xad, 0xbe, 0xef};
+    f.nums = {1, 2, 300};
+    f.tags = {"ab", "", "cd"};
+    f.parts = {{0x01, 0x02}, {}, {0x03}};
+
+    /* The one-shot reference bytes, for the streamed encode below. */
+    std::vector<uint8_t> wire0;
+    {
+        uint8_t ref[256];
+        sofab::OStreamView os{ref, sizeof ref};
+        (void)f.serialize(os);
+        wire0.assign(ref, ref + os.bytesUsed());
+    }
+
+    /* --- encode, complete, every stream flavour. The stream and its buffer are
+     *     constructed first and the counter armed after: §6.6's "One-time
+     *     construction is the boundary". --- */
+    uint8_t buf[256];
+    {
+        sofab::OStreamView os{buf, sizeof buf};
+        const unsigned long before = g_allocCount;
+        CHECK(f.serialize(os).code() == sofab::Error::None, "measure: the fixed encode succeeds");
+        (void)os.flush();
+        CHECK(os.ok(), "measure: and flushes");
+        CHECK(g_allocCount == before, "measure: a complete encode allocates nothing (OStreamView)");
+    }
+    {
+        auto os = std::make_unique<sofab::OStreamInline<256>>();
+        const unsigned long before = g_allocCount;
+        CHECK(f.serialize(*os).code() == sofab::Error::None, "measure: the inline encode succeeds");
+        CHECK(g_allocCount == before, "measure: a complete encode allocates nothing (OStreamInline)");
+    }
+    {
+        /* growable-storage message, heap-free stream: the VALUES live in the
+         * message the caller owns, so the encode is still allocation-free. */
+        sofab::OStreamView os{buf, sizeof buf};
+        const unsigned long before = g_allocCount;
+        CHECK(d.serialize(os).code() == sofab::Error::None, "measure: the dynamic encode succeeds");
+        CHECK(g_allocCount == before,
+              "measure: a complete encode of a growable-storage message allocates nothing");
+    }
+    {
+        /* driven through a sink, one byte of output buffer at a time: the split
+         * path must not allocate either. The sink's own std::vector does, so it
+         * is a fixed array the sink writes into. */
+        static uint8_t sinkOut[512];
+        size_t sinkLen = 0;
+        uint8_t tiny[sofab::MIN_OUTPUT_BUFFER];
+        sofab::OStreamView os([&](std::span<const uint8_t> chunk) {
+                                  for (uint8_t b : chunk) sinkOut[sinkLen++] = b;
+                              },
+                              tiny, sizeof tiny, 0);
+        const unsigned long before = g_allocCount;
+        CHECK(f.serialize(os).code() == sofab::Error::None, "measure: the streamed encode succeeds");
+        (void)os.flush();
+        CHECK(os.ok(), "measure: and flushes");
+        CHECK(g_allocCount == before,
+              "measure: a complete encode through a MIN_OUTPUT_BUFFER sink allocates nothing");
+        CHECK(toHex({sinkOut, sinkLen}) == toHex({wire0.data(), wire0.size()}),
+              "measure: and the streamed bytes are the one-shot bytes");
+    }
+
+    /* The wire the decode half measures against. */
+    sofab::OStreamView wos{buf, sizeof buf};
+    (void)f.serialize(wos);
+    const std::vector<uint8_t> wire(buf, buf + wos.bytesUsed());
+
+    /* --- decode, complete, one-shot. --- */
+    {
+        auto is = std::make_unique<sofab::IStreamObject<FixedStoreMsg>>();
+        const unsigned long before = g_allocCount;
+        CHECK(is->feed(wire.data(), wire.size()).complete(), "measure: the one-shot decode completes");
+        CHECK(g_allocCount == before,
+              "measure: a complete one-shot decode into heap-free storage allocates nothing");
+    }
+
+    /* --- decode, complete, ONE BYTE AT A TIME. The window §6.6.4 names second
+     *     and the one nothing here used to open.
+     *
+     * This is NOT zero yet, and the number is the point: IStreamImpl still
+     * joins a chunk-straddling field in a private accumulator (`acc_`) instead
+     * of copying each piece straight into the caller's destination, which
+     * §6.6.2 requires -- "A codec MUST NOT grow a private accumulator instead."
+     * That is A2-0015 / corelib-cpp#123, and it needs the decoder turned into a
+     * resumable per-field state machine, which is not this change.
+     *
+     * What is asserted meanwhile is a CEILING, so the accumulator cannot quietly
+     * get worse and so the day it goes it shows up here as a number that dropped
+     * to zero: the reassembly buffer is one geometrically grown vector per
+     * message, never one per chunk. --- */
+    {
+        auto is = std::make_unique<sofab::IStreamObject<FixedStoreMsg>>();
+        const unsigned long before = g_allocCount;
+        const unsigned long bytesBefore = g_allocBytes;
+        sofab::Error last = sofab::Error::None;
+        for (size_t i = 0; i < wire.size(); ++i) last = is->feed(wire.data() + i, 1).code();
+        CHECK(last == sofab::Error::None, "measure: the byte-at-a-time decode completes");
+        CHECK((*(*is)).name == std::string_view{"abcdefgh"},
+              "measure: and decodes to the same value as the one-shot feed");
+        const unsigned long allocs = g_allocCount - before;
+        const unsigned long bytes = g_allocBytes - bytesBefore;
+        /* Ceiling, not a target: §6.6.4 wants zero here (A2-0015). */
+        CHECK(allocs <= 8, "measure: a chunked feed's accumulator is O(log n), not O(chunks)");
+        CHECK(bytes <= 8 * wire.size() + 256,
+              "measure: and no wire number multiplies what it commits");
+    }
+    {
+        /* Chunk size 7, an odd size that straddles differently: the same ceiling. */
+        auto is = std::make_unique<sofab::IStreamObject<FixedStoreMsg>>();
+        const unsigned long before = g_allocCount;
+        for (size_t i = 0; i < wire.size(); i += 7)
+            (void)is->feed(wire.data() + i, std::min<size_t>(7, wire.size() - i));
+        CHECK(g_allocCount - before <= 8, "measure: an odd chunk size holds the same ceiling");
+    }
+}
+
 static void heapFreeStorage()
 {
     /* --- 1. the two storage modes produce the same bytes --- */
@@ -5025,6 +5165,174 @@ static void headerParsersEnforceCeilings()
  *     check existed, a zero-room buffer behind a sink drove pushByte past the
  *     end of the allocation. --- */
 
+/* --- §7.2 item 5b: TOLERANCE ------------------------------------------------
+ *
+ * "input that is non-canonical but well-formed **MUST** decode to the value it
+ * denotes and re-encode canonically, never `INVALID`" -- a non-minimal varint
+ * (§4.1.2) at a field header, a `fixlen_word` and an element count, and a
+ * sequence-end header whose id is non-zero but within `ID_MAX` (§4.9), which
+ * "MUST decode as an ordinary sequence end and re-encode as `0x07`".
+ *
+ * "These are the cases where a decoder is *stricter* than the format allows --
+ * the mirror of item 5, and the ones a majority-vote conformance check cannot
+ * catch, since implementations may be uniformly too strict." Nothing else in
+ * this repository or in the shared vectors would notice a regression here: the
+ * vectors are 81 CANONICAL messages the encode test asserts byte-equal, so none
+ * of them is a tolerance case (A2-0026).
+ *
+ * Item 5's sequence-end half and item 6's reserved-subtype truncation ride
+ * along, being the same neighbourhood of the parser. --- */
+
+struct TolChild : sofab::Message
+{
+    uint64_t a = 0;
+    sofab::OStreamImpl::Result serialize(sofab::OStreamImpl &os) const noexcept override
+    {
+        return os.write(0, a);
+    }
+    void deserialize(sofab::IStreamImpl &is, sofab::id id, size_t, size_t) noexcept override
+    {
+        if (id == 0) is.read(a);
+    }
+};
+
+struct TolParent : sofab::Message
+{
+    TolChild c;
+    sofab::OStreamImpl::Result serialize(sofab::OStreamImpl &os) const noexcept override
+    {
+        os.sequenceBeginLazy(1);
+        auto r = c.serialize(os);
+        os.sequenceEndKeep();
+        return r;
+    }
+    void deserialize(sofab::IStreamImpl &is, sofab::id id, size_t, size_t) noexcept override
+    {
+        if (id == 1) is.read(c);
+    }
+};
+
+static void toleranceInput()
+{
+    /* 1. a non-minimal FIELD HEADER: id 1 unsigned is `08`; `88 00` denotes the
+     *    same word with one redundant continuation byte. */
+    {
+        const std::vector<uint8_t> w = {0x88, 0x00, 0x2a};
+        uint64_t got = 0;
+        sofab::id gotId = 999;
+        sofab::IStreamInline is([&](sofab::id id, size_t, size_t) { gotId = id; is.read(got); });
+        auto r = is.feed(w.data(), w.size());
+        CHECK(r.complete(), "tolerance: a non-minimal field header decodes COMPLETE, not INVALID");
+        CHECK(gotId == 1 && got == 42, "tolerance: and denotes the same field and value");
+    }
+
+    /* 2. a non-minimal FIXLEN_WORD: `0a` is len 1 / subtype string; `8a 00` is
+     *    the same word, one byte longer. */
+    {
+        const std::vector<uint8_t> w = {0x0a, 0x8a, 0x00, 'x'};
+        std::string got;
+        sofab::IStreamInline is([&](sofab::id, size_t, size_t) { is.readString(got); });
+        auto r = is.feed(w.data(), w.size());
+        CHECK(r.complete(), "tolerance: a non-minimal fixlen_word decodes COMPLETE");
+        CHECK(got == "x", "tolerance: and denotes the same payload length");
+    }
+
+    /* 3. a non-minimal ELEMENT COUNT: `0b` is id 1 array-unsigned, then count 2
+     *    written as `82 00`. */
+    {
+        const std::vector<uint8_t> w = {0x0b, 0x82, 0x00, 0x01, 0x02};
+        std::vector<uint32_t> got;
+        sofab::IStreamInline is([&](sofab::id, size_t, size_t) { is.readArray(got); });
+        auto r = is.feed(w.data(), w.size());
+        CHECK(r.complete(), "tolerance: a non-minimal element count decodes COMPLETE");
+        CHECK(got.size() == 2 && got[0] == 1 && got[1] == 2,
+              "tolerance: and denotes the same two elements");
+    }
+
+    /* 4. a SEQUENCE-END header whose id is non-zero but within ID_MAX: `2f` is
+     *    id 5 with the sequence-end type. §4.9 makes the id meaningless there,
+     *    so it decodes as an ordinary end -- and re-encodes as the canonical
+     *    `07`. This is the case a uniformly-too-strict family cannot catch. */
+    {
+        const std::vector<uint8_t> w = {0x0e, 0x00, 0x01, 0x2f};
+        sofab::IStreamObject<TolParent> in;
+        auto r = in.feed(w.data(), w.size());
+        CHECK(r.complete(), "tolerance: a sequence-end header with id 5 decodes COMPLETE");
+        CHECK((*in).c.a == 1, "tolerance: and the sequence's content survives it");
+        uint8_t out[16];
+        sofab::OStreamView os{out, sizeof out};
+        (void)(*in).serialize(os);
+        CHECK(toHex({out, os.bytesUsed()}) == "0e000107",
+              "tolerance: and it re-encodes canonically as 07");
+    }
+    {
+        /* the canonical form of the same message decodes identically */
+        const std::vector<uint8_t> w = {0x0e, 0x00, 0x01, 0x07};
+        sofab::IStreamObject<TolParent> in;
+        CHECK(in.feed(w.data(), w.size()).complete() && (*in).c.a == 1,
+              "tolerance: the canonical sequence end decodes to the same value");
+    }
+
+    /* 5 (item 5's sequence-end half). The id ceiling admits no exception on a
+     *    sequence-end header either: an id past ID_MAX is INVALID there as it is
+     *    on a value-bearing header, and "an implementation that validates the id
+     *    only in the branches that *use* it passes the value-bearing case and
+     *    misses this one". */
+    {
+        std::vector<uint8_t> w = {0x0e, 0x00, 0x01};
+        appendVarint(w, (uint64_t{1} << 31 << 3) | 7u); /* id 2^31 > ID_MAX */
+        sofab::IStreamObject<TolParent> in;
+        auto r = in.feed(w.data(), w.size());
+        CHECK(r.invalid(), "tolerance: an oversized id on a sequence-end header is INVALID");
+    }
+
+    /* 6 (item 6). A `fixlen_word` cut after its FIRST byte, with that byte
+     *    carrying a reserved subtype (0x4-0x7 in the low three bits): "the
+     *    subtype is already settled by the low 3 bits, so an implementation that
+     *    evaluates it early answers `INVALID` where §4.1.1 requires
+     *    `INCOMPLETE`". Nothing else exercises the no-partial-evaluation rule --
+     *    the dangling `0x80` carries no settled sub-field to peek at. */
+    {
+        const std::vector<uint8_t> w = {0x02, 0x84}; /* id 0 fixlen; word byte 0: subtype 4 */
+        std::string got;
+        sofab::IStreamInline is([&](sofab::id, size_t, size_t) { is.readString(got); });
+        auto r = is.feed(w.data(), w.size());
+        CHECK(r.incomplete() && !r.invalid(),
+              "tolerance: a fixlen_word cut after a reserved-subtype first byte is INCOMPLETE");
+        /* and the reserved subtype IS rejected once the word is complete */
+        const uint8_t rest[] = {0x00};
+        auto r2 = is.feed(rest, sizeof rest);
+        CHECK(r2.invalid(), "tolerance: the completed reserved subtype is then INVALID");
+    }
+
+    /* Every tolerance case above, dribbled a byte at a time: §7.2 item 4 makes
+     * the chunked verdict identical to the one-shot one, and a decoder that
+     * evaluated a half-arrived word early would disagree here first. */
+    {
+        const std::vector<std::vector<uint8_t>> ok = {
+            {0x88, 0x00, 0x2a},
+            {0x0a, 0x8a, 0x00, 'x'},
+            {0x0b, 0x82, 0x00, 0x01, 0x02},
+        };
+        bool allComplete = true;
+        for (const auto &w : ok)
+        {
+            std::string sink;
+            std::vector<uint32_t> arr;
+            uint64_t u = 0;
+            sofab::IStreamInline is([&](sofab::id, size_t, size_t) {
+                is.read(u);
+                is.readString(sink);
+                is.readArray(arr);
+            });
+            sofab::Error last = sofab::Error::None;
+            for (uint8_t b : w) last = is.feed(&b, 1).code();
+            if (last != sofab::Error::None) allComplete = false;
+        }
+        CHECK(allComplete, "tolerance: every non-minimal form is COMPLETE byte-at-a-time too");
+    }
+}
+
 static void minOutputBuffer()
 {
     static_assert(sofab::MIN_OUTPUT_BUFFER >= 1 && sofab::MIN_OUTPUT_BUFFER <= 20,
@@ -5083,13 +5391,56 @@ static void minOutputBuffer()
         CHECK(oneShot.ok(), "MIN_OUTPUT_BUFFER: the one-shot reference encode succeeds");
         one.resize(oneShot.bytesUsed());
 
+        /* §7.2 item 4, "No foreign memory, ever": every callback argument must
+         * lie INSIDE the installed buffer, because pass-through is forbidden
+         * (§5.1.6) -- "this must hold on every flush of every message, with no
+         * permission flag to set and no exemption to claim".
+         *
+         * Byte-equality of the concatenation below cannot catch that: a
+         * pass-through encoder handing the caller's own `payload` straight to
+         * the sink produces exactly the same bytes. So the sink checks the
+         * POINTER as well, on every call (A2-0025). */
         std::vector<uint8_t> out, buf(min, 0xAA);
-        sofab::OStreamView os([&out](std::span<const uint8_t> d){ out.insert(out.end(), d.begin(), d.end()); },
+        size_t calls = 0, foreign = 0;
+        const uint8_t *lo = buf.data(), *hi = buf.data() + buf.size();
+        sofab::OStreamView os([&](std::span<const uint8_t> d) {
+                                  ++calls;
+                                  if (d.data() < lo || d.data() + d.size() > hi) ++foreign;
+                                  out.insert(out.end(), d.begin(), d.end());
+                              },
                               buf.data(), buf.size(), 0);
         os.write(1, payload);
         os.flush();
         CHECK(os.ok() && out == one,
               "MIN_OUTPUT_BUFFER: encoding into exactly the minimum equals the one-shot bytes");
+        CHECK(calls > payload.size() / (min + 1),
+              "MIN_OUTPUT_BUFFER: the divisible run really was split across flushes");
+        CHECK(foreign == 0,
+              "no foreign memory: every sink span lies inside the installed buffer (§5.1.6)");
+    }
+
+    /* The same, over a `blob` several times the buffer size, which is the shape
+     * §7.2 item 4 names -- and with a buffer larger than the declared minimum,
+     * so the check is not an accident of a one-byte window. */
+    {
+        const std::vector<uint8_t> payload(4096, 0x5a);
+        std::vector<uint8_t> out, buf(64, 0xAA);
+        size_t calls = 0, foreign = 0;
+        const uint8_t *lo = buf.data(), *hi = buf.data() + buf.size();
+        sofab::OStreamView os([&](std::span<const uint8_t> d) {
+                                  ++calls;
+                                  if (d.data() < lo || d.data() + d.size() > hi) ++foreign;
+                                  out.insert(out.end(), d.begin(), d.end());
+                              },
+                              buf.data(), buf.size(), 0);
+        os.write(7, payload.data(), static_cast<int32_t>(payload.size()));
+        os.flush();
+        CHECK(os.ok(), "no foreign memory: the oversized blob encodes");
+        CHECK(calls >= payload.size() / buf.size(),
+              "no foreign memory: the blob really was split across flushes");
+        CHECK(foreign == 0, "no foreign memory: every blob span lies inside the installed buffer");
+        CHECK(out.size() == payload.size() + 4,
+              "no foreign memory: and the whole payload reached the sink");
     }
 }
 
@@ -5375,6 +5726,53 @@ static void flushHandover()
               "flush handover: a taking sink's concatenated payload equals the one-shot bytes");
         CHECK(packets.size() > 1,
               "flush handover: the buffer really was handed over more than once");
+    }
+
+    /* The same taking sink, over OStreamView -- the flavour that wraps memory
+     * the caller already owns, and therefore the natural one for a DMA or
+     * transport handover. §5.1.1 requires the capability of the corelib and
+     * §5.1.5 puts the install duty on the sink; before A2-0020 only OStream
+     * exposed the call, so a sink written against this flavour could not
+     * discharge it. */
+    {
+        std::vector<uint8_t> b1(kCap, 0xAA), b2(kCap, 0xAA);
+        std::vector<std::vector<uint8_t>> packets;
+        sofab::OStreamView *osp = nullptr;
+        int taken = 0;
+        auto sink = [&](std::span<const uint8_t> d) {
+            packets.emplace_back(d.begin(), d.end());
+            std::memset((taken % 2) ? b2.data() : b1.data(), 0xEE, kCap);
+            ++taken;
+            osp->setBuffer((taken % 2) ? b2.data() : b1.data(), kCap, kHdr);
+        };
+        sofab::OStreamView os{sink, b1.data(), kCap, kHdr};
+        osp = &os;
+        os.write(1, payload);
+        os.flush();
+
+        bool everyPacketHasRoom = !packets.empty();
+        std::vector<uint8_t> joined;
+        for (const auto &p : packets)
+        {
+            if (p.size() < kHdr) { everyPacketHasRoom = false; continue; }
+            joined.insert(joined.end(), p.begin() + kHdr, p.end());
+        }
+        CHECK(os.ok(), "flush handover: OStreamView survives a taking sink");
+        CHECK(everyPacketHasRoom && packets.size() > 1 && joined == one,
+              "flush handover: OStreamView's taking sink reproduces the one-shot bytes");
+        CHECK(joined.size() == one.size(),
+              "flush handover: and hands the whole message on, not the buffer it gave away");
+    }
+    {
+        /* An installation below MIN_OUTPUT_BUFFER is refused at the install, not
+         * partway through a later field (§5.1.4) -- the same gate the
+         * constructor applies. */
+        std::vector<uint8_t> buf(sofab::MIN_OUTPUT_BUFFER + 8, 0xAA);
+        sofab::OStreamView os([](std::span<const uint8_t>) {}, buf.data(), buf.size(), 0);
+        CHECK(os.ok(), "flush handover: the first installation is accepted");
+        os.setBuffer(buf.data(), buf.size(), buf.size() - (sofab::MIN_OUTPUT_BUFFER - 1));
+        CHECK(!os.ok() && os.error() == sofab::Error::InvalidArgument,
+              "flush handover: setBuffer applies the MIN_OUTPUT_BUFFER floor too");
     }
 
     /* A COPYING sink: it returns without installing anything, so the same buffer
@@ -6516,12 +6914,14 @@ int main()
     skippedSubtreeSuspendsBound();
     truncatedNestedFieldIsNotDeclined();
     heapFreeStorage();
+    allocationMeasurement();
     destinationReuse();
     varintWidthSweep();
     trailingDefaultsStayOnTheWire();
     nestedArrayCountCeiling();
     headerParsersEnforceCeilings();
     minOutputBuffer();
+    toleranceInput();
     negativeBlobSize();
     encodeFormatCeilings();
     encodeFailuresAreLatched();
