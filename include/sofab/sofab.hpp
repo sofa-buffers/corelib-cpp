@@ -3545,7 +3545,9 @@ namespace sofab
              * private accumulator": there is nothing to re-parse from. */
             const Entry entry = levelEntry();
             if (entry != Entry::Fresh) [[unlikely]]
+            {
                 if (!reenterLevel(wrapCb(cb), entry)) return;
+            }
 
             while (p_ < end_ && !error_ && !incomplete_)
             {
@@ -4353,7 +4355,9 @@ namespace sofab
 
             const Entry entry = levelEntry();
             if (entry != Entry::Fresh) [[unlikely]]
+            {
                 if (!reenterLevel(wrapCb(topCallback_), entry)) return;
+            }
 
             const uint8_t *const end = end_;
             while (p_ < end)
