@@ -22,6 +22,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <functional>
 #include <limits>
 #include <memory>
 #include <span>
@@ -54,6 +55,11 @@ enum Cap : uint32_t
     CAP_SEQUENCE = 1u << 2,
     CAP_FP64     = 1u << 3,
     CAP_INT64    = 1u << 4,
+    /* The `sequence_growth` block's gate. A wrapper array's container grows as
+     * elements arrive, so a statically bounded profile (corelib-c-cpp, Rust
+     * no_std) never runs it. This corelib collects into std::vector, so it
+     * does. */
+    CAP_DYN_ARR  = 1u << 5,
 };
 
 constexpr uint32_t buildCaps()
@@ -75,6 +81,7 @@ constexpr uint32_t buildCaps()
 #if !defined(SOFAB_DISABLE_INT64_SUPPORT)
     c |= CAP_INT64;
 #endif
+    c |= CAP_DYN_ARR;
     return c;
 }
 
@@ -85,6 +92,7 @@ uint32_t capFromName(const char *s)
     if (!std::strcmp(s, "sequence")) return CAP_SEQUENCE;
     if (!std::strcmp(s, "fp64"))     return CAP_FP64;
     if (!std::strcmp(s, "int64"))    return CAP_INT64;
+    if (!std::strcmp(s, "dynamic_arrays")) return CAP_DYN_ARR;
     return 0; /* unknown tag: ignore (forward-compatible) */
 }
 
@@ -430,6 +438,185 @@ bool loadNegVectors(const sofab_json_t *root, std::vector<NegVec> &out, std::str
     return true;
 }
 
+/* --- sequence-array growth (top-level "sequence_growth"; CORELIB_PLAN §7.2
+ *     item 8, landed upstream as corelib-c-cpp@bf29d26) -----------------------
+ *
+ * A wrapper array carries no count header: its length is *highest present id +
+ * 1* (MESSAGE_SPEC §5.1), so the container grows as elements arrive and the
+ * element INDEX is what a receiver cap binds (§6.2.1). "Nothing else in this
+ * list reaches it: two ports that grow differently emit identical bytes and
+ * reach identical outcomes, so §7.1's vectors are structurally blind to it."
+ *
+ * A case is keyed by a DELIVERY SEQUENCE OF ELEMENT IDS, not by bytes; the
+ * indices are CAP-RELATIVE, so this runner picks the port's own cap, builds the
+ * message from `deliver` and asserts `expect`. --- */
+
+/*! The receiver cap this port configures for the growth block. The block's own
+ *  note requires at least 4; anything larger only makes the built messages
+ *  longer, so 4 it is. */
+constexpr long kGrowthCap = 4;
+
+struct GrowthDeliver
+{
+    long id = 0;          // absolute element index, already resolved against the cap
+    std::string sval;     // element_type "string"
+    uint64_t uval = 0;    // element_type "struct": the element's field-0 unsigned
+};
+
+struct GrowthCase
+{
+    std::string name;
+    uint32_t req = 0;
+    uint32_t fieldId = 0;
+    bool structElems = false;              // element_type: "struct" vs "string"
+    std::vector<GrowthDeliver> deliver;
+    // expectations
+    bool wantComplete = true;              // outcome: complete | limit_exceeded
+    bool terminal = false;
+    long wantLength = -1;                  // length / length_from_cap, or -1
+    long maxLength = -1;                   // max_length, or -1
+    std::vector<long> defaultIds;
+};
+
+/* `id` is absolute, `id_from_cap` is an offset onto the port's own cap. */
+bool growthIndex(const sofab_json_t *o, const char *abs, const char *rel, long &out)
+{
+    if (const sofab_json_t *a = sofab_json_get(o, abs))
+    { out = static_cast<long>(sofab_json_i64(a)); return true; }
+    if (const sofab_json_t *r = sofab_json_get(o, rel))
+    { out = kGrowthCap + static_cast<long>(sofab_json_i64(r)); return true; }
+    return false;
+}
+
+bool loadGrowthCases(const sofab_json_t *root, std::vector<GrowthCase> &out, std::string &err)
+{
+    const sofab_json_t *arr = group(root, "sequence_growth", err);
+    if (!arr) return false;
+    size_t n = sofab_json_array_size(arr);
+    for (size_t i = 0; i < n; i++)
+    {
+        const sofab_json_t *cj = sofab_json_array_at(arr, i);
+        GrowthCase c;
+        size_t nl; const char *nm = sofab_json_string(sofab_json_get(cj, "name"), &nl);
+        c.name.assign(nm ? nm : "", nm ? nl : 0);
+        c.req = reqMask(cj);
+        c.fieldId = static_cast<uint32_t>(sofab_json_u64(sofab_json_get(cj, "field_id")));
+        size_t tl; const char *et = sofab_json_string(sofab_json_get(cj, "element_type"), &tl);
+        if (!et) { err = c.name + ": no element_type"; return false; }
+        const std::string kind(et, tl);
+        if (kind == "struct") c.structElems = true;
+        else if (kind != "string") { err = c.name + ": unknown element_type " + kind; return false; }
+
+        const sofab_json_t *dl = sofab_json_get(cj, "deliver");
+        size_t nd = sofab_json_array_size(dl);
+        for (size_t k = 0; k < nd; k++)
+        {
+            const sofab_json_t *dj = sofab_json_array_at(dl, k);
+            GrowthDeliver d;
+            if (!growthIndex(dj, "id", "id_from_cap", d.id))
+            { err = c.name + ": deliver entry has neither id nor id_from_cap"; return false; }
+            const sofab_json_t *val = sofab_json_get(dj, "value");
+            if (c.structElems) d.uval = sofab_json_u64(val);
+            else
+            {
+                size_t vl; const char *vs = sofab_json_string(val, &vl);
+                if (!vs) { err = c.name + ": string element without a string value"; return false; }
+                d.sval.assign(vs, vl);
+            }
+            c.deliver.push_back(std::move(d));
+        }
+
+        const sofab_json_t *ex = sofab_json_get(cj, "expect");
+        if (!ex) { err = c.name + ": no expect"; return false; }
+        size_t ol; const char *oc = sofab_json_string(sofab_json_get(ex, "outcome"), &ol);
+        if (!oc) { err = c.name + ": no expect.outcome"; return false; }
+        const std::string outcome(oc, ol);
+        if (outcome == "complete") c.wantComplete = true;
+        else if (outcome == "limit_exceeded") c.wantComplete = false;
+        else { err = c.name + ": unknown outcome " + outcome; return false; }
+        if (const sofab_json_t *t = sofab_json_get(ex, "terminal")) c.terminal = sofab_json_bool(t) != 0;
+        (void)growthIndex(ex, "length", "length_from_cap", c.wantLength);
+        if (const sofab_json_t *ml = sofab_json_get(ex, "max_length"))
+            c.maxLength = static_cast<long>(sofab_json_i64(ml));
+        const sofab_json_t *dids = sofab_json_get(ex, "default_ids");
+        for (size_t k = 0, nk = sofab_json_array_size(dids); k < nk; k++)
+            c.defaultIds.push_back(static_cast<long>(sofab_json_i64(sofab_json_array_at(dids, k))));
+        out.push_back(std::move(c));
+    }
+    return true;
+}
+
+/* The `struct` element the block's struct cases describe: one unsigned at id 0. */
+struct GrowthRow : sofab::Message
+{
+    uint64_t a = 0;
+    sofab::OStreamImpl::Result serialize(sofab::OStreamImpl &os) const noexcept override
+    {
+        return os.write(0, a);
+    }
+    void deserialize(sofab::IStreamImpl &is, sofab::id id, size_t, size_t) noexcept override
+    {
+        if (id == 0) is.read(a);
+    }
+};
+
+/* Destinations, each with the port's cap wired into its collector. */
+struct GrowthStringMsg : sofab::IStreamMessage
+{
+    uint32_t field = 0;
+    std::vector<std::string> out;
+    void deserialize(sofab::IStreamImpl &is, sofab::id id, size_t, size_t) noexcept override
+    {
+        if (id == field) { sofab::StringSeq c{out, -1, -1, kGrowthCap}; is.read(c); }
+    }
+};
+
+struct GrowthStructMsg : sofab::IStreamMessage
+{
+    uint32_t field = 0;
+    std::vector<GrowthRow> out;
+    void deserialize(sofab::IStreamImpl &is, sofab::id id, size_t, size_t) noexcept override
+    {
+        if (id == field)
+        {
+            sofab::MessageSeq<std::vector<GrowthRow>> c;
+            c.out = &out;
+            c.dynCap = kGrowthCap;
+            is.read(c);
+        }
+    }
+};
+
+/* Build the case's wire: the wrapper sequence at `field_id`, one element per
+ * `deliver` entry at its own index. The frame is always emitted (the array is
+ * present even when empty), and a struct element keeps its own frame. */
+std::vector<uint8_t> growthWire(const GrowthCase &c)
+{
+    std::vector<uint8_t> out;
+    sofab::OStream os([&out](std::span<const uint8_t> chunk) {
+                          out.insert(out.end(), chunk.begin(), chunk.end());
+                      },
+                      std::make_shared<uint8_t[]>(4096), 4096);
+    os.sequenceBeginLazy(c.fieldId);
+    for (const GrowthDeliver &d : c.deliver)
+    {
+        const auto eid = static_cast<sofab::id>(d.id);
+        if (c.structElems)
+        {
+            os.sequenceBeginLazy(eid);
+            os.write(0, d.uval);
+            os.sequenceEndKeep();
+        }
+        else
+        {
+            os.write(eid, std::string_view{d.sval});
+        }
+    }
+    os.sequenceEndKeep();
+    os.flush();
+    return out;
+}
+
 /* --- envelope-drift guard (corelib-cpp#100) ---------------------------------
  *
  * Both group walkers now share ONE parse, and each demands its own top-level
@@ -441,8 +628,8 @@ bool loadNegVectors(const sofab_json_t *root, std::vector<NegVec> &out, std::str
 struct EnvelopeWalk
 {
     bool parsed = false;
-    bool vectorsOk = false, negOk = false;
-    size_t nVectors = 0, nNeg = 0;
+    bool vectorsOk = false, negOk = false, growthOk = false;
+    size_t nVectors = 0, nNeg = 0, nGrowth = 0;
 };
 
 EnvelopeWalk walkEnvelope(const char *json)
@@ -454,11 +641,14 @@ EnvelopeWalk walkEnvelope(const char *json)
     w.parsed = true;
     std::vector<Vector> vs;
     std::vector<NegVec> ns;
+    std::vector<GrowthCase> gs;
     std::string e;
     w.vectorsOk = loadVectors(root, vs, e);
     w.negOk = loadNegVectors(root, ns, e);
+    w.growthOk = loadGrowthCases(root, gs, e);
     w.nVectors = vs.size();
     w.nNeg = ns.size();
+    w.nGrowth = gs.size();
     sofab_json_free(root);
     return w;
 }
@@ -470,7 +660,7 @@ struct NegReadMsg : sofab::IStreamMessage
     void deserialize(sofab::IStreamImpl &is, sofab::id, size_t, size_t) noexcept override
     {
         std::string s;
-        is.read(s);
+        sofab::read(is, s);
     }
 };
 
@@ -594,6 +784,19 @@ struct GenericMsg : sofab::IStreamMessage
 
     void deserialize(sofab::IStreamImpl &is, sofab::id, size_t, size_t) noexcept override
     {
+        /* Re-entering a sequence the previous chunk left open (CORELIB_PLAN §6.6.2:
+         * the decoder resumes rather than re-parses, and rebuilds the handler chain
+         * by replaying the open levels' field ids). Nothing here is new — the op
+         * cursor is already inside the sequence — so descend without touching it.
+         * A generated `deserialize`, which only dispatches on the id, needs none of
+         * this; this verifier keeps a position of its own. */
+        if (is.resumed())
+        {
+            GenericMsg child;
+            child.cur = cur;
+            is.read(child);
+            return;
+        }
         const auto &ops = *cur->ops;
         while (cur->i < ops.size() && ops[cur->i].kind == K::SeqE) cur->i++;
         if (cur->i >= ops.size()) { cur->fail = true; cur->err = "extra field"; return; }
@@ -650,10 +853,18 @@ struct GenericMsg : sofab::IStreamMessage
             case K::B:   { bool x = false; is.read(x); if (x != (op.u != 0)) bad("bool"); break; }
             case K::F32: { float x = 0;    is.read(x); if (!eq32(x, static_cast<float>(op.f))) bad("fp32"); break; }
             case K::F64: { double x = 0;   is.read(x); if (!eq64(x, op.f)) bad("fp64"); break; }
-            case K::Str: { std::string x;  is.read(x); if (x != op.str) bad("string"); break; }
+            /* The payload destinations are `static` on purpose: a field split
+             * across chunks is delivered once per chunk that carries part of it and
+             * written into the caller's destination as the pieces arrive
+             * (CORELIB_PLAN §6.6.2), so a destination that dies with the delivery
+             * would lose the earlier halves. Only one field is ever in progress, so
+             * one scratch each is enough. A delivery that did not complete the field
+             * is discarded wholesale by `rewind` above. */
+            case K::Str: { static std::string x; sofab::read(is, x); if (x != op.str) bad("string"); break; }
             case K::Blob:
             {
-                std::vector<uint8_t> buf(op.blob.size() + 1);
+                static std::vector<uint8_t> buf;
+                if (is.progress() == 0) buf.assign(op.blob.size() + 1, 0);
                 size_t n = is.read(buf.data(), buf.size());
                 /* An empty blob's data() is null, and memcmp forbids that even
                  * for a zero length, so the compare is skipped in that case. */
@@ -664,24 +875,59 @@ struct GenericMsg : sofab::IStreamMessage
             }
             case K::Arr:
             {
-                auto cmpU = [&](auto vec) { is.read(vec); for (size_t k = 0; k < vec.size(); k++) if (static_cast<uint64_t>(vec[k]) != op.au[k]) { bad("arr-u"); break; } };
-                auto cmpI = [&](auto vec) { is.read(vec); for (size_t k = 0; k < vec.size(); k++) if (static_cast<int64_t>(vec[k]) != op.ai[k]) { bad("arr-i"); break; } };
+                auto cmpU = [&](auto &vec) {
+                    if (is.progress() == 0) vec.assign(op.au.size(), 0);
+                    is.read(vec);
+                    for (size_t k = 0; k < vec.size(); k++)
+                        if (static_cast<uint64_t>(vec[k]) != op.au[k]) { bad("arr-u"); break; }
+                };
+                auto cmpI = [&](auto &vec) {
+                    if (is.progress() == 0) vec.assign(op.ai.size(), 0);
+                    is.read(vec);
+                    for (size_t k = 0; k < vec.size(); k++)
+                        if (static_cast<int64_t>(vec[k]) != op.ai[k]) { bad("arr-i"); break; }
+                };
+                /* Stable across deliveries, like the payload scratch above. */
+                static std::vector<uint8_t>  a8;   static std::vector<uint16_t> a16;
+                static std::vector<uint32_t> a32;  static std::vector<uint64_t> a64;
+                static std::vector<int8_t>   s8;   static std::vector<int16_t>  s16;
+                static std::vector<int32_t>  s32;  static std::vector<int64_t>  s64;
+                static std::vector<float>    af32; static std::vector<double>   af64;
                 switch (op.elem)
                 {
-                    case E::U8:  cmpU(std::vector<uint8_t>(op.au.size()));  break;
-                    case E::U16: cmpU(std::vector<uint16_t>(op.au.size())); break;
-                    case E::U32: cmpU(std::vector<uint32_t>(op.au.size())); break;
-                    case E::U64: cmpU(std::vector<uint64_t>(op.au.size())); break;
-                    case E::I8:  cmpI(std::vector<int8_t>(op.ai.size()));   break;
-                    case E::I16: cmpI(std::vector<int16_t>(op.ai.size()));  break;
-                    case E::I32: cmpI(std::vector<int32_t>(op.ai.size()));  break;
-                    case E::I64: cmpI(std::vector<int64_t>(op.ai.size()));  break;
-                    case E::F32: { std::vector<float> v(op.af.size());  is.read(v); for (size_t k = 0; k < v.size(); k++) if (!eq32(v[k], static_cast<float>(op.af[k]))) { bad("arr-f32"); break; } break; }
-                    case E::F64: { std::vector<double> v(op.af.size()); is.read(v); for (size_t k = 0; k < v.size(); k++) if (!eq64(v[k], op.af[k])) { bad("arr-f64"); break; } break; }
+                    case E::U8:  cmpU(a8);  break;
+                    case E::U16: cmpU(a16); break;
+                    case E::U32: cmpU(a32); break;
+                    case E::U64: cmpU(a64); break;
+                    case E::I8:  cmpI(s8);  break;
+                    case E::I16: cmpI(s16); break;
+                    case E::I32: cmpI(s32); break;
+                    case E::I64: cmpI(s64); break;
+                    case E::F32:
+                        if (is.progress() == 0) af32.assign(op.af.size(), 0.0f);
+                        is.read(af32);
+                        for (size_t k = 0; k < af32.size(); k++)
+                            if (!eq32(af32[k], static_cast<float>(op.af[k]))) { bad("arr-f32"); break; }
+                        break;
+                    case E::F64:
+                        if (is.progress() == 0) af64.assign(op.af.size(), 0.0);
+                        is.read(af64);
+                        for (size_t k = 0; k < af64.size(); k++)
+                            if (!eq64(af64[k], op.af[k])) { bad("arr-f64"); break; }
+                        break;
                 }
                 break;
             }
-            case K::SeqB: { GenericMsg child; child.cur = cur; is.read(child); break; }
+            case K::SeqB:
+            {
+                /* A sequence's delivery is never "undone": its children were
+                 * delivered and stay delivered, and only a child that did not
+                 * finish rewinds (its own Rewind above). Leaving this one armed
+                 * would put the op cursor back on the SequenceStart, where the
+                 * resumed child would then be compared against the wrong op. */
+                rewind.armed = false;
+                GenericMsg child; child.cur = cur; is.read(child); break;
+            }
             case K::SeqE: break;
         }
     }
@@ -846,6 +1092,73 @@ int main()
 #endif
     }
 
+    /* --- sequence-array growth (top-level "sequence_growth", §7.2 item 8). Each
+     *     case is a delivery sequence of element ids against this port's own
+     *     configured cap; the assertions are the container LENGTH and the
+     *     OUTCOME, with no allocator instrumentation -- "which is what makes
+     *     these cases portable". --- */
+    std::vector<GrowthCase> growth;
+    if (!loadGrowthCases(vf.root, growth, err))
+    {
+        std::printf("sequence_growth load failed: %s\n", err.c_str());
+        return 2;
+    }
+    int growthRun = 0, growthSkipped = 0;
+    for (const GrowthCase &c : growth)
+    {
+        if (c.req & ~caps) { ++growthSkipped; continue; }
+        ++growthRun;
+        const auto wire = growthWire(c);
+        static const uint8_t goodTail[] = {0x48, 0x2a}; /* id 9, unsigned = 42 */
+        const auto label = named(c.name.c_str());
+
+        auto check = [&](sofab::Error code, size_t len,
+                         const std::function<bool(size_t)> &isDefault, sofab::Error after) {
+            const sofab::Error want = c.wantComplete ? sofab::Error::None : sofab::Error::LimitExceeded;
+            run(code == want, label, "growth-outcome",
+                "expected " + std::string(c.wantComplete ? "complete" : "limit_exceeded") +
+                    ", got code " + std::to_string(static_cast<int>(code)));
+            if (c.wantLength >= 0)
+                run(len == static_cast<size_t>(c.wantLength), label, "growth-length",
+                    "expected length " + std::to_string(c.wantLength) + ", got " + std::to_string(len));
+            if (c.maxLength >= 0)
+                run(len <= static_cast<size_t>(c.maxLength), label, "growth-max-length",
+                    "expected length <= " + std::to_string(c.maxLength) + ", got " + std::to_string(len));
+            for (long gid : c.defaultIds)
+                run(gid >= 0 && static_cast<size_t>(gid) < len && isDefault(static_cast<size_t>(gid)),
+                    label, "growth-gap-default",
+                    "id " + std::to_string(gid) + " should hold the element default");
+            if (c.terminal)
+                run(after == want, label, "growth-terminal",
+                    "the rejection did not survive the next feed: code " +
+                        std::to_string(static_cast<int>(after)));
+        };
+
+        if (c.structElems)
+        {
+            sofab::IStreamObject<GrowthStructMsg> in;
+            (*in).field = c.fieldId;
+            const auto &rows = (*in).out;
+            const sofab::Error code = in.feed(wire.data(), wire.size()).code();
+            const sofab::Error after = in.feed(goodTail, sizeof goodTail).code();
+            check(code, rows.size(), [&rows](size_t i) { return rows[i].a == 0; }, after);
+        }
+        else
+        {
+            sofab::IStreamObject<GrowthStringMsg> in;
+            (*in).field = c.fieldId;
+            const auto &tags = (*in).out;
+            const sofab::Error code = in.feed(wire.data(), wire.size()).code();
+            const sofab::Error after = in.feed(goodTail, sizeof goodTail).code();
+            check(code, tags.size(), [&tags](size_t i) { return tags[i].empty(); }, after);
+        }
+    }
+    /* The block exists upstream and this build runs it: a `requires` gate that
+     * silently excluded every case would read as a green run of nothing. */
+    run(growthRun == static_cast<int>(growth.size()) && growthRun >= 8, named("(all)"),
+        "sequence-growth-ran", "ran " + std::to_string(growthRun) + " of " +
+                                   std::to_string(growth.size()) + " growth cases");
+
     /* --- envelope guards (corelib-cpp#100) ---
      *
      * Every group above came out of ONE read and ONE parse of the vector file.
@@ -866,20 +1179,27 @@ int main()
         static const char kVec[] = "{\"name\":\"v\",\"fields\":[],\"serialized\":{\"hex\":\"\"}}";
         static const char kNeg[] = "{\"name\":\"n\",\"id\":0,\"string_hex\":\"ff\","
                                    "\"serialized_hex\":\"0201ff\"}";
+        static const char kGro[] = "{\"name\":\"g\",\"field_id\":0,\"element_type\":\"string\","
+                                   "\"deliver\":[],\"expect\":{\"outcome\":\"complete\","
+                                   "\"length\":0}}";
         const std::string both  = std::string("{\"vectors\":[") + kVec +
-                                  "],\"invalid_utf8\":[" + kNeg + "]}";
+                                  "],\"invalid_utf8\":[" + kNeg +
+                                  "],\"sequence_growth\":[" + kGro + "]}";
         const std::string onlyV = std::string("{\"vectors\":[") + kVec + "]}";
         const std::string onlyN = std::string("{\"invalid_utf8\":[") + kNeg + "]}";
-        const std::string empty = "{\"vectors\":[],\"invalid_utf8\":[]}";
+        const std::string onlyG = std::string("{\"sequence_growth\":[") + kGro + "]}";
+        const std::string empty = "{\"vectors\":[],\"invalid_utf8\":[],\"sequence_growth\":[]}";
         const std::string drift = std::string("{\"vectors_v2\":[") + kVec +
-                                  "],\"invalid_utf8_v2\":[" + kNeg + "]}";
+                                  "],\"invalid_utf8_v2\":[" + kNeg +
+                                  "],\"sequence_growth_v2\":[" + kGro + "]}";
 
-        const struct { const char *label; const std::string &json; bool wantV, wantN; } cases[] = {
-            {"envelope-both-groups",     both,  true,  true },
-            {"envelope-no-invalid_utf8", onlyV, true,  false},
-            {"envelope-no-vectors",      onlyN, false, true },
-            {"envelope-empty-groups",    empty, false, false},
-            {"envelope-renamed-keys",    drift, false, false},
+        const struct { const char *label; const std::string &json; bool wantV, wantN, wantG; } cases[] = {
+            {"envelope-all-groups",         both,  true,  true,  true },
+            {"envelope-no-invalid_utf8",    onlyV, true,  false, false},
+            {"envelope-no-vectors",         onlyN, false, true,  false},
+            {"envelope-only-sequence_growth", onlyG, false, false, true },
+            {"envelope-empty-groups",       empty, false, false, false},
+            {"envelope-renamed-keys",       drift, false, false, false},
         };
         for (const auto &c : cases)
         {
@@ -888,21 +1208,27 @@ int main()
              * walker SAID so rather than returning an empty list. */
             const bool ok = w.parsed &&
                             w.vectorsOk == c.wantV && (w.nVectors > 0) == c.wantV &&
-                            w.negOk == c.wantN && (w.nNeg > 0) == c.wantN;
+                            w.negOk == c.wantN && (w.nNeg > 0) == c.wantN &&
+                            w.growthOk == c.wantG && (w.nGrowth > 0) == c.wantG;
             run(ok, named("(all)"), c.label,
                 !w.parsed ? std::string("probe envelope did not parse")
                           : "vectors ok=" + std::to_string(static_cast<int>(w.vectorsOk)) +
                                 " n=" + std::to_string(w.nVectors) +
                                 ", invalid_utf8 ok=" + std::to_string(static_cast<int>(w.negOk)) +
-                                " n=" + std::to_string(w.nNeg) + "; expected ok " +
+                                " n=" + std::to_string(w.nNeg) +
+                                ", sequence_growth ok=" + std::to_string(static_cast<int>(w.growthOk)) +
+                                " n=" + std::to_string(w.nGrowth) + "; expected ok " +
                                 std::to_string(static_cast<int>(c.wantV)) + "/" +
-                                std::to_string(static_cast<int>(c.wantN)));
+                                std::to_string(static_cast<int>(c.wantN)) + "/" +
+                                std::to_string(static_cast<int>(c.wantG)));
         }
     }
 
     std::printf("%zu vectors, %d run, %d skipped, %d checks, %d failures\n",
                 vectors.size(), static_cast<int>(vectors.size()) - skipped, skipped, checks, failures);
     std::printf("%zu invalid_utf8 vectors, %d run, %d skipped\n", negs.size(), negRun, negSkipped);
+    std::printf("%zu sequence_growth cases, %d run, %d skipped (cap %ld)\n",
+                growth.size(), growthRun, growthSkipped, kGrowthCap);
     if (failures) std::printf("first failure: %s\n", first.c_str());
     if (const char *v = std::getenv("SOFAB_LIST_FAILURES"); v && *v)
         for (const auto &f : allFailures) std::printf("  FAIL %s\n", f.c_str());

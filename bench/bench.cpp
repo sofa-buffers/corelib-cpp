@@ -109,8 +109,8 @@ struct ChildMsg : sofab::IStreamMessage
 {
     void deserialize(sofab::IStreamImpl &s, sofab::id i, size_t, size_t) noexcept override
     {
-        if (i == 1) s.read(T.s_f1);
-        else if (i == 2) s.read(T.s_f2);
+        if (i == 1) sofab::read(s, T.s_f1);
+        else if (i == 2) sofab::read(s, T.s_f2);
     }
 };
 ChildMsg childMsg;
@@ -137,7 +137,7 @@ struct CompLevel3 : sofab::IStreamMessage /* { 1: unsigned 7 } */
 {
     void deserialize(sofab::IStreamImpl &s, sofab::id i, size_t, size_t) noexcept override
     {
-        if (i == 1) s.read(C.deep);
+        if (i == 1) sofab::read(s, C.deep);
     }
 } compL3;
 
@@ -145,7 +145,7 @@ struct CompLevel2 : sofab::IStreamMessage /* { 1: { … } } */
 {
     void deserialize(sofab::IStreamImpl &s, sofab::id i, size_t, size_t) noexcept override
     {
-        if (i == 1) s.read(compL3);
+        if (i == 1) sofab::read(s, compL3);
     }
 } compL2;
 
@@ -153,8 +153,8 @@ struct CompLevel1 : sofab::IStreamMessage /* { 1: { … }, 2: signed -1 } */
 {
     void deserialize(sofab::IStreamImpl &s, sofab::id i, size_t, size_t) noexcept override
     {
-        if (i == 1) s.read(compL2);
-        else if (i == 2) s.read(C.sig);
+        if (i == 1) sofab::read(s, compL2);
+        else if (i == 2) sofab::read(s, C.sig);
     }
 } compL1;
 
@@ -313,7 +313,7 @@ extern "C" __attribute__((noinline, flatten)) void run_decode_u64_array()
 {
     IStreamRaw is;
     is.init([&is](sofab::id id, size_t, size_t count) {
-        if (id == 1) { std::span<uint64_t> sp(dec_array, count); is.read(sp); }
+        if (id == 1) { std::span<uint64_t> sp(dec_array, count); sofab::read(is, sp); }
     });
     is.feed(enc_u64_buf, enc_u64_used);
 }
@@ -324,13 +324,13 @@ extern "C" __attribute__((noinline, flatten)) void run_decode_typical()
     is.init([&is](sofab::id id, size_t, size_t) {
         switch (id)
         {
-            case 1: is.read(T.f1); break;
-            case 2: is.read(T.f2); break;
-            case 3: is.read(T.f3); break;
-            case 4: is.read(T.f4); break;
-            case 5: is.read(T.f5); break;
-            case 6: { std::span<uint16_t> sp(T.f6, 4); is.read(sp); } break;
-            case 7: is.read(childMsg); break;
+            case 1: sofab::read(is, T.f1); break;
+            case 2: sofab::read(is, T.f2); break;
+            case 3: sofab::read(is, T.f3); break;
+            case 4: sofab::read(is, T.f4); break;
+            case 5: sofab::read(is, T.f5); break;
+            case 6: { std::span<uint16_t> sp(T.f6, 4); sofab::read(is, sp); } break;
+            case 7: sofab::read(is, childMsg); break;
             default: break;
         }
     });
@@ -393,10 +393,10 @@ extern "C" __attribute__((noinline, flatten)) void run_decode_composite()
     is.init([&is](sofab::id id, size_t, size_t) {
         switch (id)
         {
-            case 1:   is.read(compItems); break;
-            case 2:   is.readString(C.text); break;
-            case 3:   is.read(compL1); break;
-            case 130: is.read(C.big); break;
+            case 1:   sofab::read(is, compItems); break;
+            case 2:   sofab::readString(is, C.text); break;
+            case 3:   sofab::read(is, compL1); break;
+            case 130: sofab::read(is, C.big); break;
             default: break;
         }
     });

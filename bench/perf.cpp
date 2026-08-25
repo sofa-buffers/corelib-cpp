@@ -68,8 +68,8 @@ struct PerfChild : sofab::IStreamMessage
     PerfOut *o = nullptr;
     void deserialize(sofab::IStreamImpl &s, sofab::id i, size_t, size_t) noexcept override
     {
-        if (i == 1) s.read(o->s_u32);
-        else if (i == 2) s.read(o->s_i32);
+        if (i == 1) sofab::read(s, o->s_u32);
+        else if (i == 2) sofab::read(s, o->s_i32);
     }
 };
 
@@ -80,18 +80,18 @@ void perf_decode(const uint8_t *buf, size_t len, PerfOut &out)
     is.init([&is, &out, &child](sofab::id id, size_t, size_t count) {
         switch (id)
         {
-            case 1:  is.read(out.u32); break;
-            case 2:  is.read(out.i32); break;
-            case 3:  is.read(out.u64); break;
-            case 4:  is.read(out.i64); break;
-            case 5:  is.read(out.b); break;
-            case 6:  is.read(out.f32); break;
-            case 7:  is.read(out.f64); break;
-            case 8:  is.read(out.str); break;
-            case 9:  { std::span<uint32_t> s(out.samples, count); is.read(s); } break;
-            case 10: { std::span<int32_t> s(out.deltas, count); is.read(s); } break;
-            case 11: { std::span<double> s(out.fp64, count); is.read(s); } break;
-            case 12: is.read(child); break;
+            case 1:  sofab::read(is, out.u32); break;
+            case 2:  sofab::read(is, out.i32); break;
+            case 3:  sofab::read(is, out.u64); break;
+            case 4:  sofab::read(is, out.i64); break;
+            case 5:  sofab::read(is, out.b); break;
+            case 6:  sofab::read(is, out.f32); break;
+            case 7:  sofab::read(is, out.f64); break;
+            case 8:  sofab::read(is, out.str); break;
+            case 9:  { std::span<uint32_t> s(out.samples, count); sofab::read(is, s); } break;
+            case 10: { std::span<int32_t> s(out.deltas, count); sofab::read(is, s); } break;
+            case 11: { std::span<double> s(out.fp64, count); sofab::read(is, s); } break;
+            case 12: sofab::read(is, child); break;
             default: break;
         }
     });

@@ -83,16 +83,11 @@ target_link_libraries(my_app PRIVATE sofa-buffers::corelib)
 
 ## Why this design
 
-The C corelib optimises for minimal code size and RAM; it targets bare metal.
-This library makes the opposite trade: size and memory are not a concern, the
-goal is **throughput**, and the decoder is tuned for a message already in
-contiguous memory.
-
 | Goal | How |
 |------|-----|
 | Fast encode | Payloads written with a single `memcpy`; a field's header + value varints emitted as one write; whole float arrays copied in one shot on little-endian. |
-| Fast decode | The *parse* allocates nothing — the cursor walks the caller's buffer in place, and only an incomplete trailing field is ever buffered; float arrays are bulk-`memcpy`'d; a `string`/`blob` payload is copied straight into the destination. |
-| Still streamable | `OStream`/`OStreamInline` flush a small buffer via callback; `feed()` dispatches each complete top-level field and buffers only an incomplete tail. |
+| Fast decode | The parse allocates nothing, at any chunk size — the cursor walks the caller's buffer in place; float arrays are bulk-`memcpy`'d; a `string`/`blob` payload is copied straight into the destination, once. |
+| Still streamable | `OStream`/`OStreamInline` flush a small buffer via callback; `feed()` dispatches each complete top-level field and resumes a field a chunk boundary cut, carrying at most 30 bytes of it. |
 | Modern C++ | `std::span`, `std::bit_cast`, concepts, `if constexpr` `write()`/`read()` deduction, `[[nodiscard]]`. Little-endian handled explicitly. |
 
 ## Usage
@@ -162,7 +157,8 @@ A message carries no framing, and an all-default message is the empty byte
 string, so a decoder cannot see a message boundary: successive `feed()` calls
 continue **one** message. Call `reset()` to decode a second one into the same
 object — it re-initialises the wrapped message and the decoder together
-(reassembly buffer, sticky flags, the latched verdict, `skipped()` counter).
+(the carry and the parse position, sticky flags, the latched verdict, `skipped()`
+counter).
 
 ```cpp
 sofab::IStreamObject<Sensor> in;
@@ -181,8 +177,11 @@ callback-driven decoder clears its own targets.)
 ### Deserialize stream
 
 `feed()` takes whatever bytes have arrived; a field straddling a chunk boundary
-is buffered and re-parsed once its remainder comes, so a chunked stream decodes
-identically to a one-shot buffer.
+is **resumed** — each piece is written into the destination as it lands, and only
+what a boundary can cut in half rides in a fixed 30-byte carry — so a chunked
+stream decodes identically to a one-shot buffer and allocates just as little.
+Such a field is delivered once per chunk that carries part of it, so its
+destination has to outlive the chunk (see `## Memory handling`).
 
 ```cpp
 sofab::IStreamObject<Sensor> in;
@@ -197,15 +196,22 @@ Each `feed()` returns a three-valued decode outcome. There is **no** separate
 | `Result`                | `code()`                 | `status()`                    | meaning |
 |-------------------------|--------------------------|-------------------------------|---------|
 | `complete()` / `ok()`   | `Error::None`            | `DecodeStatus::Complete`      | the consumed bytes end **exactly** at a field boundary — a valid message |
-| `incomplete()`          | `Error::Incomplete`      | `DecodeStatus::Incomplete`    | the bytes end **inside** a field (a partial varint, a short fixlen/array payload) or with an open sequence; the partial tail is retained for the next `feed()` |
+| `incomplete()`          | `Error::Incomplete`      | `DecodeStatus::Incomplete`    | the bytes end **inside** a field (a partial varint, a short fixlen/array payload) or with an open sequence; the decoder keeps its place for the next `feed()` |
 | `invalid()`             | `Error::InvalidMessage`  | `DecodeStatus::Invalid`       | the bytes are malformed **regardless of what follows** (varint over 64 bits, bad subtype/length, count/id over max, nesting past `MAX_DEPTH`, dangling sequence-end, …) |
+| `limitExceeded()`       | `Error::LimitExceeded`   | `DecodeStatus::LimitExceeded` | a configured receiver cap was exceeded on a field the schema leaves unbounded; the bytes are well-formed and decode under a looser cap |
+| `invalidArgument()`     | `Error::InvalidArgument` | `DecodeStatus::InvalidArgument` | the value broke no schema bound and no configured cap, but does not fit the destination this caller passed |
+
+The last two are not wire outcomes and are never folded into `Invalid`: a limit
+rejection means *raise my limit or the sender must send less*, `Invalid` means
+*these bytes are broken*, and `InvalidArgument` means *pass a bigger
+destination*.
 
 `Incomplete` is not an error — it means "the message may continue". A streaming
 caller reads it as "feed me more bytes"; a caller that has delivered all its
 bytes and still sees it knows the message was truncated.
 
-`Invalid` and the `LimitExceeded` policy code below are **terminal**, and the
-decoder latches them on the stream: once a `feed()` returns either, every later
+`Invalid`, `LimitExceeded` and `InvalidArgument` are all **terminal**, and the
+decoder latches them on the stream: once a `feed()` returns one, every later
 `feed()` returns it immediately without parsing. `reset()` is the way back.
 
 ```cpp
@@ -220,21 +226,20 @@ The latch is what keeps the outcome chunk-independent: the same bytes fed whole,
 in odd-sized chunks or one at a time end on the same verdict, and a sender cannot
 prefix garbage to a valid message and still have the receiver report `Complete`.
 
-#### Streaming buffer limit (opt-in)
+#### Field-size limit (opt-in)
 
-A never-completing or huge trailing field would otherwise grow the internal
-reassembly buffer without bound — a field may claim up to `FIXLEN_MAX` ≈ 2 GB.
-Pass a `sofab::Limits` to cap it:
+A field may claim up to `FIXLEN_MAX` ≈ 2 GB, and a receiver that does not want to
+spend that long on one field can say so. Pass a `sofab::Limits` to cap it:
 
 ```cpp
 sofab::IStreamObject<Sensor> in{ sofab::Limits{ .max_buffered_field = 64 * 1024 } };
 ```
 
-`max_buffered_field` bounds how large a *single* incomplete top-level field may
-grow the buffer. A field whose declared size exceeds it fails `feed()` with
-`Error::LimitExceeded` the moment the size is known, before the payload is
-buffered — so an oversized header is rejected even if its bytes never arrive,
-whether fed whole or byte by byte. This is a receiver-side **policy** code, kept
+`sofab::Limits` carries two receiver-side caps. `max_buffered_field` bounds how
+many bytes a *single* top-level field may span. A field whose declared size
+exceeds it fails `feed()` with `Error::LimitExceeded` the moment the size is
+known, before a byte of payload is read — so an oversized header is rejected even
+if its bytes never arrive, whether fed whole or byte by byte. This is a receiver-side **policy** code, kept
 distinct from `Error::InvalidMessage`: a local limit is not wire malformation.
 The default is no cap (`SIZE_MAX`). Bytes are never clamped or truncated; the
 `feed()` simply fails.
@@ -248,6 +253,20 @@ with its **payload withheld**: `readString`/`readArray`/… settle the wire type
 (§7.3) and the schema bound (§7.1) and then report `Incomplete` instead of
 materialising anything. Only a field the schema leaves unbounded ends in
 `LimitExceeded`.
+
+`max_dyn_array_count` is the second cap. A wrapper array — an array of `string`,
+`blob`, `struct` or nested rows — carries no count header: its length is *highest
+present id + 1*, so the element **index** is what a cap has to bind, and it is
+checked before the container is extended. The `StringSeq` / `BlobSeq` /
+`MessageSeq` collectors take the same cap per field as their `dynCap` argument,
+which generated code sets from the schema; the `Limits` value is the fallback for
+a collector that declares none. Its default is no cap for the same reason
+`max_buffered_field`'s is: the numbers belong to the layer that knows the schema
+and the target.
+
+```cpp
+sofab::IStreamObject<Sensor> in{ sofab::Limits{ .max_dyn_array_count = 4096 } };
+```
 
 #### Strict UTF-8 validation (`SOFAB_STRICT_UTF8`, default ON)
 
@@ -382,40 +401,66 @@ non-canonical empty frame that every decoder normalizes away, a wrong
 `sequenceEnd` silently changes an array's length — so `write` (keep) is the safe
 default and `writeLazy` the deliberate one. Generated code picks per position.
 
-There is no depth window: the pending run grows on demand up to `MAX_DEPTH`
-(255), so the omission is canonical at every legal depth. The held-back ids are
-encoder state, never buffer content, so a flush can never split a run and a tiny
-output buffer yields byte-identical output. Beyond the run's inline depth the
-ids spill to the heap (see [Memory handling](#memory-handling)); a failed
-allocation there is reported, not fatal — the open is refused with
-`Error::BufferFull` and `ok()` turns false.
+There is no depth window: the pending run is a fixed `MAX_DEPTH` array (255 ids)
+inside the stream object, sized when the stream is constructed, so the omission
+is canonical at every legal depth and no depth of nesting allocates. The
+held-back ids are encoder state, never buffer content, so a flush can never
+split a run and a tiny output buffer yields byte-identical output. An open past
+`MAX_DEPTH` is refused with `Error::InvalidArgument`, `ok()` turns false, and
+the sequence is not opened.
 
 ## Memory handling
 
-Buffer ownership is the defining trade-off of this port, and it is the inverse of
-the C port's.
-
-**Decode — in-place parsing over the caller's buffer.** When nothing is buffered
-(the common case, a whole message handed in at once) the cursor walks straight
-over the caller's contiguous `buf`, allocating and copying nothing.
+**Decode — in-place parsing over the caller's buffer.** The cursor walks straight
+over the caller's contiguous `buf`, allocating nothing — and that holds however
+the bytes arrive, whole or one byte at a time.
 
 - **A fed chunk is yours again the moment `feed()` returns.** Every destination
   owns what it receives: a `string` or `blob` is copied out before the call
-  returns. There is deliberately **no** borrowing destination —
-  `read(std::string_view&)` does not exist, and asking for one is a compile error
-  that names the owning alternatives.
-- Integer and float arrays decode into the caller-provided `span`/container, and
-  `read(void* dst, size_t maxlen)` copies a blob out. The stream never allocates
-  the destination.
-- If a `feed()` chunk ends mid-field, only that trailing field is copied into an
-  internal accumulator and re-parsed on the next `feed()`. That accumulator is
-  the one piece of library-owned heap on the decode path, and
-  `Limits::max_buffered_field` bounds it.
+  returns, on the one-shot path exactly as on the streaming one. There is
+  deliberately **no** borrowing destination — `read(std::string_view&)` does not
+  exist, and asking for one is a compile error that names the owning
+  alternatives. Nothing a callback receives is valid after it returns.
+- **The value lands in storage the caller supplied.** That is the route this port
+  uses: `read`/`readString`/`readBlob`/`readArray` are handed a destination and
+  write into it, and `read(void* dst, size_t maxlen)` copies a blob out. The
+  stream never allocates a destination and never sizes one from the wire.
+- **No wire number sizes an allocation the codec makes.** A count or length on
+  the wire is checked against the schema bound, then a configured receiver cap,
+  then the destination's capacity, before anything is written; a value larger
+  than the destination is refused, never grown into.
+- **A field a chunk boundary cuts is resumed, not buffered.** Each piece of a
+  `string`, `blob` or array payload is written into the caller's destination as
+  it arrives, and the decoder carries only what a boundary can cut in half — a
+  field header, the words before a payload, one varint element — in a fixed
+  30-byte array inside the stream object, sized when it is constructed. A nested
+  sequence left open is re-entered by replaying the open levels' field ids. **No
+  wire number, and no chunk size, decides any memory this library holds.**
+- **A field is delivered once per chunk that carries part of it.** That is the
+  other side of the same coin: the handler is called again with the same id, and
+  `read`/`readString`/`readArray` continue where they stopped. Generated code
+  dispatches on the id and needs nothing more. A handler that keeps a position of
+  its own reads `IStreamImpl::progress()` (bytes or elements already delivered)
+  and `IStreamImpl::resumed()` (this delivery re-enters an open sequence). The
+  **destination must stay put** for the duration: a member of the message object
+  does, a local in the handler does not.
+- **Receiver caps.** `Limits::max_buffered_field` bounds how many bytes one
+  top-level field may span; `Limits::max_dyn_array_count` bounds the element **index** of
+  a wrapper array the schema leaves unbounded, and the `StringSeq` / `BlobSeq` /
+  `MessageSeq` collectors take the same cap per field as `dynCap`. Neither has a
+  default: the numbers belong to generated code, which knows the schema and the
+  target. Breaching one is `Error::LimitExceeded`, never `InvalidMessage`.
 
-This inverts the C port's deferred-copy model, where `read()` binds an
-address-stable destination that a later `feed()` fills. Here `read()` pulls the
-value out immediately, so no destination has to stay stable across chunks and no
-input buffer has to outlive the call it was passed to.
+`read()` pulls the value out immediately: no input buffer has to outlive the call
+it was passed to.
+
+**Who sizes the destination.** The codec never does — it is handed one and
+refuses one that is too short (`Error::InvalidArgument`) rather than growing it.
+The free functions `sofab::readString` / `readBlob` / `readArray` / `read` are the
+generated layer's entry point: they size a growable destination (`std::string`,
+`std::vector`) for the announced value and then call the codec. They compile away
+to nothing for a heap-free destination. Calling the `IStreamImpl` members
+directly is the power-user path, and then sizing the destination is yours.
 
 **Encode — writes into a caller-supplied, fixed-size buffer; flushes, never
 grows.** The library **allocates no output buffer**: `OStreamView` writes into
@@ -440,7 +485,8 @@ field is simply absent.
 **`MIN_OUTPUT_BUFFER` is `1`.** That is the smallest buffer this port accepts
 **for streaming**, and it binds a buffer installed together with a flush sink:
 `buflen - offset` must be at least that much, checked where the buffer is handed
-over (a constructor or `OStream::setBuffer`), never partway through a message. A
+over (a constructor, `OStream::setBuffer` or `OStreamView::setBuffer`), never
+partway through a message. A
 rejected installation leaves the stream inert with `ok() == false`. A buffer
 installed **without** a sink has no minimum at all, so a two-byte message still
 encodes into a two-byte buffer. Every write funnels through a per-byte fallback
@@ -451,7 +497,9 @@ output.
 **Flush handover.** A sink either *copies* what it is handed — it returns without
 installing anything, and the encoder resumes in the same buffer at offset 0 — or
 it *takes* the buffer, in which case it **must** call `setBuffer` before
-returning. The start offset belongs to the installation, not to the buffer, and
+returning (`OStream::setBuffer` for `shared_ptr` storage,
+`OStreamView::setBuffer` for storage the caller already owns; `OStreamInline`
+carries its buffer inside the object and so admits only copying sinks). The start offset belongs to the installation, not to the buffer, and
 is consumed by the first flush that returns without one; re-installing is how a
 sink re-arms header room in every packet. This port does **not** implement
 pass-through of a `string`/`blob` run, so a sink is only ever handed the buffer
@@ -463,14 +511,18 @@ the byte count and leaves the message where it is, readable through `data()` /
 callback returned from moves the cursor back to offset 0. A stream starts over by
 installing a buffer or by being constructed anew — `flush()` is not a reset.
 
-The one allocation an encode can make is the held-back sequence run (see
-[Sequence framing](#sequence-framing-an-all-default-sub-message-is-omitted)).
-The first eight levels of nesting live inside the stream object, costing it 64
-bytes of state, so the ordinary encode allocates nothing; only a deeper run
-spills to the heap, bounded by `MAX_DEPTH` (255 ids, ~1 KiB). With exceptions
-enabled the `bad_alloc` is caught and `sequenceBeginLazy` returns
-`Error::BufferFull`; under `-fno-exceptions` the failure terminates the process,
-as any other allocation in such a build does.
+**A decode allocates nothing at all, either.** `allocationMeasurement()`
+measures a complete decode against the `operator new` counter at every chunk
+size from one byte to the whole message, and the count is zero.
+
+**An encode allocates nothing at all.** The held-back sequence run (see
+[Sequence framing](#sequence-framing-an-all-default-sub-message-is-omitted)) is
+a fixed `MAX_DEPTH` array inside the stream object — 255 ids, ~1 KiB — sized
+when the stream is constructed, so the hold-back is canonical at every legal
+depth and no nesting depth reaches an allocator. An open past `MAX_DEPTH` is
+refused with `Error::InvalidArgument` and does not open the sequence.
+`test_roundtrip.cpp`'s `allocationMeasurement()` measures a complete encode
+against the `operator new` counter, for all four stream flavours.
 
 ### Heap-free destinations
 
@@ -490,25 +542,30 @@ sofab::FixedString<24>                        name;   // maxlen 24
 sofab::InlineVector<sofab::FixedString<8>, 4> tags;   // count 4, maxlen 8
 sofab::InlineVector<Reading, 4>               rows;   // count 4, struct elements
 
-case 1: is.readString(name, 24); break;               // same call either way
-case 2: { sofab::StringSeq c{tags, 4, 8}; is.read(c); } break;
-case 3: { sofab::MessageSeq<decltype(rows)> c; c.out = &rows; is.read(c); } break;
+case 1: sofab::readString(is, name, 24); break;       // same call either way
+case 2: { sofab::StringSeq c{tags, 4, 8}; sofab::read(is, c); } break;
+case 3: { sofab::MessageSeq<decltype(rows)> c; c.out = &rows; sofab::read(is, c); } break;
 ```
 
-Call sites are spelled identically for both storage kinds, so switching a field's
-storage is a change of member type and nothing else. Semantics are unchanged: a
+Call sites are spelled identically for both storage kinds — the `sofab::` free
+functions size a growable destination and compile away for a heap-free one — so
+switching a field's storage is a change of member type and nothing else. Semantics are unchanged: a
 payload past the declared bound is `INVALID` (§7.1) rather than truncated, and
 one past the container's own capacity is refused as well — a decode never drops
-what it cannot store. The two refusals stay in different categories:
+what it cannot store. Which refusal it is follows CORELIB_PLAN §6.3's three
+tiers, in that order:
 
-| ceiling that was passed | outcome | why |
-|---|---|---|
-| a declared `maxlen` / `count` | `INVALID` | the schema makes the message malformed (§7.1) |
-| the destination's capacity, nothing declared | `readArray`: `LimitExceeded`<br>`readString` / `readBlob`: `INVALID` | the bytes are well-formed — the same message decodes into a growable destination — so this is the receiver-side category of §6.2.1 |
+| ceiling that was passed | outcome |
+|---|---|
+| a declared `maxlen` / `count` | `InvalidMessage` (`DecodeStatus::Invalid`) |
+| a configured receiver cap (`Limits::max_buffered_field`, `readArray`'s `dynCap`) on a field the schema does not bound | `LimitExceeded` (`DecodeStatus::LimitExceeded`) |
+| neither of the above, and the destination this caller passed is too short | `InvalidArgument` (`DecodeStatus::InvalidArgument`) |
 
-A decode into fully bounded fields performs **no allocation at all**;
-`test_roundtrip.cpp`'s `heapFreeStorage()` checks that against the `operator new`
-counter. The three types are deliberately identical, in name and behaviour, to
+A decode into fully bounded fields performs no allocation at all, at any chunk
+size; `test_roundtrip.cpp`'s `heapFreeStorage()` and `allocationMeasurement()`
+check that against the `operator new` counter.
+
+The three types are deliberately identical, in name and behaviour, to
 `corelib-c-cpp`'s, so generated code for a bounded field is the same whichever
 C++ corelib it targets.
 
@@ -526,19 +583,29 @@ build tool, and with Unix Makefiles that is `make -j` with no limit. Run both
 (strict aliasing, UB the optimiser acts on, an uninitialised field) is invisible
 to a Debug-only run.
 
+**Build options.** `SOFAB_STRICT_UTF8=0` is the only one that changes what the
+library accepts: it compiles the UTF-8 check out, so this build accepts — and
+emits — a `string` payload a strict peer answers `INVALID` for. The wire format
+is unchanged and every other build option (`SOFAB_ENABLE_COVERAGE`,
+`SOFAB_ENABLE_DOXYGEN`, `SOFAB_INSTALL`, `SOFAB_BUILD_TESTING`) is invisible to a
+peer. CI builds and conformance-tests the default, strict configuration as well
+as the non-strict one.
+
 Six suites run under CTest:
 
 - **`test_roundtrip`** — encode/decode/nested/chunked/skip, the three-valued
   outcome, malformed input, the terminal latch, and §2 sequence framing.
 - **`test_vectors`** — replays the shared `assets/test_vectors.json` for encode,
-  decode and byte-at-a-time streaming.
+  decode and byte-at-a-time streaming: the `vectors`, `invalid_utf8` and
+  `sequence_growth` groups, plus a guard that fails when the file's envelope
+  drifts.
 - **`test_bench_tools`** — holds the benchmark tooling to BENCH_SPEC: the
   workload list, both output tables, and the cross-port parity sizes.
 - **`test_ci_workflows`** — reads `.github/workflows/` and requires both build
   types, no untyped CMake configure, and `fail-fast: false` on a matrix.
-- **`test_readme_structure`** — reads this README and requires the §9 section
-  list and order, the §9.2 badge block, the §9.5 examples, the §6.4 and §9.6
-  facts, the §6.1.1 name set, and that every in-document link resolves.
+- **`test_readme_example`** — compiles and runs the `### Code generator`
+  example as a real translation unit, and fails if this README's fenced block
+  and that source ever disagree.
 - **`test_vendored_provenance`** — re-hashes the vendored copies against the
   provenance table in `test/shared/README.md`, so a refresh without a re-pin
   goes red.
