@@ -83,6 +83,25 @@ void operator delete[](void *p) noexcept { std::free(p); }
 void operator delete(void *p, size_t) noexcept { std::free(p); }
 void operator delete[](void *p, size_t) noexcept { std::free(p); }
 
+static std::vector<uint8_t> fromHex(std::string_view h)
+{
+    auto nib = [](char c) { return c <= '9' ? c - '0' : (c | 0x20) - 'a' + 10; };
+    auto isHex = [](char c) {
+        return (c >= '0' && c <= '9') || ((c | 0x20) >= 'a' && (c | 0x20) <= 'f');
+    };
+    std::vector<uint8_t> v;
+    int hi = -1;
+    for (char c : h)                    /* separators are ignored, so the wire can be
+                                         * written in readable groups */
+    {
+        if (!isHex(c)) continue;
+        if (hi < 0) { hi = nib(c); continue; }
+        v.push_back(static_cast<uint8_t>(hi << 4 | nib(c)));
+        hi = -1;
+    }
+    return v;
+}
+
 static std::string toHex(std::span<const uint8_t> bytes)
 {
     static const char *h = "0123456789abcdef";
@@ -208,12 +227,12 @@ struct ScalarMsg : sofab::IStreamMessage
     {
         switch (id)
         {
-            case 1: is.read(a); break;
-            case 2: is.read(b); break;
-            case 3: is.read(f); break;
-            case 4: is.read(d); break;
-            case 5: is.read(s); break;
-            case 6: is.read(flag); break;
+            case 1: sofab::read(is, a); break;
+            case 2: sofab::read(is, b); break;
+            case 3: sofab::read(is, f); break;
+            case 4: sofab::read(is, d); break;
+            case 5: sofab::read(is, s); break;
+            case 6: sofab::read(is, flag); break;
         }
     }
 };
@@ -244,7 +263,7 @@ struct ArrMsg : sofab::IStreamMessage
     std::array<uint32_t,5> u{}; std::array<float,3> f{};
     void deserialize(sofab::IStreamImpl &is, sofab::id id, size_t, size_t) noexcept override
     {
-        switch (id) { case 1: is.read(u); break; case 2: is.read(f); break; }
+        switch (id) { case 1: sofab::read(is, u); break; case 2: sofab::read(is, f); break; }
     }
 };
 
@@ -267,7 +286,7 @@ struct Child : sofab::IStreamMessage
     uint64_t x = 0; int64_t y = 0;
     void deserialize(sofab::IStreamImpl &is, sofab::id id, size_t, size_t) noexcept override
     {
-        switch (id) { case 0: is.read(x); break; case 2: is.read(y); break; }
+        switch (id) { case 0: sofab::read(is, x); break; case 2: sofab::read(is, y); break; }
     }
 };
 
@@ -276,7 +295,7 @@ struct Parent : sofab::IStreamMessage
     uint64_t top = 0; Child child; int64_t tail = 0;
     void deserialize(sofab::IStreamImpl &is, sofab::id id, size_t, size_t) noexcept override
     {
-        switch (id) { case 0: is.read(top); break; case 1: is.read(child); break; case 2: is.read(tail); break; }
+        switch (id) { case 0: sofab::read(is, top); break; case 1: sofab::read(is, child); break; case 2: sofab::read(is, tail); break; }
     }
 };
 
@@ -371,7 +390,7 @@ static void skippingUnknownFields()
     struct Only2 : sofab::IStreamMessage {
         int64_t b = 0;
         void deserialize(sofab::IStreamImpl &is, sofab::id id, size_t, size_t) noexcept override
-        { if (id == 2) is.read(b); }
+        { if (id == 2) sofab::read(is, b); }
     };
     checkStreamReuse<Only2>("skippingUnknownFields/Only2");
     sofab::IStreamObject<Only2> in;
@@ -469,7 +488,13 @@ static void malformedInput()
         const uint8_t bytes[] = {0x2a, static_cast<uint8_t>((200u << 3) | 2u), 'h', 'i'};
         auto r = in.feed(bytes, sizeof bytes); /* id 5, string, len=200 */
         CHECK(r.code() == sofab::Error::Incomplete, "malformed: oversized fixlen is INCOMPLETE, no OOB read");
-        CHECK((*in).s.empty(), "malformed: oversized fixlen yields no string");
+        /* §6.6.2 has the codec copy a split payload "into it as the piece
+         * arrives", and the generated layer sizes that destination for what the
+         * header announced — so an unfinished payload may leave room, or a
+         * prefix, behind. What an INCOMPLETE decode promises is the *verdict*,
+         * never a value the caller may use, and that nothing past the fed buffer
+         * was read. The claimed 200 bytes are what must not appear. */
+        CHECK((*in).s.size() < 200, "malformed: oversized fixlen never materialises its claim");
     }
 
     /* A stray sequence-end marker with no open sequence is INVALID (§7), not a
@@ -567,7 +592,7 @@ static void malformedInput()
         struct Only2 : sofab::IStreamMessage {
             int64_t b = 0;
             void deserialize(sofab::IStreamImpl &is, sofab::id id, size_t, size_t) noexcept override
-            { if (id == 2) is.read(b); }
+            { if (id == 2) sofab::read(is, b); }
         };
         checkStreamReuse<Only2>("malformedInput/Only2");
         sofab::IStreamObject<Only2> in;
@@ -826,7 +851,7 @@ static void callbackInvalidate()
             if (id == 0)
             {
                 if (count > 4) { is.invalidate(); return; } /* the generated guard */
-                is.read(u);
+                sofab::read(is, u);
             }
         }
     };
@@ -907,7 +932,7 @@ static void headerFirstBounds()
     {
         std::array<uint8_t, 4> u{};
         void deserialize(sofab::IStreamImpl &is, sofab::id id, size_t, size_t) noexcept override
-        { if (id == 15) is.readArray(u, 4); }
+        { if (id == 15) sofab::readArray(is, u, 4); }
     };
     checkStreamReuse<BoundedArr>("headerFirstBounds/BoundedArr");
     {   /* count 6 (>4) then EOF after 2 elements — over-count AND truncated */
@@ -944,7 +969,7 @@ static void headerFirstBounds()
     {
         std::string s;
         void deserialize(sofab::IStreamImpl &is, sofab::id id, size_t, size_t) noexcept override
-        { if (id == 5) is.readString(s, 8); }
+        { if (id == 5) sofab::readString(is, s, 8); }
     };
     checkStreamReuse<BoundedStr>("headerFirstBounds/BoundedStr");
     {   /* len 10 (>8), complete */
@@ -986,7 +1011,7 @@ static void headerFirstBounds()
     {
         Elems e;
         void deserialize(sofab::IStreamImpl &is, sofab::id id, size_t, size_t) noexcept override
-        { if (id == 3) is.read(e); }
+        { if (id == 3) sofab::read(is, e); }
     };
     checkStreamReuse<WrapMsg>("headerFirstBounds/WrapMsg");
     {   /* elements 0,1 then element index 2 (>=2), complete */
@@ -1044,7 +1069,7 @@ static void elementWidthBound()
     {
         std::array<uint8_t, 4> u{};
         void deserialize(sofab::IStreamImpl &is, sofab::id id, size_t, size_t) noexcept override
-        { if (id == 15) is.readArray(u, 4, -1, sofab::ElemBound::of<uint8_t>()); }
+        { if (id == 15) sofab::readArray(is, u, 4, -1, sofab::ElemBound::of<uint8_t>()); }
     };
     checkStreamReuse<U8Arr>("elementWidthBound/U8Arr");
     /* the same array read WITHOUT a declared width, as a hand-written caller
@@ -1053,7 +1078,7 @@ static void elementWidthBound()
     {
         std::array<uint8_t, 4> u{};
         void deserialize(sofab::IStreamImpl &is, sofab::id id, size_t, size_t) noexcept override
-        { if (id == 15) is.readArray(u, 4); }
+        { if (id == 15) sofab::readArray(is, u, 4); }
     };
     checkStreamReuse<U8ArrUnbounded>("elementWidthBound/U8ArrUnbounded");
     /* array<i8> count 4 at id 15 (header 0x7c = (15<<3)|ArraySigned). Elements are
@@ -1063,7 +1088,7 @@ static void elementWidthBound()
     {
         std::array<int8_t, 4> i{};
         void deserialize(sofab::IStreamImpl &is, sofab::id id, size_t, size_t) noexcept override
-        { if (id == 15) is.readArray(i, 4, -1, sofab::ElemBound::of<int8_t>()); }
+        { if (id == 15) sofab::readArray(is, i, 4, -1, sofab::ElemBound::of<int8_t>()); }
     };
     checkStreamReuse<I8Arr>("elementWidthBound/I8Arr");
 
@@ -1136,7 +1161,7 @@ static void elementWidthBound()
         {
             std::array<uint32_t, 2> u{};
             void deserialize(sofab::IStreamImpl &is, sofab::id id, size_t, size_t) noexcept override
-            { if (id == 15) is.readArray(u, 2, -1, sofab::ElemBound::of<uint32_t>()); }
+            { if (id == 15) sofab::readArray(is, u, 2, -1, sofab::ElemBound::of<uint32_t>()); }
         };
         checkStreamReuse<U32Arr>("elementWidthBound/U32Arr");
         {   /* 4294967295 = ff ff ff ff 0f */
@@ -1163,7 +1188,7 @@ static void elementWidthBound()
         {
             std::array<uint64_t, 1> u{};
             void deserialize(sofab::IStreamImpl &is, sofab::id id, size_t, size_t) noexcept override
-            { if (id == 15) is.readArray(u, 1, -1, sofab::ElemBound::of<uint64_t>()); }
+            { if (id == 15) sofab::readArray(is, u, 1, -1, sofab::ElemBound::of<uint64_t>()); }
         };
         checkStreamReuse<U64Arr>("elementWidthBound/U64Arr");
         const uint8_t bytes[] = {0x7b, 0x01, 0xff, 0xff, 0xff, 0xff, 0xff,
@@ -1182,7 +1207,7 @@ static void elementWidthBound()
         {
             std::array<uint8_t, 2> u{};
             void deserialize(sofab::IStreamImpl &is, sofab::id id, size_t, size_t) noexcept override
-            { if (id == 15) is.readArray(u, -1, -1, sofab::ElemBound::of<uint8_t>()); }
+            { if (id == 15) sofab::readArray(is, u, -1, -1, sofab::ElemBound::of<uint8_t>()); }
         };
         checkStreamReuse<ShortDst>("elementWidthBound/ShortDst");
         {   /* four elements into a two-element destination, the LAST over-width */
@@ -1253,7 +1278,7 @@ static void elementWidthBound()
         {
             std::vector<uint16_t> u;
             void deserialize(sofab::IStreamImpl &is, sofab::id id, size_t, size_t) noexcept override
-            { if (id == 15) is.readArray(u, 4, -1, sofab::ElemBound::of<uint16_t>()); }
+            { if (id == 15) sofab::readArray(is, u, 4, -1, sofab::ElemBound::of<uint16_t>()); }
         };
         checkStreamReuse<VecArr>("elementWidthBound/VecArr");
         {   /* 65535 = ff ff 03 */
@@ -1277,7 +1302,7 @@ static void elementWidthBound()
         {
             std::array<int32_t, 2> i{};
             void deserialize(sofab::IStreamImpl &is, sofab::id id, size_t, size_t) noexcept override
-            { if (id == 15) is.readArray(i, 2, -1, sofab::ElemBound{-10, 10}); }
+            { if (id == 15) sofab::readArray(is, i, 2, -1, sofab::ElemBound{-10, 10}); }
         };
         checkStreamReuse<RangedArr>("elementWidthBound/RangedArr");
         {   /* -10, 10 -> zig-zag 19 (13), 20 (14) */
@@ -1320,7 +1345,7 @@ static void callbackExceedLimit()
             if (id == 0)
             {
                 if (count > 4) { is.exceedLimit(); return; } /* the generated #102 guard */
-                is.read(u);
+                sofab::read(is, u);
             }
         }
     };
@@ -1378,7 +1403,7 @@ static void wireTypeGuard()
         {
             if (id != 0) return;
             if (is.wire() != sofab::detail::Wire::Unsigned) return; /* §7.3: skip on mismatch */
-            is.read(v);
+            sofab::read(is, v);
             read = true;
         }
     };
@@ -1416,7 +1441,7 @@ static void wireTypeGuard()
             uint32_t v = 0;
             bool taken = false;
             void deserialize(sofab::IStreamImpl &is, sofab::id id, size_t, size_t) noexcept override
-            { if (id == 0) taken = is.read(v); }
+            { if (id == 0) taken = sofab::read(is, v); }
         };
         checkStreamReuse<UnguardedU>("wireTypeGuard/UnguardedU");
         const uint8_t bytes[] = {0x01, 0x06}; /* Signed, zig-zag 6 = 3 */
@@ -1438,7 +1463,7 @@ static void wireTypeGuard()
         {
             uint32_t a = 0, b = 0;
             void deserialize(sofab::IStreamImpl &is, sofab::id id, size_t, size_t) noexcept override
-            { if (id == 0) is.read(a); else if (id == 1) is.read(b); }
+            { if (id == 0) sofab::read(is, a); else if (id == 1) sofab::read(is, b); }
         };
         checkStreamReuse<TwoU>("wireTypeGuard/TwoU");
         const uint8_t bytes[] = {0x01, 0x06, 0x09, 0x06}; /* id0 Signed, id1 Signed */
@@ -1473,11 +1498,11 @@ static void wireTypeGuard()
             uint32_t guarded = 0; /* id 1, declared unsigned, read behind a hand guard */
             void deserialize(sofab::IStreamImpl &is, sofab::id id, size_t, size_t) noexcept override
             {
-                if (id == 0) is.read(known);
+                if (id == 0) sofab::read(is, known);
                 else if (id == 1)
                 {
                     if (is.wire() != sofab::detail::Wire::Unsigned) return; /* the generated array-arm shape */
-                    is.read(guarded);
+                    sofab::read(is, guarded);
                 }
                 /* every other id: not ours, never read */
             }
@@ -1514,8 +1539,8 @@ static void wireTypeGuard()
             bool readA = false;
             void deserialize(sofab::IStreamImpl &is, sofab::id id, size_t, size_t) noexcept override
             {
-                if (id == 0) { if (is.wire() != sofab::detail::Wire::Unsigned) return; is.read(a); readA = true; }
-                else if (id == 1) { if (is.wire() != sofab::detail::Wire::Signed) return; is.read(b); }
+                if (id == 0) { if (is.wire() != sofab::detail::Wire::Unsigned) return; sofab::read(is, a); readA = true; }
+                else if (id == 1) { if (is.wire() != sofab::detail::Wire::Signed) return; sofab::read(is, b); }
             }
         };
         checkStreamReuse<TwoFields>("wireTypeGuard/TwoFields");
@@ -1539,7 +1564,7 @@ static void wireTypeGuard()
             {
                 if (id != 5) return;
                 if (is.wire() != sofab::detail::Wire::Fixlen || is.fixType() != sofab::detail::Fix::String) return;
-                is.read(s);
+                sofab::read(is, s);
                 read = true;
             }
         };
@@ -1585,8 +1610,8 @@ static void wireTypeGuard()
             uint32_t next = 0;
             void deserialize(sofab::IStreamImpl &is, sofab::id id, size_t, size_t) noexcept override
             {
-                if (id == 5)      taken = is.read(s);
-                else if (id == 6) is.read(next);
+                if (id == 5)      taken = sofab::read(is, s);
+                else if (id == 6) sofab::read(is, next);
             }
         };
         checkStreamReuse<StrBinder>("wireTypeGuard/StrBinder");
@@ -1748,10 +1773,10 @@ struct EmptyArrMsg : sofab::IStreamMessage
     {
         switch (id)
         {
-            case 1: uCount = count; is.read(u); break;
-            case 2: sCount = count; is.read(s); break;
-            case 3: fCount = count; is.read(f); break;
-            case 4: is.read(tail); break;
+            case 1: uCount = count; sofab::read(is, u); break;
+            case 2: sCount = count; sofab::read(is, s); break;
+            case 3: fCount = count; sofab::read(is, f); break;
+            case 4: sofab::read(is, tail); break;
         }
     }
 };
@@ -1800,7 +1825,7 @@ static void zeroLengthForms()
         struct OnlyTail : sofab::IStreamMessage {
             int64_t t = 0;
             void deserialize(sofab::IStreamImpl &is, sofab::id id, size_t, size_t) noexcept override
-            { if (id == 2) is.read(t); }
+            { if (id == 2) sofab::read(is, t); }
         };
         checkStreamReuse<OnlyTail>("zeroLengthForms/OnlyTail");
         sofab::IStreamObject<OnlyTail> in;
@@ -2405,7 +2430,7 @@ static void bufferLimits()
         std::string got;
         bool consumed = false;
         sofab::IStreamInline in(
-            [&](sofab::id, size_t, size_t) { in.read(got); consumed = in.consumed(); },
+            [&](sofab::id, size_t, size_t) { sofab::read(in, got); consumed = in.consumed(); },
             sofab::Limits{cap});
         auto r = in.feed(hdr.data(), hdr.size());
         CHECK(r.code() == sofab::Error::LimitExceeded, "limit: IStreamInline honours the cap");
@@ -2444,10 +2469,10 @@ struct BoundedMsg : sofab::IStreamMessage
     {
         switch (id)
         {
-            case 1: is.readString(s, 4); break;
-            case 2: is.readArray(a, 4);  break;
-            case 3: is.read(u);          break;
-            case 4: is.readArray(v);     break;
+            case 1: sofab::readString(is, s, 4); break;
+            case 2: sofab::readArray(is, a, 4);  break;
+            case 3: sofab::read(is, u);          break;
+            case 4: sofab::readArray(is, v);     break;
         }
     }
 };
@@ -2564,13 +2589,151 @@ struct TierMsg : sofab::IStreamMessage
     {
         switch (id)
         {
-            case 1: is.readString(bounded, 4); break;
-            case 2: is.readString(plain);      break;
-            case 3: is.readBlob(blob);         break;
-            case 4: is.readArray(arr, -1, dynCap); break;
+            case 1: sofab::readString(is, bounded, 4); break;
+            case 2: sofab::readString(is, plain);      break;
+            case 3: sofab::readBlob(is, blob);         break;
+            case 4: sofab::readArray(is, arr, -1, dynCap); break;
         }
     }
 };
+
+/* --- §6.6/§6.6.3: the codec never grows the caller's destination ------------
+ *
+ * The rule the audit's A2-0016 pinned: "the codec allocates nothing itself but
+ * **requires a growable destination** and grows it, from a wire count or
+ * otherwise -- violates -- it moved the allocator call one type away, where a
+ * source-level audit no longer sees it." (§6.6, violation table row 2.)
+ *
+ * What replaces it is §6.6.3's second shape: a value is delivered "into a
+ * destination the caller hands back after being told the announced count, with
+ * the codec refusing a destination too short rather than growing it". So there
+ * are two claims to pin, and they are opposite sides of one contract:
+ *
+ *   1. driven at the CODEC surface (IStreamImpl::readString / readBlob /
+ *      readArray), an empty growable destination is REFUSED -- InvalidArgument,
+ *      §6.3's third tier -- and not one byte is allocated;
+ *   2. driven through the HELPER layer (sofab::readString / ... , §6.6.1), which
+ *      is what generated code calls, the destination is sized there and the same
+ *      bytes decode to the same value.
+ *
+ * Both run under the allocation counter, because "source inspection alone is
+ * still not sufficient" (§6.6.4): claim 1 is exactly the measurement that fails
+ * if the growth ever comes back. --- */
+struct GrowMsg : sofab::IStreamMessage
+{
+    std::string text;              /* id 1: string  */
+    std::vector<uint8_t> bytes;    /* id 2: blob    */
+    std::vector<uint32_t> nums;    /* id 3: u-array */
+    bool viaHelper = false;
+    void deserialize(sofab::IStreamImpl &is, sofab::id id, size_t, size_t) noexcept override
+    {
+        if (viaHelper)
+            switch (id)
+            {
+                case 1: (void)sofab::readString(is, text); break;
+                case 2: (void)sofab::readBlob(is, bytes);  break;
+                case 3: (void)sofab::readArray(is, nums);  break;
+                default: break;
+            }
+        else
+            switch (id)
+            {
+                case 1: (void)is.readString(text); break;
+                case 2: (void)is.readBlob(bytes);  break;
+                case 3: (void)is.readArray(nums);  break;
+                default: break;
+            }
+    }
+};
+
+static void destinationIsNeverGrown()
+{
+    /* id 1 string "sofa", id 2 blob {1,2,3}, id 3 u-array [7, 8]. */
+    const auto wire = fromHex("0a22736f6661" "121b010203" "1b020708");
+
+    /* --- 1. the codec surface refuses an empty growable destination --------- */
+    for (int field = 1; field <= 3; ++field)
+    {
+        static const char *names[] = {"", "readString", "readBlob", "readArray"};
+        static char msg[128];
+        auto say = [&](const char *what) {
+            std::snprintf(msg, sizeof msg, "no-grow [%s]: %s", names[field], what);
+            return msg;
+        };
+        /* One field at a time, so each read is judged on its own. */
+        const std::vector<uint8_t> one =
+            field == 1 ? fromHex("0a22736f6661")
+                       : (field == 2 ? fromHex("121b010203") : fromHex("1b020708"));
+        auto in = std::make_unique<sofab::IStreamObject<GrowMsg>>();
+        const unsigned long before = g_allocCount;
+        const auto r = in->feed(one.data(), one.size());
+        CHECK(r.code() == sofab::Error::InvalidArgument && r.invalidArgument(),
+              say("an empty growable destination is InvalidArgument, not a resize"));
+        CHECK(r.status() == sofab::DecodeStatus::InvalidArgument,
+              say("and status() keeps it out of Invalid"));
+        CHECK(!r.invalid() && !r.limitExceeded(), say("and out of the other two tiers"));
+        CHECK(g_allocCount == before, say("and the refusal allocated nothing"));
+        CHECK((**in).text.empty() && (**in).bytes.empty() && (**in).nums.empty(),
+              say("and left the destination exactly as it was"));
+    }
+
+    /* --- 2. the same bytes through the helper layer, which sizes ------------ */
+    {
+        auto in = std::make_unique<sofab::IStreamObject<GrowMsg>>();
+        (**in).viaHelper = true;
+        CHECK(in->feed(wire.data(), wire.size()).code() == sofab::Error::None,
+              "no-grow: the helper layer sizes the destination and the message decodes");
+        CHECK((**in).text == "sofa", "no-grow: the string decodes");
+        CHECK((**in).bytes == std::vector<uint8_t>({1, 2, 3}), "no-grow: the blob decodes");
+        CHECK((**in).nums == std::vector<uint32_t>({7, 8}), "no-grow: the array decodes");
+    }
+
+    /* --- 3. a destination the CALLER sized: the codec fills it and allocates
+     *        nothing, which is the whole point of moving the sizing out. ----- */
+    {
+        auto in = std::make_unique<sofab::IStreamObject<GrowMsg>>();
+        (**in).text.resize(4);
+        (**in).bytes.resize(3);
+        (**in).nums.resize(2);
+        const unsigned long before = g_allocCount;
+        CHECK(in->feed(wire.data(), wire.size()).code() == sofab::Error::None,
+              "no-grow: a pre-sized destination decodes at the codec surface");
+        CHECK(g_allocCount == before,
+              "no-grow: and the codec allocated nothing to fill it (§6.6.4)");
+        CHECK((**in).text == "sofa" && (**in).bytes == std::vector<uint8_t>({1, 2, 3}) &&
+                  (**in).nums == std::vector<uint32_t>({7, 8}),
+              "no-grow: with the same values as the helper-driven decode");
+    }
+
+    /* --- 4. over-sized by the caller: the decoded length is `M`, published as
+     *        a shrink -- never a grow, and never a silent surplus. ----------- */
+    {
+        auto in = std::make_unique<sofab::IStreamObject<GrowMsg>>();
+        (**in).text.assign(64, 'x');
+        (**in).bytes.assign(64, 0xee);
+        (**in).nums.assign(64, 0xffffffffu);
+        const unsigned long before = g_allocCount;
+        CHECK(in->feed(wire.data(), wire.size()).code() == sofab::Error::None,
+              "no-grow: an over-sized destination decodes too");
+        CHECK(g_allocCount == before, "no-grow: shrinking to M allocates nothing");
+        CHECK((**in).text == "sofa" && (**in).bytes.size() == 3 && (**in).nums.size() == 2,
+              "no-grow: and the destination's length is the wire's M, not what it was");
+    }
+
+    /* --- 5. §7.4: an occurrence skipped under §7.3 must leave the destination
+     *        untouched -- including its SIZE, so the helper's sizing may not run
+     *        before the tag has spoken. Field id 1 arrives as a `blob`, which a
+     *        readString declines. --- */
+    {
+        auto in = std::make_unique<sofab::IStreamObject<GrowMsg>>();
+        (**in).viaHelper = true;
+        const auto mistyped = fromHex("0a23736f6661"); /* id 1, fixlen, subtype blob */
+        CHECK(in->feed(mistyped.data(), mistyped.size()).code() == sofab::Error::None,
+              "no-grow: a §7.3-mistyped field is skipped, not an error");
+        CHECK(in->skipped() == 1, "no-grow: and counted as a skip");
+        CHECK((**in).text.empty(), "no-grow: and the helper did not size a destination for it");
+    }
+}
 
 static void refusalTiers()
 {
@@ -2928,24 +3091,6 @@ static void strictUtf8()
  * implement that split, and picking the wrong one for an element does not cost
  * bytes -- it changes the decoded array's LENGTH. --- */
 
-static std::vector<uint8_t> fromHex(std::string_view h)
-{
-    auto nib = [](char c) { return c <= '9' ? c - '0' : (c | 0x20) - 'a' + 10; };
-    auto isHex = [](char c) {
-        return (c >= '0' && c <= '9') || ((c | 0x20) >= 'a' && (c | 0x20) <= 'f');
-    };
-    std::vector<uint8_t> v;
-    int hi = -1;
-    for (char c : h)                    /* separators are ignored, so the wire can be
-                                         * written in readable groups */
-    {
-        if (!isHex(c)) continue;
-        if (hi < 0) { hi = nib(c); continue; }
-        v.push_back(static_cast<uint8_t>(hi << 4 | nib(c)));
-        hi = -1;
-    }
-    return v;
-}
 
 /* One uint field, all-default when a == 0, serialised sparsely per §2. */
 struct SeqRow : sofab::Message
@@ -2957,7 +3102,7 @@ struct SeqRow : sofab::Message
     }
     void deserialize(sofab::IStreamImpl &is, sofab::id id, size_t, size_t) noexcept override
     {
-        if (id == 0) is.read(a);
+        if (id == 0) sofab::read(is, a);
     }
 };
 
@@ -2972,7 +3117,7 @@ struct NestRow : sofab::Message
     }
     void deserialize(sofab::IStreamImpl &is, sofab::id id, size_t, size_t) noexcept override
     {
-        if (id == 1) is.read(child);
+        if (id == 1) sofab::read(is, child);
     }
 };
 
@@ -2990,12 +3135,12 @@ struct SeqMsg : sofab::IStreamMessage
     {
         switch (id)
         {
-            case 1: { sofab::StringSeq c{tags};  is.read(c); break; }
-            case 2: { sofab::MessageSeq<SeqRow> c; c.out = &rows; is.read(c); break; }
-            case 3: { sofab::BlobSeq c{blobs};   is.read(c); break; }
-            case 4: { sofab::MessageSeq<std::vector<uint32_t>> c; c.out = &matrix; is.read(c); break; }
-            case 5: { sofab::MessageSeq<NestRow> c; c.out = &nested; is.read(c); break; }
-            case 9: is.read(other); break;
+            case 1: { sofab::StringSeq c{tags};  sofab::read(is, c); break; }
+            case 2: { sofab::MessageSeq<SeqRow> c; c.out = &rows; sofab::read(is, c); break; }
+            case 3: { sofab::BlobSeq c{blobs};   sofab::read(is, c); break; }
+            case 4: { sofab::MessageSeq<std::vector<uint32_t>> c; c.out = &matrix; sofab::read(is, c); break; }
+            case 5: { sofab::MessageSeq<NestRow> c; c.out = &nested; sofab::read(is, c); break; }
+            case 9: sofab::read(is, other); break;
         }
     }
 };
@@ -3007,7 +3152,7 @@ struct RowsAtOneMsg : sofab::IStreamMessage
     std::vector<SeqRow> rows;
     void deserialize(sofab::IStreamImpl &is, sofab::id id, size_t, size_t) noexcept override
     {
-        if (id == 1) { sofab::MessageSeq<SeqRow> c; c.out = &rows; is.read(c); }
+        if (id == 1) { sofab::MessageSeq<SeqRow> c; c.out = &rows; sofab::read(is, c); }
     }
 };
 
@@ -3020,8 +3165,8 @@ struct BoundedSeqMsg : sofab::IStreamMessage
     {
         switch (id)
         {
-            case 1: { sofab::StringSeq c{tags, -1, 2};  is.read(c); break; }
-            case 2: { sofab::BlobSeq   c{blobs, -1, 2}; is.read(c); break; }
+            case 1: { sofab::StringSeq c{tags, -1, 2};  sofab::read(is, c); break; }
+            case 2: { sofab::BlobSeq   c{blobs, -1, 2}; sofab::read(is, c); break; }
         }
     }
 };
@@ -3032,7 +3177,7 @@ struct CappedMsg : sofab::IStreamMessage
     std::vector<SeqRow> rows;
     void deserialize(sofab::IStreamImpl &is, sofab::id id, size_t, size_t) noexcept override
     {
-        if (id == 1) { sofab::MessageSeq<SeqRow> c; c.out = &rows; c.cap = 2; is.read(c); }
+        if (id == 1) { sofab::MessageSeq<SeqRow> c; c.out = &rows; c.cap = 2; sofab::read(is, c); }
     }
 };
 
@@ -3069,8 +3214,8 @@ struct DynRowsMsg : sofab::IStreamMessage
     {
         switch (id)
         {
-            case 1: { sofab::MessageSeq<std::vector<SeqRow>> c; c.out = &rows; c.cap = 3; is.read(c); break; }
-            case 4: { sofab::MessageSeq<std::vector<std::vector<uint32_t>>> c; c.out = &matrix; is.read(c); break; }
+            case 1: { sofab::MessageSeq<std::vector<SeqRow>> c; c.out = &rows; c.cap = 3; sofab::read(is, c); break; }
+            case 4: { sofab::MessageSeq<std::vector<std::vector<uint32_t>>> c; c.out = &matrix; sofab::read(is, c); break; }
         }
     }
 };
@@ -3085,9 +3230,9 @@ struct FixedRowsMsg : sofab::IStreamMessage
     {
         switch (id)
         {
-            case 1: { sofab::MessageSeq<sofab::InlineVector<SeqRow, 3>> c; c.out = &rows; is.read(c); break; }
+            case 1: { sofab::MessageSeq<sofab::InlineVector<SeqRow, 3>> c; c.out = &rows; sofab::read(is, c); break; }
             case 4: { sofab::MessageSeq<sofab::InlineVector<sofab::InlineVector<uint32_t, 2>, 3>> c;
-                      c.out = &matrix; is.read(c); break; }
+                      c.out = &matrix; sofab::read(is, c); break; }
         }
     }
 };
@@ -3387,8 +3532,8 @@ struct F41Row : sofab::Message
     }
     void deserialize(sofab::IStreamImpl &is, sofab::id id, size_t, size_t) noexcept override
     {
-        if (id == 0) is.read(k);
-        else if (id == 1) is.read(v);
+        if (id == 0) sofab::read(is, k);
+        else if (id == 1) sofab::read(is, v);
     }
 };
 
@@ -3404,10 +3549,10 @@ struct F41Msg : sofab::IStreamMessage
     {
         switch (id)
         {
-            case 200: { sofab::StringSeq c{strs, 5, 64};  is.read(c); break; }
-            case 201: { sofab::BlobSeq   c{blobs, 5, 64}; is.read(c); break; }
-            case 202: { sofab::MessageSeq<F41Row> c; c.out = &rows; c.cap = 5; is.read(c); break; }
-            case 8:   is.read(other); break;
+            case 200: { sofab::StringSeq c{strs, 5, 64};  sofab::read(is, c); break; }
+            case 201: { sofab::BlobSeq   c{blobs, 5, 64}; sofab::read(is, c); break; }
+            case 202: { sofab::MessageSeq<F41Row> c; c.out = &rows; c.cap = 5; sofab::read(is, c); break; }
+            case 8:   sofab::read(is, other); break;
         }
     }
 };
@@ -3430,7 +3575,7 @@ struct F41GenSeq : sofab::IStreamMessage
         if (is.wire() != Tag::SequenceStart) return;                    /* §7.3 */
         if (cap >= 0 && static_cast<long>(id) >= cap) { is.invalidate(); return; }
         while (out->size() <= static_cast<size_t>(id)) out->emplace_back();
-        is.read((*out)[id]);
+        sofab::read(is, (*out)[id]);
     }
 };
 
@@ -3439,7 +3584,7 @@ struct F41GenMsg : sofab::IStreamMessage
     std::vector<F41Row> rows;
     void deserialize(sofab::IStreamImpl &is, sofab::id id, size_t, size_t) noexcept override
     {
-        if (id == 202) { F41GenSeq c; c.out = &rows; c.cap = 5; is.read(c); }
+        if (id == 202) { F41GenSeq c; c.out = &rows; c.cap = 5; sofab::read(is, c); }
     }
 };
 
@@ -3463,7 +3608,7 @@ struct CapStringMsg : sofab::IStreamMessage
     long dynCap = -1;
     void deserialize(sofab::IStreamImpl &is, sofab::id id, size_t, size_t) noexcept override
     {
-        if (id == 1) { sofab::StringSeq c{tags, -1, -1, dynCap}; is.read(c); }
+        if (id == 1) { sofab::StringSeq c{tags, -1, -1, dynCap}; sofab::read(is, c); }
     }
 };
 
@@ -3473,7 +3618,7 @@ struct CapBlobMsg : sofab::IStreamMessage
     long dynCap = -1;
     void deserialize(sofab::IStreamImpl &is, sofab::id id, size_t, size_t) noexcept override
     {
-        if (id == 1) { sofab::BlobSeq c{blobs, -1, -1, dynCap}; is.read(c); }
+        if (id == 1) { sofab::BlobSeq c{blobs, -1, -1, dynCap}; sofab::read(is, c); }
     }
 };
 
@@ -3482,7 +3627,7 @@ struct FixedStringSeqMsg : sofab::IStreamMessage
     sofab::InlineVector<sofab::FixedString<8>, 4> tags;
     void deserialize(sofab::IStreamImpl &is, sofab::id id, size_t, size_t) noexcept override
     {
-        if (id == 1) { sofab::StringSeq c{tags}; is.read(c); }
+        if (id == 1) { sofab::StringSeq c{tags}; sofab::read(is, c); }
     }
 };
 
@@ -3497,7 +3642,7 @@ struct CapRowsMsg : sofab::IStreamMessage
             sofab::MessageSeq<std::vector<SeqRow>> c;
             c.out = &rows;
             c.dynCap = dynCap;
-            is.read(c);
+            sofab::read(is, c);
         }
     }
 };
@@ -3558,7 +3703,7 @@ static void wrapperArrayIndexCaps()
             std::vector<std::string> *out;
             void deserialize(sofab::IStreamImpl &is, sofab::id id, size_t, size_t) noexcept override
             {   /* schema `count: 4` AND a looser receiver cap of 8 */
-                if (id == 1) { sofab::StringSeq c{*out, 4, -1, 8}; is.read(c); }
+                if (id == 1) { sofab::StringSeq c{*out, 4, -1, 8}; sofab::read(is, c); }
             }
         };
         BoundedIdxMsg m;
@@ -4121,7 +4266,7 @@ struct F56Inner : sofab::IStreamMessage
     std::vector<float> vals; /* id 0 -- fp32 array, count 5 */
     void deserialize(sofab::IStreamImpl &is, sofab::id id, size_t, size_t) noexcept override
     {
-        if (id == 0) is.readArray(vals, 5);
+        if (id == 0) sofab::readArray(is, vals, 5);
     }
 };
 struct F56Nested : sofab::IStreamMessage
@@ -4129,7 +4274,7 @@ struct F56Nested : sofab::IStreamMessage
     F56Inner inner; /* id 10 */
     void deserialize(sofab::IStreamImpl &is, sofab::id id, size_t, size_t) noexcept override
     {
-        if (id == 10) is.read(inner);
+        if (id == 10) sofab::read(is, inner);
     }
 };
 struct F56Msg : sofab::IStreamMessage
@@ -4137,7 +4282,7 @@ struct F56Msg : sofab::IStreamMessage
     F56Nested nested; /* id 100 */
     void deserialize(sofab::IStreamImpl &is, sofab::id id, size_t, size_t) noexcept override
     {
-        if (id == 100) is.read(nested);
+        if (id == 100) sofab::read(is, nested);
     }
 };
 
@@ -4283,11 +4428,11 @@ struct DynStoreMsg : sofab::Message
     {
         switch (id)
         {
-            case 1: is.readString(name, 8); break;
-            case 2: is.readBlob(sig, 4); break;
-            case 3: is.readArray(nums, 4); break;
-            case 4: { sofab::StringSeq c{tags, 3, 2};  is.read(c); break; }
-            case 5: { sofab::BlobSeq   c{parts, 3, 2}; is.read(c); break; }
+            case 1: sofab::readString(is, name, 8); break;
+            case 2: sofab::readBlob(is, sig, 4); break;
+            case 3: sofab::readArray(is, nums, 4); break;
+            case 4: { sofab::StringSeq c{tags, 3, 2};  sofab::read(is, c); break; }
+            case 5: { sofab::BlobSeq   c{parts, 3, 2}; sofab::read(is, c); break; }
         }
     }
 };
@@ -4321,11 +4466,11 @@ struct FixedStoreMsg : sofab::Message
     {
         switch (id)
         {
-            case 1: is.readString(name, 8); break;
-            case 2: is.readBlob(sig, 4); break;
-            case 3: is.readArray(nums, 4); break;
-            case 4: { sofab::StringSeq c{tags, 3, 2};  is.read(c); break; }
-            case 5: { sofab::BlobSeq   c{parts, 3, 2}; is.read(c); break; }
+            case 1: sofab::readString(is, name, 8); break;
+            case 2: sofab::readBlob(is, sig, 4); break;
+            case 3: sofab::readArray(is, nums, 4); break;
+            case 4: { sofab::StringSeq c{tags, 3, 2};  sofab::read(is, c); break; }
+            case 5: { sofab::BlobSeq   c{parts, 3, 2}; sofab::read(is, c); break; }
         }
     }
 };
@@ -4533,7 +4678,7 @@ static void heapFreeStorage()
             sofab::FixedString<8> name;
             void deserialize(sofab::IStreamImpl &is, sofab::id id, size_t, size_t) noexcept override
             {
-                if (id == 1) is.readString(name); /* no declared maxlen */
+                if (id == 1) sofab::readString(is, name); /* no declared maxlen */
             }
         };
         checkStreamReuse<NoBoundMsg>("heapFreeStorage/NoBoundMsg");
@@ -4557,7 +4702,7 @@ static void heapFreeStorage()
             sofab::FixedString<8> name{"keep"};
             void deserialize(sofab::IStreamImpl &is, sofab::id id, size_t, size_t) noexcept override
             {
-                if (id == 1) is.readString(name, 8);
+                if (id == 1) sofab::readString(is, name, 8);
             }
         };
         checkStreamReuse<TypedMsg>("heapFreeStorage/TypedMsg");
@@ -4579,7 +4724,7 @@ static void heapFreeStorage()
             sofab::FixedString<8> s;
             void deserialize(sofab::IStreamImpl &is, sofab::id id, size_t, size_t) noexcept override
             {
-                if (id == 5) is.readString(s, 8);
+                if (id == 5) sofab::readString(is, s, 8);
             }
         };
         checkStreamReuse<Utf8Msg>("heapFreeStorage/Utf8Msg");
@@ -4610,7 +4755,7 @@ static void heapFreeStorage()
             sofab::InlineVector<uint32_t, 4> v;
             void deserialize(sofab::IStreamImpl &is, sofab::id id, size_t, size_t) noexcept override
             {
-                if (id == 1) is.readArray(v); /* no declared count */
+                if (id == 1) sofab::readArray(is, v); /* no declared count */
             }
         };
         checkStreamReuse<UnboundedArrayMsg>("heapFreeStorage/UnboundedArrayMsg");
@@ -4619,7 +4764,7 @@ static void heapFreeStorage()
             sofab::InlineVector<uint32_t, 4> v;
             void deserialize(sofab::IStreamImpl &is, sofab::id id, size_t, size_t) noexcept override
             {
-                if (id == 1) is.readArray(v, 4); /* count: 4 */
+                if (id == 1) sofab::readArray(is, v, 4); /* count: 4 */
             }
         };
         checkStreamReuse<BoundedArrayMsg>("heapFreeStorage/BoundedArrayMsg");
@@ -4628,7 +4773,7 @@ static void heapFreeStorage()
             std::vector<uint32_t> v;
             void deserialize(sofab::IStreamImpl &is, sofab::id id, size_t, size_t) noexcept override
             {
-                if (id == 1) is.readArray(v);
+                if (id == 1) sofab::readArray(is, v);
             }
         };
         checkStreamReuse<GrowableArrayMsg>("heapFreeStorage/GrowableArrayMsg");
@@ -4674,7 +4819,7 @@ static void heapFreeStorage()
                 sofab::InlineVector<float, 4> v;
                 void deserialize(sofab::IStreamImpl &is, sofab::id id, size_t, size_t) noexcept override
                 {
-                    if (id == 2) is.readArray(v);
+                    if (id == 2) sofab::readArray(is, v);
                 }
             };
             checkStreamReuse<FloatArrayMsg>("heapFreeStorage/FloatArrayMsg");
@@ -4831,7 +4976,7 @@ struct SweepU : sofab::IStreamMessage
     std::vector<uint64_t> v;
     void deserialize(sofab::IStreamImpl &is, sofab::id id, size_t, size_t count) noexcept override
     {
-        if (id == 1) { v.assign(count, 0); is.read(v); }
+        if (id == 1) { v.assign(count, 0); sofab::read(is, v); }
     }
 };
 struct SweepI : sofab::IStreamMessage
@@ -4839,7 +4984,7 @@ struct SweepI : sofab::IStreamMessage
     std::vector<int64_t> v;
     void deserialize(sofab::IStreamImpl &is, sofab::id id, size_t, size_t count) noexcept override
     {
-        if (id == 1) { v.assign(count, 0); is.read(v); }
+        if (id == 1) { v.assign(count, 0); sofab::read(is, v); }
     }
 };
 
@@ -4955,8 +5100,8 @@ struct TrailMsg : sofab::IStreamMessage
          * destination from it is what makes a shortened M observable here. */
         switch (id)
         {
-            case 0: u.assign(count, 0); is.read(u); break;
-            case 1: f.assign(count, 0.0f); is.read(f); break;
+            case 0: u.assign(count, 0); sofab::read(is, u); break;
+            case 1: f.assign(count, 0.0f); sofab::read(is, f); break;
         }
     }
 };
@@ -5203,7 +5348,7 @@ struct TolChild : sofab::Message
     }
     void deserialize(sofab::IStreamImpl &is, sofab::id id, size_t, size_t) noexcept override
     {
-        if (id == 0) is.read(a);
+        if (id == 0) sofab::read(is, a);
     }
 };
 
@@ -5219,7 +5364,7 @@ struct TolParent : sofab::Message
     }
     void deserialize(sofab::IStreamImpl &is, sofab::id id, size_t, size_t) noexcept override
     {
-        if (id == 1) is.read(c);
+        if (id == 1) sofab::read(is, c);
     }
 };
 
@@ -5231,7 +5376,7 @@ static void toleranceInput()
         const std::vector<uint8_t> w = {0x88, 0x00, 0x2a};
         uint64_t got = 0;
         sofab::id gotId = 999;
-        sofab::IStreamInline is([&](sofab::id id, size_t, size_t) { gotId = id; is.read(got); });
+        sofab::IStreamInline is([&](sofab::id id, size_t, size_t) { gotId = id; sofab::read(is, got); });
         auto r = is.feed(w.data(), w.size());
         CHECK(r.complete(), "tolerance: a non-minimal field header decodes COMPLETE, not INVALID");
         CHECK(gotId == 1 && got == 42, "tolerance: and denotes the same field and value");
@@ -5242,7 +5387,7 @@ static void toleranceInput()
     {
         const std::vector<uint8_t> w = {0x0a, 0x8a, 0x00, 'x'};
         std::string got;
-        sofab::IStreamInline is([&](sofab::id, size_t, size_t) { is.readString(got); });
+        sofab::IStreamInline is([&](sofab::id, size_t, size_t) { sofab::readString(is, got); });
         auto r = is.feed(w.data(), w.size());
         CHECK(r.complete(), "tolerance: a non-minimal fixlen_word decodes COMPLETE");
         CHECK(got == "x", "tolerance: and denotes the same payload length");
@@ -5253,7 +5398,7 @@ static void toleranceInput()
     {
         const std::vector<uint8_t> w = {0x0b, 0x82, 0x00, 0x01, 0x02};
         std::vector<uint32_t> got;
-        sofab::IStreamInline is([&](sofab::id, size_t, size_t) { is.readArray(got); });
+        sofab::IStreamInline is([&](sofab::id, size_t, size_t) { sofab::readArray(is, got); });
         auto r = is.feed(w.data(), w.size());
         CHECK(r.complete(), "tolerance: a non-minimal element count decodes COMPLETE");
         CHECK(got.size() == 2 && got[0] == 1 && got[1] == 2,
@@ -5306,7 +5451,7 @@ static void toleranceInput()
     {
         const std::vector<uint8_t> w = {0x02, 0x84}; /* id 0 fixlen; word byte 0: subtype 4 */
         std::string got;
-        sofab::IStreamInline is([&](sofab::id, size_t, size_t) { is.readString(got); });
+        sofab::IStreamInline is([&](sofab::id, size_t, size_t) { sofab::readString(is, got); });
         auto r = is.feed(w.data(), w.size());
         CHECK(r.incomplete() && !r.invalid(),
               "tolerance: a fixlen_word cut after a reserved-subtype first byte is INCOMPLETE");
@@ -5332,9 +5477,9 @@ static void toleranceInput()
             std::vector<uint32_t> arr;
             uint64_t u = 0;
             sofab::IStreamInline is([&](sofab::id, size_t, size_t) {
-                is.read(u);
-                is.readString(sink);
-                is.readArray(arr);
+                sofab::read(is, u);
+                sofab::readString(is, sink);
+                sofab::readArray(is, arr);
             });
             sofab::Error last = sofab::Error::None;
             for (uint8_t b : w) last = is.feed(&b, 1).code();
@@ -6024,10 +6169,10 @@ static void chunkLifetime()
         {
             switch (id)
             {
-                case 1: is.readString(s); break;
-                case 2: is.readBlob(b); break;
-                case 3: is.readArray(a); break;
-                case 4: is.readString(fs, 32); break;
+                case 1: sofab::readString(is, s); break;
+                case 2: sofab::readBlob(is, b); break;
+                case 3: sofab::readArray(is, a); break;
+                case 4: sofab::readString(is, fs, 32); break;
             }
         }
     };
@@ -6242,7 +6387,7 @@ struct SweepArrMsg : sofab::IStreamMessage
     sofab::ElemBound bound{};        /**< declared element width (§7.1)  */
     void deserialize(sofab::IStreamImpl &is, sofab::id id, size_t, size_t) noexcept override
     {
-        if (id == 15) is.readArray(v, count, cap, bound);
+        if (id == 15) sofab::readArray(is, v, count, cap, bound);
     }
 };
 
@@ -6653,7 +6798,7 @@ struct Utf8FixedMsg : sofab::IStreamMessage
     sofab::FixedString<32> s;
     void deserialize(sofab::IStreamImpl &is, sofab::id id, size_t, size_t) noexcept override
     {
-        if (id == 5) is.readString(s, 32);
+        if (id == 5) sofab::readString(is, s, 32);
     }
 };
 
@@ -6915,6 +7060,7 @@ int main()
     bufferLimits();
     schemaBoundOutranksCap();
     refusalTiers();
+    destinationIsNeverGrown();
     utf8ValidatorSweep();
     strictUtf8();
     messageLayerFraming();

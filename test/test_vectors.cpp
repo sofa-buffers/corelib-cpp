@@ -660,7 +660,7 @@ struct NegReadMsg : sofab::IStreamMessage
     void deserialize(sofab::IStreamImpl &is, sofab::id, size_t, size_t) noexcept override
     {
         std::string s;
-        is.read(s);
+        sofab::read(is, s);
     }
 };
 
@@ -840,7 +840,7 @@ struct GenericMsg : sofab::IStreamMessage
             case K::B:   { bool x = false; is.read(x); if (x != (op.u != 0)) bad("bool"); break; }
             case K::F32: { float x = 0;    is.read(x); if (!eq32(x, static_cast<float>(op.f))) bad("fp32"); break; }
             case K::F64: { double x = 0;   is.read(x); if (!eq64(x, op.f)) bad("fp64"); break; }
-            case K::Str: { std::string x;  is.read(x); if (x != op.str) bad("string"); break; }
+            case K::Str: { std::string x;  sofab::read(is, x); if (x != op.str) bad("string"); break; }
             case K::Blob:
             {
                 std::vector<uint8_t> buf(op.blob.size() + 1);

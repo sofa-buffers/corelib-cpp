@@ -568,6 +568,68 @@ namespace sofab
             if constexpr (requires { T::capacity(); }) return static_cast<long>(T::capacity());
             else                                       return -1;
         }
+
+        /**
+         * @brief Room a decode destination **already holds** — bytes for a payload,
+         *        elements for an array (CORELIB_PLAN §6.6.3).
+         *
+         * §6.6 forbids the codec growing the caller's destination from a wire
+         * number: "the codec allocates nothing itself but **requires a growable
+         * destination** and grows it, from a wire count or otherwise — violates".
+         * §6.6.3 names the shape that replaces it — a value is delivered "into a
+         * destination the caller hands back after being told the announced count,
+         * **with the codec refusing a destination too short rather than growing
+         * it**" — so every typed read needs one number: how much room is there
+         * *now*.
+         *
+         * Two kinds of destination answer it differently, and the difference is
+         * not a policy the codec picks but a fact the type publishes:
+         *
+         * * a **static capacity** (`T::capacity()` — @ref FixedString,
+         *   @ref FixedBytes, @ref InlineVector) is storage the caller already owns
+         *   in full. Setting a length inside it allocates nothing, so the room is
+         *   the capacity;
+         * * anything else (`std::string`, `std::vector`, `std::array`, a bound
+         *   span) offers exactly `size()`. For a heap-growable container that is
+         *   the point: the codec writes into what the caller sized and never
+         *   creates room, so no allocator call can reach the wire.
+         *
+         * @tparam D Destination type.
+         * @param d  The destination.
+         * @return Room in bytes (payload) or elements (array).
+         */
+        template <typename D>
+        constexpr size_t destRoom(const D &d) noexcept
+        {
+            if constexpr (requires { D::capacity(); }) return static_cast<size_t>(D::capacity());
+            else                                       return d.size();
+        }
+
+        /**
+         * @brief Publish the decoded length in a destination that already had the
+         *        room — the one container operation the codec performs.
+         *
+         * Never grows: @ref destRoom has already been compared against the
+         * announced size, so `n` is at most what the destination holds and this is
+         * a length store (@ref FixedString::set_len) or a **shrink**. A shrink
+         * cannot allocate — `std::string` / `std::vector` never reallocate for a
+         * size below the current one — so §6.6's question, "can a sender make this
+         * allocation bigger by sending different bytes?", has no allocation to ask
+         * it of.
+         *
+         * A destination of fixed extent that publishes neither (`std::array`, a
+         * bound span) keeps its extent; the value's length is the announced count
+         * the caller was told.
+         *
+         * @param d Destination.
+         * @param n Decoded length, already known to fit.
+         */
+        template <typename D>
+        constexpr void destSetLen(D &d, size_t n) noexcept
+        {
+            if constexpr (requires { d.set_len(n); })      d.set_len(n);
+            else if constexpr (requires { d.resize(n); }) { if (d.size() != n) d.resize(n); }
+        }
     } // namespace detail
 
     /**
@@ -3145,6 +3207,72 @@ namespace sofab
         }
 
         /**
+         * @brief Deliver the current fixlen payload into the destination the
+         *        caller handed over (§6.6.3, second shape).
+         *
+         * The one place a `string` / `blob` payload reaches a destination, so the
+         * §6.6 rule has one implementation and cannot hold in one read and be
+         * missing from another. In order:
+         *
+         * 1. **The destination's room** (@ref detail::destRoom) against the
+         *    announced length. Too short is §6.3's third refusal tier —
+         *    @ref rejectDestination, `InvalidArgument` — because both bounds that
+         *    can speak about the *message* have already spoken: the schema
+         *    `maxlen` in the caller above, and any configured receiver cap. It is
+         *    decided from the **header alone**, before a byte of payload is
+         *    consulted, so where the chunk boundaries fall cannot change it.
+         * 2. **Availability.** Fewer bytes than the declared length is
+         *    `INCOMPLETE`, never an error (§5.2).
+         * 3. **UTF-8** (§6.4), for a `string` payload only, and never on skip
+         *    (§6.4.5 — this function runs only where a value is materialized).
+         * 4. **The copy**, then the length (@ref detail::destSetLen). The
+         *    destination is written exactly once, complete (§6.6.2).
+         *
+         * @tparam D Destination: @ref FixedString / @ref FixedBytes (static room)
+         *         or a `std::string` / `std::vector<uint8_t>` the caller sized.
+         * @param value Destination.
+         * @param validateUtf8 Whether the payload is a `string` (§6.4).
+         * @return `true` when the payload was delivered and the field consumed.
+         */
+        template <typename D>
+        bool readPayload(D &value, bool validateUtf8) noexcept
+        {
+            if constexpr (requires { D::capacity(); })
+            {
+                /* **Static** room cannot change between chunks, so the refusal is
+                 * decided from the header alone, before a byte of payload is
+                 * consulted: where the chunk boundaries fall cannot change it. */
+                if (fixLen_ > D::capacity()) { rejectDestination(); return false; }
+            }
+            else
+            {
+                /* Room the caller sized, judged against what this delivery can
+                 * actually **reach** — the announced length, clamped to the bytes
+                 * in hand. A declared length whose payload is absent or withheld
+                 * reaches nothing and refuses nothing, so a truncated field stays
+                 * `INCOMPLETE` (§5.2) instead of being mistaken for a destination
+                 * that is too small; once the payload is here the reach IS the
+                 * announced length, and a destination genuinely too short is
+                 * refused exactly then. */
+                if (std::min<size_t>(fixLen_, static_cast<size_t>(end_ - p_)) > value.size())
+                { rejectDestination(); return false; }
+            }
+            if (static_cast<size_t>(end_ - p_) < fixLen_) { incomplete_ = true; return false; }
+#if SOFAB_STRICT_UTF8
+            if (validateUtf8 &&
+                !detail::utf8Valid(reinterpret_cast<const char *>(p_), fixLen_))
+            { error_ = true; return false; }
+#else
+            (void)validateUtf8;
+#endif
+            if (fixLen_) std::memcpy(value.data(), p_, fixLen_);
+            detail::destSetLen(value, fixLen_);
+            p_ += fixLen_;
+            consumed_ = true;
+            return true;
+        }
+
+        /**
          * @brief Would buffering this field cross @ref maxBufferedField_?
          *
          * @param consumed Bytes of the current top-level field already spanned.
@@ -4154,23 +4282,10 @@ namespace sofab
                  * are skipped like an unknown id instead. */
                 if (!tagMatches(Wire::Fixlen, Fix::String, Fix::Blob))
                     return false; /* §7.3, see the view branch */
-                if (static_cast<size_t>(end_ - p_) < fixLen_)
-                {
-                    incomplete_ = true;
-                    return false;
-                }
-#if SOFAB_STRICT_UTF8
-                /* §6.4: reject an invalid-UTF-8 `string` payload as INVALID (see
-                 * the std::string_view branch above for the full rationale).
-                 * Gated on the wire subtype so a `blob` read into a std::string
-                 * is never validated. */
-                if (fixType_ == Fix::String &&
-                    !detail::utf8Valid(reinterpret_cast<const char *>(p_), fixLen_))
-                { error_ = true; return false; }
-#endif
-                value.assign(reinterpret_cast<const char *>(p_), fixLen_);
-                p_ += fixLen_;
-                consumed_ = true;
+                /* §6.6.3: the destination is what the caller handed over, and a
+                 * payload longer than its room is refused rather than grown into
+                 * — see @ref readPayload. */
+                if (!readPayload(value, fixType_ == Fix::String)) return false;
             }
             else if constexpr (InputMessage<T>)
             {
@@ -4326,36 +4441,12 @@ namespace sofab
             if (!tagMatches(Wire::Fixlen, Fix::String)) return false;      /* §7.3 */
             if (bound >= 0 && fixLen_ > static_cast<size_t>(bound))        /* §7.1/§5.2 */
             { error_ = true; return false; }
-            if constexpr (requires { value.set_len(size_t{}); S::capacity(); })
-            {
-                /* §6.3's THIRD refusal tier. Both bounds that can speak about the
-                 * message have already spoken -- the schema `maxlen` above, and the
-                 * receiver cap wherever generated code applies one -- so a payload
-                 * that still does not fit is neither malformed nor over a
-                 * configured limit: it does not fit THIS CALLER'S destination.
-                 * "`InvalidMessage` would mark a well-formed message malformed --
-                 * the same bytes decode for a caller who passes a larger
-                 * destination ... `LimitExceeded` would promise a limit to raise
-                 * that was never configured." (§6.3). Never a silent truncation and
-                 * never a resize; checked before any byte is written, so a refused
-                 * field leaves the destination alone (§7.4). */
-                if (fixLen_ > S::capacity()) { rejectDestination(); return false; }
-                if (static_cast<size_t>(end_ - p_) < fixLen_)
-                { incomplete_ = true; return false; }
-#if SOFAB_STRICT_UTF8
-                /* §6.4, same rule as the std::string branch of read(): the subtype
-                 * is already known to be Fix::String from tagMatches above, so no
-                 * second gate is needed here. */
-                if (!detail::utf8Valid(reinterpret_cast<const char *>(p_), fixLen_))
-                { error_ = true; return false; }
-#endif
-                std::memcpy(value.data(), p_, fixLen_);
-                value.set_len(fixLen_);
-                p_ += fixLen_;
-                consumed_ = true;
-                return true;
-            }
-            else return read(value);
+            /* One delivery path for both storage modes (§6.6.3): the destination
+             * is refused when it is shorter than the announced payload, never
+             * grown to fit it. Which of the two a destination is — static room or
+             * room the caller sized — is a fact @ref detail::destRoom reads off
+             * the type, not a policy this read picks. */
+            return readPayload(value, /*validateUtf8*/ true);
         }
 
         /**
@@ -4380,23 +4471,9 @@ namespace sofab
                 error_ = true;
                 return false;
             }
-            if (static_cast<size_t>(end_ - p_) < fixLen_)
-            {
-                incomplete_ = true;
-                return false;
-            }
-            if constexpr (requires { value.set_len(size_t{}); B::capacity(); })
-            {
-                /* §6.3's third tier, as in readString: the destination is too
-                 * short for a value the message and the deployment both allow. */
-                if (fixLen_ > B::capacity()) { rejectDestination(); return false; }
-                std::memcpy(value.data(), p_, fixLen_);
-                value.set_len(fixLen_);
-            }
-            else value.assign(p_, p_ + fixLen_);
-            p_ += fixLen_;
-            consumed_ = true;
-            return true;
+            /* §6.6.3, as in readString — one delivery path, refuse rather than
+             * grow. A `blob` is never UTF-8 validated (§6.4). */
+            return readPayload(value, /*validateUtf8*/ false);
         }
 
         /**
@@ -4491,46 +4568,82 @@ namespace sofab
              * one — two answers, neither of them this one (A2-0022). */
             if constexpr (constexpr long destCap = detail::destCapacity<T>(); destCap >= 0)
             {
+                /* A **static** capacity cannot change between chunks, so the
+                 * refusal is pulled forward to the header: the destination is
+                 * judged before a byte of payload is read, and the verdict cannot
+                 * depend on where the chunk boundaries fell. */
                 if (count_ > static_cast<size_t>(destCap))
                 {
                     rejectDestination();
                     return false;
                 }
             }
-            /* Grow only as far as the bytes in hand could ever fill: a varint
-             * element is at least one byte, a fixlen one exactly @ref fixLen_, so
-             * with R bytes readable no more than that many elements can be present.
-             * A count the remaining bytes cannot possibly back therefore never
-             * becomes an allocation — the parse below still runs, so an over-width
-             * element that IS present stays INVALID and a genuinely cut payload
-             * stays INCOMPLETE and is delivered again whole, resized in full then.
-             * When the payload is complete this is exactly `count_`, so nothing
-             * changes for it. It is what lets the reassembly cap withhold an
-             * over-cap payload while the schema `count` above still gets to speak
-             * (#86): a withheld payload cannot make the receiver allocate for a
-             * count it is on the point of refusing. */
-            const uint64_t readable = static_cast<uint64_t>(end_ - p_);
-            const uint64_t needed = type_ == Wire::ArrayFixlen
-                                        ? static_cast<uint64_t>(count_) * fixLen_
-                                        : static_cast<uint64_t>(count_);
-            size_t grow = count_;
-            if (needed > readable) [[unlikely]] /* only a cut or withheld payload */
-                grow = static_cast<size_t>(type_ == Wire::ArrayFixlen
-                                               ? (fixLen_ ? readable / fixLen_ : uint64_t{0})
-                                               : readable);
-            if constexpr (requires { dst.resize(grow); }) dst.resize(grow);
-            else                                          dst = T{};
-            if constexpr (std::is_integral_v<Elem> && !std::is_same_v<Elem, bool>)
+            else if constexpr (requires { dst.resize(size_t{}); })
             {
-                if (elem.armed)
+                /* Room the caller sized (§6.6.3) — the branch §6.6 is about, since
+                 * this is the destination the codec used to grow. It is compared
+                 * against what this delivery can actually **reach**: the announced
+                 * count, clamped to the elements the bytes in hand could carry (a
+                 * varint element is at least one byte, a fixlen one exactly
+                 * @ref fixLen_).
+                 *
+                 * Clamping is what keeps a hostile count from deciding anything: a
+                 * declared 2^31 elements whose payload is absent or withheld reaches
+                 * nothing, so it neither refuses a sound destination nor asks anyone
+                 * to size one — which is also what lets the reassembly cap withhold
+                 * an over-cap payload while the schema `count` above still gets to
+                 * speak (#86). When the payload is complete the reach IS `count_`, so
+                 * a destination genuinely too short is refused exactly then, and
+                 * refused rather than silently truncated into (MESSAGE_SPEC §3,
+                 * issue #81). */
+                const uint64_t readable = static_cast<uint64_t>(end_ - p_);
+                const uint64_t fillable = type_ == Wire::ArrayFixlen
+                                              ? (fixLen_ ? readable / fixLen_ : uint64_t{0})
+                                              : readable;
+                const size_t reach = static_cast<size_t>(
+                    std::min<uint64_t>(static_cast<uint64_t>(count_), fillable));
+                if (reach > dst.size())
                 {
-                    /* The tag is already settled above, so the bounded decode is
-                     * entered directly rather than through read(). */
-                    std::span<Elem> sp{dst};
-                    return readIntElements<true>(sp.first(std::min(sp.size(), count_)), elem);
+                    rejectDestination();
+                    return false;
                 }
             }
-            return read(dst);
+            /* A destination of fixed extent that publishes neither a capacity nor a
+             * resize (`std::array`, a bound span) is @ref read's low-level contract
+             * and not this tier's business: it cannot be grown, so §6.6 has nothing
+             * to say about it, and the leading elements land in it while the rest is
+             * parsed only to stay framed. */
+            /* §7.4's reset, and the destination's length, in the one order each
+             * kind admits:
+             *
+             * * **static room** (@ref InlineVector): the storage is already the
+             *   caller's in full, so setting the length to `M` is a length store
+             *   and nothing is allocated. It happens **before** the fill, because
+             *   the span the fill binds is the destination's *current* length;
+             * * **fixed extent with no length** (`std::array`, a bound span): put
+             *   back to the element default here — the slots past `M` are what
+             *   §7.4 would otherwise leave from an earlier message;
+             * * **room the caller sized**: the fill writes the `M` elements it was
+             *   given room for, and the length is published **after**, as a shrink
+             *   (below). Growing it here is exactly what §6.6 forbids. */
+            if constexpr (detail::destCapacity<T>() >= 0)      detail::destSetLen(dst, count_);
+            else if constexpr (!requires { dst.resize(size_t{}); }) dst = T{};
+            const bool ok = [&]() noexcept {
+                if constexpr (std::is_integral_v<Elem> && !std::is_same_v<Elem, bool>)
+                {
+                    if (elem.armed)
+                    {
+                        /* The tag is already settled above, so the bounded decode is
+                         * entered directly rather than through read(). */
+                        std::span<Elem> sp{dst};
+                        return readIntElements<true>(sp.first(std::min(sp.size(), count_)), elem);
+                    }
+                }
+                return read(dst);
+            }();
+            if (!ok) return false;
+            if constexpr (detail::destCapacity<T>() < 0) detail::destSetLen(dst, count_);
+            return true;
         }
 
         /**
@@ -4608,6 +4721,68 @@ namespace sofab
          * @return The delivered field's @ref Fix.
          */
         [[nodiscard]] Fix fixType() const noexcept { return fixType_; }
+
+        /**
+         * @brief The payload length the current field's header announces — a
+         *        `string`/`blob` byte count, or a fixlen array's **element** width.
+         *
+         * §6.6.3's "after being told the announced count": the number the caller
+         * sizes its destination from before handing it back. Identical to the
+         * `size` argument of the deliver callback, reachable from a helper that
+         * was not handed it (@ref sofab::readString and friends).
+         */
+        [[nodiscard]] size_t announcedSize() const noexcept { return fixLen_; }
+
+        /**
+         * @brief The element count the current array field's header announces.
+         * @copydetails announcedSize
+         */
+        [[nodiscard]] size_t announcedCount() const noexcept { return count_; }
+
+        /**
+         * @brief Bytes of this field readable right now, in the chunk being parsed.
+         *
+         * What lets a helper sizing a destination clamp an announced count to what
+         * the bytes in hand could ever fill, so a hostile count never decides an
+         * allocation — the same clamp @ref readArray applies to its own refusal.
+         */
+        [[nodiscard]] size_t available() const noexcept
+        {
+            return static_cast<size_t>(end_ - p_);
+        }
+
+        /**
+         * @brief The §7.3 and §7.1 decisions @ref readString makes, taken **before
+         *        a destination exists**.
+         *
+         * For a caller that has to place an element before it can offer a
+         * destination — @ref StringSeq puts an element at its index, and growing
+         * the container for a field that turns out not to be an element would
+         * change the array's length (§5.1/§7.4). It answers the same two questions
+         * @ref readString answers first, in the same order and through the same
+         * seam, so the skip is counted exactly once: the tag (§7.3) and then the
+         * declared `maxlen` (§7.1).
+         *
+         * @param bound Declared `maxlen`, or negative when unbounded.
+         * @return `true` when a destination may be placed and handed to
+         *         @ref readString.
+         */
+        [[nodiscard]] bool acceptsString(long bound = -1) noexcept
+        {
+            if (!tagMatches(Wire::Fixlen, Fix::String)) return false; /* §7.3 */
+            if (bound >= 0 && fixLen_ > static_cast<size_t>(bound))   /* §7.1 */
+            { error_ = true; return false; }
+            return true;
+        }
+
+        /** @copydoc acceptsString */
+        [[nodiscard]] bool acceptsBlob(long bound = -1) noexcept
+        {
+            if (!tagMatches(Wire::Fixlen, Fix::Blob)) return false; /* §7.3 */
+            if (bound >= 0 && fixLen_ > static_cast<size_t>(bound)) /* §7.1 */
+            { error_ = true; return false; }
+            return true;
+        }
     };
 
     /**
@@ -4753,6 +4928,192 @@ namespace sofab
         /** @return Reference to the wrapped message (const access). */
         const MessageType &operator*() const noexcept { return data_; }
     };
+
+    /* ---------------------------------------------------------------------- */
+    /* The static helper layer (§6.6.1)                                       */
+    /*                                                                        */
+    /* Everything from here to the end of the file is the HELPER layer, not    */
+    /* the codec. CORELIB_PLAN §6.6.1 draws the line by ownership: "A helper   */
+    /* is part of the corelib -- it ships in the repository and is built with  */
+    /* it -- but the codec never uses one directly. Either the caller invokes  */
+    /* it, or it is reached from inside a callback the codec made. It may      */
+    /* allocate, because whatever it takes belongs to whoever called it."      */
+    /*                                                                        */
+    /* Nothing in IStreamImpl above calls anything below. These functions are  */
+    /* what the GENERATED layer calls instead of the codec's own read*: they   */
+    /* size the destination each field lands in -- "the generated object knows */
+    /* the schema, sizes and owns the storage each field lands in, then drives */
+    /* the codec over it like any other caller" (§6.6.1) -- and then hand it   */
+    /* to the codec, which refuses a destination too short rather than growing */
+    /* one (§6.6.3).                                                          */
+    /* ---------------------------------------------------------------------- */
+
+    namespace detail
+    {
+        /**
+         * @brief Give @p dst room for @p want, if it is a destination the caller
+         *        has to size.
+         *
+         * Helper layer: this is the allocator call §6.6 moved out of the codec, and
+         * it is here rather than there because the storage belongs to whoever
+         * called this. A destination with **static room** (`T::capacity()`) needs
+         * nothing — it already holds what it can ever hold — and one of fixed
+         * extent with no `resize` cannot be sized at all.
+         *
+         * Only ever grows: a destination the caller deliberately sized larger keeps
+         * its room, and the decoded length is published by
+         * @ref detail::destSetLen when the value is in.
+         *
+         * @param dst  Destination.
+         * @param want Room the announced value needs, already clamped by the caller
+         *             to what the bytes in hand could fill.
+         */
+        template <typename D>
+        void fitDest(D &dst, size_t want) noexcept
+        {
+            if constexpr (requires { D::capacity(); }) { (void)dst; (void)want; }
+            else if constexpr (requires { dst.resize(size_t{}); })
+            {
+                if (dst.size() < want) dst.resize(want);
+            }
+        }
+
+        /**
+         * @brief Elements of the announced array the bytes in hand could still
+         *        carry, clamped to the count itself.
+         *
+         * The same clamp @ref IStreamImpl::readArray applies to its own refusal, so
+         * the helper never sizes a destination the codec would then refuse, and an
+         * announced 2^31 whose payload is absent or withheld sizes nothing.
+         */
+        [[nodiscard]] inline size_t arrayReach(const IStreamImpl &is) noexcept
+        {
+            const uint64_t readable = static_cast<uint64_t>(is.available());
+            const uint64_t fillable = is.wire() == Wire::ArrayFixlen
+                                          ? (is.announcedSize()
+                                                 ? readable / is.announcedSize()
+                                                 : uint64_t{0})
+                                          : readable;
+            return static_cast<size_t>(
+                std::min<uint64_t>(static_cast<uint64_t>(is.announcedCount()), fillable));
+        }
+
+        /** @brief Does the delivered tag match the array kind @p Elem declares (§7.3)? */
+        template <typename Elem>
+        [[nodiscard]] inline bool arrayTagMatches(const IStreamImpl &is) noexcept
+        {
+            if constexpr (std::is_same_v<Elem, float>)
+                return is.wire() == Wire::ArrayFixlen && is.fixType() == Fix::Fp32;
+            else if constexpr (std::is_same_v<Elem, double>)
+                return is.wire() == Wire::ArrayFixlen && is.fixType() == Fix::Fp64;
+            else if constexpr (std::is_unsigned_v<Elem>)
+                return is.wire() == Wire::ArrayUnsigned;
+            else
+                return is.wire() == Wire::ArraySigned;
+        }
+    } // namespace detail
+
+    /**
+     * @brief Read the current field as a `string` into a destination this call
+     *        sizes — the generated layer's @ref IStreamImpl::readString.
+     *
+     * Sizes @p dst for the announced payload and then hands it to the codec, which
+     * refuses a destination too short rather than growing one (§6.6.3). For a
+     * destination with static room (@ref FixedString) it adds nothing and compiles
+     * away; for a `std::string` it is the one place the allocation happens.
+     *
+     * The sizing runs only once the tag (§7.3) and the declared `maxlen` (§7.1)
+     * admit the field, so a mistyped or over-long occurrence leaves @p dst exactly
+     * as it was (§7.4).
+     *
+     * @param is Stream delivering the field.
+     * @param dst Destination for the decoded text.
+     * @param maxlen Declared `maxlen`, or negative when unbounded.
+     * @return `true` when the value was read.
+     */
+    template <typename S>
+    bool readString(IStreamImpl &is, S &dst, long maxlen = -1) noexcept
+    {
+        if (is.wire() == detail::Wire::Fixlen && is.fixType() == detail::Fix::String &&
+            (maxlen < 0 || is.announcedSize() <= static_cast<size_t>(maxlen)))
+            detail::fitDest(dst, std::min(is.announcedSize(), is.available()));
+        return is.readString(dst, maxlen);
+    }
+
+    /**
+     * @brief The `blob` counterpart of @ref sofab::readString.
+     * @copydetails sofab::readString
+     */
+    template <typename B>
+    bool readBlob(IStreamImpl &is, B &dst, long maxlen = -1) noexcept
+    {
+        if (is.wire() == detail::Wire::Fixlen && is.fixType() == detail::Fix::Blob &&
+            (maxlen < 0 || is.announcedSize() <= static_cast<size_t>(maxlen)))
+            detail::fitDest(dst, std::min(is.announcedSize(), is.available()));
+        return is.readBlob(dst, maxlen);
+    }
+
+    /**
+     * @brief Read the current count-prefixed array into a destination this call
+     *        sizes — the generated layer's @ref IStreamImpl::readArray.
+     *
+     * Sizes @p dst for the announced element count, clamped to what the bytes in
+     * hand could fill, and only once the tag (§7.3), the schema `count` (§7.1) and
+     * the configured receiver cap (§6.2.1) all admit the field — so neither a
+     * mistyped occurrence nor a hostile count reaches an allocator. The codec then
+     * fills what it was given room for and refuses a destination shorter than the
+     * array actually is (§6.6.3).
+     *
+     * @param is Stream delivering the field.
+     * @param dst Destination range.
+     * @param schemaCount Declared `count: N`, or negative when unbounded.
+     * @param dynCap Configured `max_dyn_array_count`, or negative.
+     * @param elem Declared element range (@ref ElemBound).
+     * @return `true` when the array was read.
+     */
+    template <typename T>
+    bool readArray(IStreamImpl &is, T &dst, long schemaCount = -1, long dynCap = -1,
+                   ElemBound elem = {}) noexcept
+    {
+        using Elem = typename T::value_type;
+        const size_t n = is.announcedCount();
+        if (detail::arrayTagMatches<Elem>(is) &&
+            (schemaCount < 0 || n <= static_cast<size_t>(schemaCount)) &&
+            (dynCap < 0 || n <= static_cast<size_t>(dynCap)))
+            detail::fitDest(dst, detail::arrayReach(is));
+        return is.readArray(dst, schemaCount, dynCap, elem);
+    }
+
+    /**
+     * @brief @ref IStreamImpl::read with the destination sized first — the
+     *        generated layer's untyped read.
+     *
+     * Dispatches like @ref IStreamImpl::read and adds nothing for a scalar or a
+     * sub-message, whose destinations hold no room to size. A `std::string` payload
+     * destination and a contiguous element range are sized here, so the codec never
+     * has to grow one.
+     */
+    template <typename T>
+    bool read(IStreamImpl &is, T &dst) noexcept
+    {
+        if constexpr (std::is_same_v<T, std::string>)
+        {
+            if (is.wire() == detail::Wire::Fixlen &&
+                (is.fixType() == detail::Fix::String || is.fixType() == detail::Fix::Blob))
+                detail::fitDest(dst, std::min(is.announcedSize(), is.available()));
+        }
+        else if constexpr (requires(T &d) {
+                               typename T::value_type;
+                               std::span{d};
+                               requires !std::is_const_v<typename T::value_type>;
+                               requires !InputMessage<T>;
+                           })
+        {
+            if (detail::arrayTagMatches<typename T::value_type>(is))
+                detail::fitDest(dst, detail::arrayReach(is));
+        }
+        return is.read(dst);
+    }
 
     /* ---------------------------------------------------------------------- */
     /* Wrapper-sequence collectors and encode helpers                         */
@@ -4935,16 +5296,24 @@ namespace sofab
              * rather than INVALID, since there the subtype, and with it whether the
              * field is an element at all, is not yet decidable. */
             (void)size;
-            /* Read into a temporary first, and only then place it: a §7.3-skipped
-             * or §7.1-rejected element must leave the destination untouched, and
-             * growing the container here would change the array's length (§5.1,
-             * highest present id + 1). For the heap-free element types the
-             * temporary is a stack object, so this costs no allocation. */
-            typename C::value_type s{};
-            if (!is.readString(s, emax)) return;
+            /* Decide first, place second, read into the placed element last.
+             *
+             * A §7.3-skipped or §7.1-rejected element must leave the destination
+             * untouched — growing the container for a field that is not an element
+             * would change the array's length (§5.1, highest present id + 1) — so
+             * both decisions are taken through @ref IStreamImpl::acceptsString,
+             * before there is a destination at all. It is the same seam
+             * @ref IStreamImpl::readString takes them at, in the same order, so the
+             * §7.3 skip is counted exactly once.
+             *
+             * The element is then read **in place** rather than into a temporary
+             * that is moved in. A payload split across chunks is written into the
+             * caller's destination piece by piece (§6.6.2), and a temporary would
+             * not survive the `feed` that carries the first half. */
+            if (!is.acceptsString(emax)) return;
             if (!detail::seqIndexAdmitted(is, id, cap, dynCap, elemDestCap)) return;
             while (out.size() <= static_cast<size_t>(id)) out.emplace_back();
-            out[static_cast<size_t>(id)] = std::move(s);
+            (void)sofab::readString(is, out[static_cast<size_t>(id)], emax);
         }
     };
 
@@ -4982,12 +5351,11 @@ namespace sofab
         void deserialize(IStreamImpl &is, sofab::id id, size_t size, size_t) noexcept override
         {
             (void)size;
-            /* Temporary first, then place -- see StringSeq::deserialize. */
-            typename C::value_type b{};
-            if (!is.readBlob(b, emax)) return; /* §7.3 + §7.1, see StringSeq */
+            /* Decide, place, read in place -- see StringSeq::deserialize. */
+            if (!is.acceptsBlob(emax)) return; /* §7.3 + §7.1, see StringSeq */
             if (!detail::seqIndexAdmitted(is, id, cap, dynCap, elemDestCap)) return;
             while (out.size() <= static_cast<size_t>(id)) out.emplace_back();
-            out[static_cast<size_t>(id)] = std::move(b);
+            (void)sofab::readBlob(is, out[static_cast<size_t>(id)], emax);
         }
     };
 
@@ -5149,7 +5517,7 @@ namespace sofab
                  * wrong. A heap-free row's capacity IS the schema `count` it was
                  * generated for, so it is passed as one and a row past it is the
                  * INVALID of §7.1 rather than a receiver-side LimitExceeded. */
-                (void)is.readArray(row, detail::destCapacity<Elem>());
+                (void)sofab::readArray(is, row, detail::destCapacity<Elem>());
             }
             else
             {
