@@ -4437,6 +4437,17 @@ struct DynStoreMsg : sofab::Message
     }
 };
 
+/* The A2-0015 measurement's sharp case: a destination far smaller than what a
+ * sender can announce. */
+struct TinyBlobMsg : sofab::IStreamMessage
+{
+    sofab::FixedBytes<8> b;
+    void deserialize(sofab::IStreamImpl &is, sofab::id id, size_t, size_t) noexcept override
+    {
+        if (id == 1) sofab::readBlob(is, b);
+    }
+};
+
 struct FixedStoreMsg : sofab::Message
 {
     sofab::FixedString<8> name;
@@ -4575,43 +4586,77 @@ static void allocationMeasurement()
               "measure: a complete one-shot decode into heap-free storage allocates nothing");
     }
 
-    /* --- decode, complete, ONE BYTE AT A TIME. The window §6.6.4 names second
-     *     and the one nothing here used to open.
+    /* --- decode, complete, ONE BYTE AT A TIME. The window §6.6.4 names second,
+     *     and the one A2-0015 was about.
      *
-     * This is NOT zero yet, and the number is the point: IStreamImpl still
-     * joins a chunk-straddling field in a private accumulator (`acc_`) instead
-     * of copying each piece straight into the caller's destination, which
-     * §6.6.2 requires -- "A codec MUST NOT grow a private accumulator instead."
-     * That is A2-0015 / corelib-cpp#123, and it needs the decoder turned into a
-     * resumable per-field state machine, which is not this change.
+     * It is ZERO now. The decoder used to join a chunk-straddling field in a
+     * private accumulator (`acc_`) instead of copying each piece straight into
+     * the caller's destination, which §6.6.2 forbids by name -- "A codec MUST
+     * NOT grow a private accumulator instead" -- and §6.6.1's decided-shapes
+     * table calls out that exact shape as "no -- this is codec". What replaced
+     * it is a fixed CARRY_CAP-byte carry for the one item a boundary can cut,
+     * plus a resumable parse; nothing on this path can be sized by the sender.
      *
-     * What is asserted meanwhile is a CEILING, so the accumulator cannot quietly
-     * get worse and so the day it goes it shows up here as a number that dropped
-     * to zero: the reassembly buffer is one geometrically grown vector per
-     * message, never one per chunk. --- */
+     * `== before` is the assertion §6.6.4 asks for, not a ceiling: "Where the
+     * runtime does not box the codec's values it MUST be zero." --- */
     {
         auto is = std::make_unique<sofab::IStreamObject<FixedStoreMsg>>();
         const unsigned long before = g_allocCount;
-        const unsigned long bytesBefore = g_allocBytes;
         sofab::Error last = sofab::Error::None;
         for (size_t i = 0; i < wire.size(); ++i) last = is->feed(wire.data() + i, 1).code();
         CHECK(last == sofab::Error::None, "measure: the byte-at-a-time decode completes");
         CHECK((*(*is)).name == std::string_view{"abcdefgh"},
               "measure: and decodes to the same value as the one-shot feed");
-        const unsigned long allocs = g_allocCount - before;
-        const unsigned long bytes = g_allocBytes - bytesBefore;
-        /* Ceiling, not a target: §6.6.4 wants zero here (A2-0015). */
-        CHECK(allocs <= 8, "measure: a chunked feed's accumulator is O(log n), not O(chunks)");
-        CHECK(bytes <= 8 * wire.size() + 256,
-              "measure: and no wire number multiplies what it commits");
+        CHECK(g_allocCount == before, "measure: a chunked feed allocates nothing either (§6.6.4)");
     }
     {
-        /* Chunk size 7, an odd size that straddles differently: the same ceiling. */
-        auto is = std::make_unique<sofab::IStreamObject<FixedStoreMsg>>();
+        /* Every chunk size from 1 to the whole message, so no split point has an
+         * allocation hiding at it. */
+        for (size_t step = 1; step <= wire.size(); ++step)
+        {
+            auto is = std::make_unique<sofab::IStreamObject<FixedStoreMsg>>();
+            const unsigned long before = g_allocCount;
+            sofab::Error last = sofab::Error::Incomplete;
+            for (size_t i = 0; i < wire.size(); i += step)
+                last = is->feed(wire.data() + i, std::min(step, wire.size() - i)).code();
+            if (last != sofab::Error::None || g_allocCount != before)
+            {
+                static char msg[96];
+                std::snprintf(msg, sizeof msg,
+                              "measure: chunk size %zu is allocation-free and COMPLETE", step);
+                CHECK(false, msg);
+                break;
+            }
+        }
+        CHECK(true, "measure: every chunk size decodes allocation-free");
+    }
+    {
+        /* The audit's sharp case (A2-0015): a 64 KiB `blob` fed in two chunks into
+         * a destination that cannot hold it. The accumulator used to commit ~64 KiB
+         * chosen by the SENDER before the destination's capacity refused the field.
+         * Now the refusal is decided at the header and nothing is committed at all. */
+        std::vector<uint8_t> big;
+        big.push_back(0x0a);                       /* id 1, fixlen */
+        const uint64_t word = (uint64_t{65536} << 3) | 3u; /* blob, 64 KiB */
+        for (uint64_t w = word; ; )
+        {
+            uint8_t b = static_cast<uint8_t>(w & 0x7f);
+            w >>= 7;
+            if (w) { big.push_back(b | 0x80); continue; }
+            big.push_back(b);
+            break;
+        }
+        big.resize(big.size() + 65536, 0x41);
+        auto is = std::make_unique<sofab::IStreamObject<TinyBlobMsg>>();
         const unsigned long before = g_allocCount;
-        for (size_t i = 0; i < wire.size(); i += 7)
-            (void)is->feed(wire.data() + i, std::min<size_t>(7, wire.size() - i));
-        CHECK(g_allocCount - before <= 8, "measure: an odd chunk size holds the same ceiling");
+        const unsigned long bytesBefore = g_allocBytes;
+        auto r1 = is->feed(big.data(), 8);
+        auto r2 = is->feed(big.data() + 8, big.size() - 8);
+        CHECK(r1.code() == sofab::Error::InvalidArgument &&
+                  r2.code() == sofab::Error::InvalidArgument,
+              "measure: a 64 KiB blob into an 8-byte destination is InvalidArgument, at once");
+        CHECK(g_allocCount == before && g_allocBytes == bytesBefore,
+              "measure: and the sender's 64 KiB never becomes an allocation");
     }
 }
 
@@ -4976,7 +5021,14 @@ struct SweepU : sofab::IStreamMessage
     std::vector<uint64_t> v;
     void deserialize(sofab::IStreamImpl &is, sofab::id id, size_t, size_t count) noexcept override
     {
-        if (id == 1) { v.assign(count, 0); sofab::read(is, v); }
+        /* A field split across chunks is delivered once per chunk that carries
+         * part of it (§6.6.2), so a destination reset belongs on the FIRST
+         * delivery only -- which is what is.progress() answers. */
+        if (id == 1)
+        {
+            if (is.progress() == 0) v.assign(count, 0);
+            sofab::read(is, v);
+        }
     }
 };
 struct SweepI : sofab::IStreamMessage
@@ -4984,7 +5036,11 @@ struct SweepI : sofab::IStreamMessage
     std::vector<int64_t> v;
     void deserialize(sofab::IStreamImpl &is, sofab::id id, size_t, size_t count) noexcept override
     {
-        if (id == 1) { v.assign(count, 0); sofab::read(is, v); }
+        if (id == 1)
+        {
+            if (is.progress() == 0) v.assign(count, 0);
+            sofab::read(is, v);
+        }
     }
 };
 
@@ -5100,8 +5156,14 @@ struct TrailMsg : sofab::IStreamMessage
          * destination from it is what makes a shortened M observable here. */
         switch (id)
         {
-            case 0: u.assign(count, 0); sofab::read(is, u); break;
-            case 1: f.assign(count, 0.0f); sofab::read(is, f); break;
+            case 0:
+                if (is.progress() == 0) u.assign(count, 0);
+                sofab::read(is, u);
+                break;
+            case 1:
+                if (is.progress() == 0) f.assign(count, 0.0f);
+                sofab::read(is, f);
+                break;
         }
     }
 };
@@ -6942,6 +7004,182 @@ static void checkEverySplit(const char *name, const std::vector<uint8_t> &w, Che
     }
 }
 
+/* --- §6.6.2 / A2-0015: the decoder resumes, it does not accumulate -----------
+ *
+ * "A payload split across fed chunks has to be joined somewhere. That somewhere
+ * is storage the caller supplied -- the codec copies each piece into it as the
+ * piece arrives ... A codec MUST NOT grow a private accumulator instead."
+ *
+ * allocationMeasurement() proves the *absence* (zero allocations at every chunk
+ * size). This proves the mechanism that replaced it still decodes correctly at
+ * the places a resumable parser can go wrong:
+ *
+ *   1. a payload far longer than the CARRY_CAP-byte carry, cut at every byte;
+ *   2. a nesting DEPTH cut at every byte -- the case that needs the open levels'
+ *      field ids replayed, because the handler chain died with the last feed;
+ *   3. the two facts a handler can observe about a resumed delivery,
+ *      IStreamImpl::progress() and IStreamImpl::resumed().
+ */
+struct DeepMsg : sofab::IStreamMessage
+{
+    struct L4 : sofab::IStreamMessage {
+        std::string leaf;
+        void deserialize(sofab::IStreamImpl &is, sofab::id id, size_t, size_t) noexcept override
+        { if (id == 0) (void)sofab::readString(is, leaf, 200); }
+    };
+    struct L3 : sofab::IStreamMessage {
+        L4 c; std::vector<uint32_t> nums;
+        void deserialize(sofab::IStreamImpl &is, sofab::id id, size_t, size_t) noexcept override
+        { if (id == 0) (void)sofab::read(is, c); else if (id == 1) (void)sofab::readArray(is, nums, 8); }
+    };
+    struct L2 : sofab::IStreamMessage {
+        L3 c;
+        void deserialize(sofab::IStreamImpl &is, sofab::id id, size_t, size_t) noexcept override
+        { if (id == 0) (void)sofab::read(is, c); }
+    };
+    struct L1 : sofab::IStreamMessage {
+        L2 c;
+        void deserialize(sofab::IStreamImpl &is, sofab::id id, size_t, size_t) noexcept override
+        { if (id == 0) (void)sofab::read(is, c); }
+    };
+    L1 c; uint64_t tail = 0;
+    void deserialize(sofab::IStreamImpl &is, sofab::id id, size_t, size_t) noexcept override
+    { if (id == 0) (void)sofab::read(is, c); else if (id == 1) (void)sofab::read(is, tail); }
+};
+
+/* Records what the stream said about each delivery, so the observable half of
+ * the resume contract is pinned rather than assumed. */
+struct WatchMsg : sofab::IStreamMessage
+{
+    std::string text;
+    int deliveries = 0;
+    int resumedDeliveries = 0;
+    size_t maxProgress = 0;
+    void deserialize(sofab::IStreamImpl &is, sofab::id id, size_t, size_t) noexcept override
+    {
+        if (id != 1) return;
+        ++deliveries;
+        if (is.resumed()) ++resumedDeliveries;
+        if (is.progress() > maxProgress) maxProgress = is.progress();
+        (void)sofab::readString(is, text, 300);
+    }
+};
+
+static void resumesInsteadOfBuffering()
+{
+    /* --- 1. a payload much longer than the carry, at every split ------------ */
+    {
+        std::string payload;
+        for (int i = 0; i < 250; ++i) payload.push_back(static_cast<char>('a' + i % 26));
+        std::vector<uint8_t> w;
+        w.push_back(0x0a); /* id 1, fixlen */
+        appendVarint(w, (static_cast<uint64_t>(payload.size()) << 3) | 2u); /* string */
+        w.insert(w.end(), payload.begin(), payload.end());
+        CHECK(w.size() > 3 * 10, "resume: the payload is longer than the carry can ever be");
+
+        bool allOk = true;
+        for (size_t k = 1; k < w.size() && allOk; ++k)
+        {
+            sofab::IStreamObject<WatchMsg> in;
+            const auto r1 = in.feed(w.data(), k);
+            const auto r2 = in.feed(w.data() + k, w.size() - k);
+            allOk = r1.code() != sofab::Error::InvalidMessage &&
+                    r2.code() == sofab::Error::None && (*in).text == payload;
+        }
+        CHECK(allOk, "resume: a 250-byte payload decodes identically at every split point");
+
+        /* Byte at a time: every piece lands in the caller's destination as it
+         * arrives, so the field is delivered many times and `progress` walks up. */
+        sofab::IStreamObject<WatchMsg> drip;
+        sofab::Error last = sofab::Error::Incomplete;
+        for (uint8_t b : w) last = drip.feed(&b, 1).code();
+        CHECK(last == sofab::Error::None, "resume: and one byte at a time is COMPLETE");
+        CHECK((*drip).text == payload, "resume: with the whole payload assembled in the destination");
+        CHECK((*drip).deliveries > 1,
+              "resume: a split field is delivered once per chunk that carries part of it");
+        CHECK((*drip).maxProgress == payload.size() - 1,
+              "resume: and progress() reports what earlier chunks already delivered");
+        CHECK((*drip).resumedDeliveries == 0,
+              "resume: resumed() is about re-entering a sequence, not continuing a field");
+    }
+
+    /* --- 2. four levels of nesting, at every split -------------------------- */
+    {
+        sofab::OStreamInline<256> os;
+        os.sequenceBeginLazy(0)
+            .sequenceBeginLazy(0)
+              .sequenceBeginLazy(0)
+                .sequenceBeginLazy(0)
+                  .write(0, std::string_view{"deep enough to straddle"})
+                .sequenceEnd()
+                .write(1, std::array<uint32_t, 4>{1, 2, 300, 40000})
+              .sequenceEnd()
+            .sequenceEnd()
+          .sequenceEnd()
+          .write(1, uint64_t{7});
+        CHECK(os.ok(), "resume: the deep message encodes");
+        const std::vector<uint8_t> w(os.data(), os.data() + os.bytesUsed());
+
+        auto good = [](const DeepMsg &m) {
+            return m.c.c.c.c.leaf == "deep enough to straddle" &&
+                   m.c.c.c.nums == std::vector<uint32_t>{1, 2, 300, 40000} && m.tail == 7;
+        };
+        {
+            sofab::IStreamObject<DeepMsg> in;
+            CHECK(in.feed(w.data(), w.size()).code() == sofab::Error::None && good(*in),
+                  "resume: the deep message decodes in one piece");
+        }
+        bool allOk = true;
+        size_t firstBad = 0;
+        for (size_t k = 1; k < w.size(); ++k)
+        {
+            sofab::IStreamObject<DeepMsg> in;
+            (void)in.feed(w.data(), k);
+            const auto r2 = in.feed(w.data() + k, w.size() - k);
+            if (r2.code() != sofab::Error::None || !good(*in)) { allOk = false; firstBad = k; break; }
+        }
+        CHECK(allOk, "resume: four open levels are re-entered correctly at every split point");
+        (void)firstBad;
+
+        sofab::IStreamObject<DeepMsg> drip;
+        sofab::Error last = sofab::Error::Incomplete;
+        for (uint8_t b : w) last = drip.feed(&b, 1).code();
+        CHECK(last == sofab::Error::None && good(*drip),
+              "resume: and one byte at a time, which re-enters all four on every feed");
+    }
+
+    /* --- 3. resumed(): a sequence re-entered says so, a fresh one does not --- */
+    {
+        struct SeqWatch : sofab::IStreamMessage
+        {
+            int fresh = 0, reentered = 0;
+            std::string leaf;
+            struct Inner : sofab::IStreamMessage {
+                std::string *dst;
+                void deserialize(sofab::IStreamImpl &is, sofab::id id, size_t, size_t) noexcept override
+                { if (id == 0) (void)sofab::readString(is, *dst, 40); }
+            };
+            void deserialize(sofab::IStreamImpl &is, sofab::id id, size_t, size_t) noexcept override
+            {
+                if (id != 3) return;
+                if (is.resumed()) ++reentered; else ++fresh;
+                Inner inner; inner.dst = &leaf;
+                (void)sofab::read(is, inner);
+            }
+        };
+        sofab::OStreamInline<64> os;
+        os.sequenceBeginLazy(3).write(0, std::string_view{"inside"}).sequenceEnd();
+        const std::vector<uint8_t> w(os.data(), os.data() + os.bytesUsed());
+        sofab::IStreamObject<SeqWatch> in;
+        sofab::Error last = sofab::Error::Incomplete;
+        for (uint8_t b : w) last = in.feed(&b, 1).code();
+        CHECK(last == sofab::Error::None && (*in).leaf == "inside",
+              "resume: the wrapper decodes byte by byte");
+        CHECK((*in).fresh == 1, "resume: the sequence is announced as new exactly once");
+        CHECK((*in).reentered > 0, "resume: every later feed re-enters it, and says so");
+    }
+}
+
 static void chunkIndependence()
 {
     /* Every wrapper-array collector and both nesting forms in one message, so
@@ -7090,6 +7328,7 @@ int main()
     decoderReuseAcrossTypes();
     utf8AcrossChunkBoundaries();
     chunkIndependence();
+    resumesInsteadOfBuffering();
 
     std::printf("\n%d checks, %d failures\n", g_checks, g_failures);
     return g_failures ? 1 : 0;

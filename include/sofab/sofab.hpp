@@ -181,8 +181,8 @@ namespace sofab
          */
         Incomplete = 5,
         /**
-         * Decode-only: a single field would grow the reassembly buffer past the
-         * receiver-configured @ref Limits::max_buffered_field.
+         * Decode-only: a single top-level field spans more bytes than the
+         * receiver-configured @ref Limits::max_buffered_field allows.
          *
          * **Policy, not malformation** — deliberately distinct from
          * @ref InvalidMessage, so a differential fuzzer never reads a local
@@ -493,6 +493,41 @@ namespace sofab
           12,36,12,12,12,12,12,12,12,12,12,12,
         };
 
+        /** @brief The DFA's ACCEPT and REJECT states (see @ref utf8Dfa). */
+        inline constexpr uint32_t UTF8_ACCEPT = 0;
+        inline constexpr uint32_t UTF8_REJECT = 12;
+
+        /**
+         * @brief Step the UTF-8 DFA over @p len bytes and return the state.
+         *
+         * The resumable half of @ref utf8Valid, for a `string` payload that arrives
+         * across more than one `feed`: §6.4.4 requires that "a chunk boundary MUST
+         * NOT affect the outcome" and permits exactly this — "A decoder MAY validate
+         * incrementally provided it carries validator state across `feed` calls; no
+         * assembly buffer is required."
+         *
+         * @ref UTF8_REJECT is absorbing, which is what lets the verdict be **held
+         * back**: §6.4.4's last row makes a byte that can begin no sequence
+         * `INVALID` "reported at payload completion, not before", and a decoder
+         * "MUST NOT report INVALID mid-payload … that input is INCOMPLETE until the
+         * payload ends". The caller therefore steps the state per chunk and consults
+         * it once, when the declared length is reached — where a state other than
+         * @ref UTF8_ACCEPT covers both a rejected byte and a sequence the payload
+         * ended in the middle of.
+         *
+         * @param state State from the previous piece (@ref UTF8_ACCEPT to start).
+         * @param d Bytes of this piece.
+         * @param len Their count.
+         * @return The state after them.
+         */
+        [[nodiscard]] constexpr uint32_t utf8Advance(uint32_t state, const uint8_t *d,
+                                                     size_t len) noexcept
+        {
+            for (size_t i = 0; i < len; ++i)
+                state = utf8Dfa[256u + state + utf8Dfa[d[i]]];
+            return state;
+        }
+
         [[nodiscard]] constexpr bool utf8Valid(const char *data, size_t len) noexcept
         {
             size_t i = 0;
@@ -585,8 +620,8 @@ namespace sofab
          * Two kinds of destination answer it differently, and the difference is
          * not a policy the codec picks but a fact the type publishes:
          *
-         * * a **static capacity** (`T::capacity()` — @ref FixedString,
-         *   @ref FixedBytes, @ref InlineVector) is storage the caller already owns
+         * * a **static capacity** (`T::capacity()` — @ref sofab::FixedString,
+         *   @ref sofab::FixedBytes, @ref sofab::InlineVector) is storage the caller already owns
          *   in full. Setting a length inside it allocates nothing, so the room is
          *   the capacity;
          * * anything else (`std::string`, `std::vector`, `std::array`, a bound
@@ -609,9 +644,9 @@ namespace sofab
          * @brief Publish the decoded length in a destination that already had the
          *        room — the one container operation the codec performs.
          *
-         * Never grows: @ref destRoom has already been compared against the
+         * Never grows: @ref sofab::detail::destRoom has already been compared against the
          * announced size, so `n` is at most what the destination holds and this is
-         * a length store (@ref FixedString::set_len) or a **shrink**. A shrink
+         * a length store (@ref sofab::FixedString::set_len) or a **shrink**. A shrink
          * cannot allocate — `std::string` / `std::vector` never reallocate for a
          * size below the current one — so §6.6's question, "can a sender make this
          * allocation bigger by sending different bytes?", has no allocation to ask
@@ -2616,8 +2651,12 @@ namespace sofab
     struct Limits
     {
         /**
-         * @brief Cap on how large the reassembly buffer may grow for a single
-         *        incomplete top-level field, in bytes.
+         * @brief Cap on how many bytes a single top-level field may span, in bytes.
+         *
+         * A receiver policy on the **size of a field**, not on a buffer: the
+         * decoder holds no buffer a field could grow (§6.6). It is the surface
+         * §6.2.1 asks for on a schema-unbounded payload, and the name is kept
+         * because it is a public field generated code already passes.
          *
          * Checked the moment the size becomes known -- at the header for a fixlen
          * or fixlen-array payload, as it accrues for a sequence -- so an oversized
@@ -2807,8 +2846,96 @@ namespace sofab
         };
 
     protected:
-        std::vector<uint8_t> acc_; /**< Buffered bytes spanning @ref feed calls (incomplete trailing field). */
-        size_t topPos_ = 0;        /**< Parse offset into @ref acc_ of the next unconsumed top-level field. */
+        /**
+         * @brief Widest prefix of a wire item that can outlive a chunk boundary,
+         *        derived from this format's own constants (§6.6).
+         *
+         * The parse never backs up over a payload — a `string`, a `blob` or an
+         * array element run is written into the caller's destination piece by piece
+         * as the pieces arrive (§6.6.2) — so what a chunk boundary can cut in half
+         * is only ever a **small item**: a field header, the words between it and
+         * its payload, a lone varint element, or a fixed-width scalar. The widest
+         * of those is an `ARRAY_FIXLEN` field's prefix: the header word, the
+         * element count and a `fixlen_word`, three varints of at most
+         * @ref detail::VARINT_MAX_BYTES each.
+         *
+         * That is what makes @ref carry_ **bounded working state** in §6.6's sense
+         * rather than an accumulator: a constant of the specification caps it, no
+         * wire number can enlarge it, and it is sized when the decoder is
+         * constructed.
+         */
+        static constexpr size_t CARRY_CAP = 3 * detail::VARINT_MAX_BYTES;
+
+        /**
+         * @brief The prefix of one cut item, carried to the next @ref feed.
+         *
+         * This is what replaced the private reassembly accumulator §6.6.2 forbids:
+         * "A payload split across fed chunks has to be joined somewhere. That
+         * somewhere is storage the caller supplied — the codec copies each piece
+         * into it as the piece arrives … A codec **MUST NOT** grow a private
+         * accumulator instead." A fixed array of @ref CARRY_CAP bytes cannot be
+         * grown, and a sender cannot make it larger by sending different bytes,
+         * which is §6.6's whole test.
+         */
+        uint8_t carry_[CARRY_CAP];
+        size_t carryLen_ = 0; /**< Live bytes of @ref carry_. */
+
+        /**
+         * @brief Depth at which the parse is suspended, or -1 when nothing is.
+         *
+         * The decoder resumes rather than re-parses, so a field that straddles a
+         * chunk boundary is never delivered from the beginning again. Three pieces
+         * of fixed-size state describe where it stopped: this depth,
+         * @ref pathId_ / @ref pathSkip_ for the sequences that are open above it,
+         * and @ref pend_ / @ref pendDone_ for the field itself.
+         */
+        int suspendDepth_ = -1;
+        /** @brief Re-descending @ref pathId_ to reach @ref suspendDepth_. */
+        bool replay_ = false;
+        /**
+         * @brief Id of the sequence field entered at each open level (§4.9).
+         *
+         * A nested sequence cannot be resumed by remembering a byte offset: the
+         * handler chain that was descending into it lives on the C++ stack, which
+         * a `feed` returning unwinds. What survives is the **path** — one field id
+         * per open level — and replaying it re-enters exactly the handlers that
+         * were open, because each level's `deserialize` dispatches on the id. At
+         * most @ref MAX_DEPTH ids, sized at construction (§6.6).
+         */
+        sofab::id pathId_[MAX_DEPTH + 1];
+        /** @brief That level was entered by @ref skipPayload, not by a handler. */
+        bool pathSkip_[MAX_DEPTH + 1];
+        /** @brief A field at @ref suspendDepth_ is half-delivered. */
+        bool pend_ = false;
+        /**
+         * @brief That field's header, kept apart from the live @ref type_ /
+         *        @ref fixLen_ / @ref count_.
+         *
+         * The live metadata belongs to whatever field the parser is looking at
+         * *now*, and re-descending @ref pathId_ overwrites it with each sequence
+         * header it replays. The suspended field's own header therefore has to be
+         * kept separately and put back once its level is reached again — it is the
+         * header the read will be continued under, and re-parsing it is exactly
+         * what there are no bytes for.
+         */
+        sofab::id pendId_ = 0;
+        Wire pendType_{};   /**< @copydoc pendId_ */
+        Fix pendFix_{};     /**< @copydoc pendId_ */
+        size_t pendLen_ = 0;   /**< @copydoc pendId_ */
+        size_t pendCount_ = 0; /**< @copydoc pendId_ */
+        /** @brief ...and it was declined, so @ref skipPayload resumes it rather than the handler. */
+        bool pendSkip_ = false;
+        /**
+         * @brief Progress through the pending field: payload bytes already written
+         *        into the caller's destination, or array elements already decoded.
+         */
+        size_t pendDone_ = 0;
+        /** @brief Incremental UTF-8 DFA state for the `string` payload in progress (§6.4.4). */
+        uint32_t utf8State_ = 0;
+        /** @brief Bytes of the current top-level field consumed in earlier chunks (#26). */
+        size_t spanCarry_ = 0;
+        /** @brief Where that field's span continues in the window being parsed (#26). */
+        const uint8_t *spanBase_ = nullptr;
 
         /* cursor + current-field metadata, valid during a deliver callback */
         const uint8_t *p_ = nullptr;   /**< Read cursor. */
@@ -2853,17 +2980,16 @@ namespace sofab
          * the field was refused rather than consumed, and letting a later chunk
          * "recover" it would make the verdict depend on where the chunk boundaries
          * fell. So once any of the three is the answer it stays the answer for
-         * every later @ref feed, until @ref reset starts a new message. Without the latch the verdict would depend on where the chunk
-         * boundaries fell: feed()'s fast path returns before the offending bytes
-         * reach @ref acc_ and the next call starts from a clean slate, while the
-         * continuation path re-parses them out of @ref acc_ and keeps failing —
-         * exactly the divergence §7.2 item 4 forbids.
+         * every later @ref feed, until @ref reset starts a new message. Without the
+         * latch the verdict would depend on where the chunk boundaries fell: the
+         * offending bytes are consumed and gone, so the next call would start from
+         * a clean slate and resynchronize on whatever follows the fault — exactly
+         * the divergence §7.2 item 4 forbids.
          */
         Error terminal_ = Error::None;
         int seqDepth_ = 0;             /**< Current nested-sequence depth during dispatch (§4.9 @ref MAX_DEPTH). */
         size_t skipped_ = 0;           /**< §7.3 type-mismatch skips seen so far (@ref skipped). */
         bool incomplete_ = false;      /**< The field being delivered needs more bytes (§7 INCOMPLETE, not malformed). */
-        bool declined_ = false;        /**< The buffered field was already offered and not read: skip it, do not deliver again. */
         /**
          * @brief The tightest armed element-index bound of the wrapper sequence
          *        being read (§5.1); -1 = none.
@@ -2880,9 +3006,8 @@ namespace sofab
         int elemWire_ = -1;            /**< §7.3 wire type its elements must carry (a @ref Wire as int); -1 = the collector decides the bound itself. */
         int elemFix_ = -1;             /**< §7.3 fixlen subtype for that element type (a @ref Fix as int); -1 = the element type has none. */
         sofab::id fieldId_ = 0;        /**< Id of the field being delivered. */
-        const uint8_t *fieldStart_ = nullptr; /**< First byte of that field, for the #26 reassembly cap. */
 
-        /** Cap on the reassembly buffer's growth for one incomplete field (@ref Limits::max_buffered_field). */
+        /** Cap on how many bytes one top-level field may span (@ref Limits::max_buffered_field). */
         size_t maxBufferedField_ = SIZE_MAX;
         long maxDynArrayCount_ = -1; /**< §6.2.1 index cap fallback; -1 = none (@ref Limits::max_dyn_array_count). */
 
@@ -3034,17 +3159,22 @@ namespace sofab
              * untouched). @p overflow is still taken for the fast path above. */
             uint64_t v = 0;
             int shift = 0;
-            while (p < end)
+            for (const uint8_t *q = p; q < end; )
             {
-                const uint8_t b = *p++;
+                const uint8_t b = *q++;
                 v |= static_cast<uint64_t>(b & 0x7f) << shift;
                 if (!(b & 0x80))
                 {
+                    p = q;
                     out = v;
                     return true;
                 }
                 shift += 7;
             }
+            /* Truncated: the cursor does NOT move. A varint cut by a chunk
+             * boundary is bounded working state (§6.6.2) that rides in the carry
+             * and is read again from its first byte, so every caller wants it left
+             * where it started rather than half-consumed. */
             return false;
         }
         /**
@@ -3068,9 +3198,9 @@ namespace sofab
             if (static_cast<size_t>(end - p) >= detail::VARINT_MAX_BYTES)
                 return skipVarintWindowed(p, overflow);
 
-            while (p < end)
-                if (!(*p++ & 0x80)) return true;
-            return false;
+            for (const uint8_t *q = p; q < end; )
+                if (!(*q++ & 0x80)) { p = q; return true; }
+            return false; /* truncated: cursor unmoved, see @ref getVarint */
         }
 
         /**
@@ -3121,29 +3251,6 @@ namespace sofab
             }
         }
 
-        /**
-         * @brief Append @p n bytes to a byte vector.
-         *
-         * The surrounding pragma silences a GCC-13 `-Wstringop-overflow` false
-         * positive triggered by growing the vector from a raw pointer.
-         *
-         * @param v Vector to extend.
-         * @param p Source bytes.
-         * @param n Number of bytes to append.
-         */
-#if defined(__GNUC__) && !defined(__clang__)
-#  pragma GCC diagnostic push
-#  pragma GCC diagnostic ignored "-Wstringop-overflow"
-#endif
-        static void appendBytes(std::vector<uint8_t> &v, const uint8_t *p, size_t n)
-        {
-            size_t old = v.size();
-            v.resize(old + n);
-            if (n) std::memcpy(v.data() + old, p, n);
-        }
-#if defined(__GNUC__) && !defined(__clang__)
-#  pragma GCC diagnostic pop
-#endif
         /**
          * @brief Load a little-endian float or double from raw bytes.
          * @tparam F Floating-point type to read (`float` or `double`).
@@ -3225,11 +3332,12 @@ namespace sofab
          *    `INCOMPLETE`, never an error (§5.2).
          * 3. **UTF-8** (§6.4), for a `string` payload only, and never on skip
          *    (§6.4.5 — this function runs only where a value is materialized).
-         * 4. **The copy**, then the length (@ref detail::destSetLen). The
+         * 4. **The copy**, then the length (@ref sofab::detail::destSetLen). The
          *    destination is written exactly once, complete (§6.6.2).
          *
-         * @tparam D Destination: @ref FixedString / @ref FixedBytes (static room)
-         *         or a `std::string` / `std::vector<uint8_t>` the caller sized.
+         * @tparam D Destination: @ref sofab::FixedString / @ref sofab::FixedBytes
+         *         (static room) or a `std::string` / `std::vector<uint8_t>` the
+         *         caller sized.
          * @param value Destination.
          * @param validateUtf8 Whether the payload is a `string` (§6.4).
          * @return `true` when the payload was delivered and the field consumed.
@@ -3237,37 +3345,103 @@ namespace sofab
         template <typename D>
         bool readPayload(D &value, bool validateUtf8) noexcept
         {
+            const size_t avail = static_cast<size_t>(end_ - p_);
+            if (pendDone_ == 0 && avail >= fixLen_) [[likely]]
+            {
+                /* The whole payload in one piece — every un-chunked feed, and every
+                 * chunked one whose boundary did not fall inside this field. One
+                 * room test, one validation pass, one copy. */
+                if (!roomFor(value, fixLen_)) return false;
+#if SOFAB_STRICT_UTF8
+                if (validateUtf8 &&
+                    !detail::utf8Valid(reinterpret_cast<const char *>(p_), fixLen_))
+                { error_ = true; return false; }
+#else
+                (void)validateUtf8;
+#endif
+                if (fixLen_) std::memcpy(value.data(), p_, fixLen_);
+                detail::destSetLen(value, fixLen_);
+                p_ += fixLen_;
+                consumed_ = true;
+                return true;
+            }
+            return readPayloadPiece(value, validateUtf8, avail);
+        }
+
+        /**
+         * @brief Is there room for @p need bytes in the destination the caller
+         *        handed over (§6.6.3)?
+         *
+         * Two kinds of destination answer differently, and the difference is a fact
+         * the type publishes rather than a policy this read picks:
+         *
+         * * **static room** (`D::capacity()`) cannot change between chunks, so the
+         *   refusal is decided from the header alone — before a byte of payload is
+         *   consulted — and where the chunk boundaries fall cannot change it;
+         * * **room the caller sized** is judged against what this delivery can
+         *   actually reach: the announced length, clamped to what has arrived. A
+         *   declared length whose payload is absent or withheld reaches nothing and
+         *   refuses nothing, so a truncated field stays `INCOMPLETE` (§5.2) instead
+         *   of being mistaken for a destination that is too small; once the last
+         *   piece is here the reach IS the announced length, and a destination
+         *   genuinely too short is refused exactly then.
+         *
+         * @return `false` with @ref rejectDestination raised (`InvalidArgument`).
+         */
+        template <typename D>
+        bool roomFor(D &value, size_t need) noexcept
+        {
             if constexpr (requires { D::capacity(); })
             {
-                /* **Static** room cannot change between chunks, so the refusal is
-                 * decided from the header alone, before a byte of payload is
-                 * consulted: where the chunk boundaries fall cannot change it. */
                 if (fixLen_ > D::capacity()) { rejectDestination(); return false; }
             }
-            else
-            {
-                /* Room the caller sized, judged against what this delivery can
-                 * actually **reach** — the announced length, clamped to the bytes
-                 * in hand. A declared length whose payload is absent or withheld
-                 * reaches nothing and refuses nothing, so a truncated field stays
-                 * `INCOMPLETE` (§5.2) instead of being mistaken for a destination
-                 * that is too small; once the payload is here the reach IS the
-                 * announced length, and a destination genuinely too short is
-                 * refused exactly then. */
-                if (std::min<size_t>(fixLen_, static_cast<size_t>(end_ - p_)) > value.size())
-                { rejectDestination(); return false; }
-            }
-            if (static_cast<size_t>(end_ - p_) < fixLen_) { incomplete_ = true; return false; }
+            else if (need > value.size()) { rejectDestination(); return false; }
+            return true;
+        }
+
+        /**
+         * @brief The chunk-straddling half of @ref readPayload — deliver the piece
+         *        that has arrived and remember how far the value got.
+         *
+         * §6.6.2: "A payload split across fed chunks has to be joined somewhere.
+         * That somewhere is storage the caller supplied — the codec copies each
+         * piece into it as the piece arrives … A codec **MUST NOT** grow a private
+         * accumulator instead." So the piece goes straight where the value belongs
+         * and only the **length** is published, once, at the end — no caller ever
+         * sees a half-written value (§6.6.2's "written exactly once, complete").
+         *
+         * Cold: it runs only for a field a chunk boundary fell inside.
+         */
+        template <typename D>
+        bool readPayloadPiece(D &value, bool validateUtf8, size_t avail) noexcept
+        {
+            const size_t done = pendDone_;
+            const size_t take = std::min(avail, fixLen_ - done);
+            if (!roomFor(value, done + take)) return false;
 #if SOFAB_STRICT_UTF8
-            if (validateUtf8 &&
-                !detail::utf8Valid(reinterpret_cast<const char *>(p_), fixLen_))
-            { error_ = true; return false; }
+            /* §6.4.4 permits exactly this — "A decoder MAY validate incrementally
+             * provided it carries validator state across `feed` calls; no assembly
+             * buffer is required" — and requires the verdict to be taken at payload
+             * completion, never mid-payload, so a chunk boundary cannot decide it. */
+            if (validateUtf8) utf8State_ = detail::utf8Advance(utf8State_, p_, take);
 #else
             (void)validateUtf8;
 #endif
-            if (fixLen_) std::memcpy(value.data(), p_, fixLen_);
+            if (take) std::memcpy(value.data() + done, p_, take);
+            p_ += take;
+            if (done + take < fixLen_)
+            {
+                pendDone_ = done + take;
+                incomplete_ = true;
+                return false;
+            }
+#if SOFAB_STRICT_UTF8
+            if (validateUtf8 && utf8State_ != detail::UTF8_ACCEPT)
+            { error_ = true; return false; }
+#endif
             detail::destSetLen(value, fixLen_);
-            p_ += fixLen_;
+            pendDone_ = 0;
+            utf8State_ = detail::UTF8_ACCEPT;
             consumed_ = true;
             return true;
         }
@@ -3308,113 +3482,402 @@ namespace sofab
          * @param stopAtEnd If `true`, return at a @ref Wire::SequenceEnd
          *        marker (nested level); if `false`, such a marker is a decode error.
          */
+        /**
+         * @brief A non-owning reference to a level's per-field callback.
+         *
+         * The parse loops call their callback through a template parameter, so the
+         * call is direct and inlines (that is deliberate — a `std::function`
+         * parameter there cost ~13 % of `decode: typical message`). The **resume**
+         * helpers below want the opposite: they run once per chunk boundary, never
+         * in the loop, and compiling a copy of each of them into every one of the
+         * dozens of `dispatchLevel` instantiations buys nothing but code size and
+         * uncoverable lines. They take this instead — two pointers, one indirect
+         * call on a cold path.
+         */
+        struct FieldCb
+        {
+            void *ctx;
+            void (*fn)(void *, sofab::id, size_t, size_t);
+            void operator()(sofab::id id, size_t size, size_t count) const noexcept
+            {
+                fn(ctx, id, size, count);
+            }
+        };
+
+        /** @brief Wrap a level's callback as a @ref FieldCb. */
+        template <typename Cb>
+        static FieldCb wrapCb(Cb &cb) noexcept
+        {
+            return FieldCb{&cb, [](void *p, sofab::id id, size_t size, size_t count) noexcept {
+                               (*static_cast<Cb *>(p))(id, size, count);
+                           }};
+        }
+
+        /** @brief How a level is being entered (see @ref levelEntry). */
+        enum class Entry : uint8_t
+        {
+            Fresh,   /**< Nothing open here: parse the next field. */
+            Descend, /**< The suspended level is deeper: replay one more id. */
+            Resume,  /**< This level is it: continue its half-delivered field. */
+        };
+
+        /**
+         * @brief Decide how this level is being entered, and clear the replay state
+         *        once the suspended level is reached.
+         *
+         * Non-template on purpose: every `dispatchLevel` instantiation asks the
+         * same question, and only the answer differs.
+         */
+        Entry levelEntry() noexcept
+        {
+            if (!replay_) return Entry::Fresh;
+            if (seqDepth_ < suspendDepth_) return Entry::Descend;
+            replay_ = false;
+            suspendDepth_ = -1;
+            return pend_ ? Entry::Resume : Entry::Fresh;
+        }
+
         template <typename Cb>
         void dispatchLevel(Cb &&cb, bool stopAtEnd) noexcept
         {
+            /* Re-enter a level the previous chunk left open, rather than parsing
+             * its bytes again — which is the whole of §6.6.2's "MUST NOT grow a
+             * private accumulator": there is nothing to re-parse from. */
+            const Entry entry = levelEntry();
+            if (entry != Entry::Fresh) [[unlikely]]
+                if (!reenterLevel(wrapCb(cb), entry)) return;
+
             while (p_ < end_ && !error_ && !incomplete_)
             {
-                /* #26: a sequence's own bulk accrues field by field — bound it as it
-                 * grows, catching many-small-fields that no single payload check
-                 * would trip. */
-                if (maxBufferedField_ != SIZE_MAX && fieldStart_ &&
-                    exceedsBuffer(static_cast<size_t>(p_ - fieldStart_), 0))
-                { exceedLimit(); return; }
-                const uint8_t *fieldStart = p_;
-                if (!parseFieldTag()) return; /* error_ or incomplete_ set */
+                /* Everything before the delivery is the same code in every
+                 * instantiation, and it is where §7.3's element test, §5.1's index
+                 * bound and §4.6/§4.8's metadata rules all live, so it is written
+                 * once (@ref beginField) rather than copied into each. */
+                const Field f = beginField(stopAtEnd);
+                if (f == Field::Stop) return;
                 const sofab::id fieldId = fieldId_;
-                /* §5.1/§7: an element index at or past the declared count is
-                 * INVALID -- but §7.3 decides first. An element header whose wire
-                 * type (or, for a fixlen element type, whose fixlen subtype)
-                 * contradicts the declared element type MUST be skipped exactly as
-                 * an unknown id is skipped, so it never becomes an element and its
-                 * id is not an array index the bound could measure. §7.4 states the
-                 * same from the other side ("an occurrence skipped under §7.3 is
-                 * not an occurrence"), and CORELIB_PLAN §4.8 gives the reason: the
-                 * field was never this array's value.
-                 *
-                 * The bound is therefore applied only to a header that survives the
-                 * §7.3 test. For a fixlen element type that is known only after the
-                 * fixlen word below, so a message ending BETWEEN the element header
-                 * and its fixlen word is INCOMPLETE, not INVALID (§5.2, the analogue
-                 * of §4.8's ruling for the fixlen array's two words). From the
-                 * fixlen word on the reject is immediate -- it never waits for
-                 * payload bytes. Format-level rejects (over-64-bit varint,
-                 * ARRAY_MAX, a reserved fixlen subtype, ...) still fire on a skipped
-                 * field's own metadata: §7.3 subordinates the SCHEMA bound only.
-                 *
-                 * A collector that publishes no element type (elemWire_ < 0) keeps
-                 * the bound to itself and enforces it in its deserialize. */
-                bool skipElem = false;     /* §7.3: not an element of this array */
-                bool boundPending = false; /* over-index, subtype not yet known */
-                if (elemBound_ >= 0 && elemWire_ >= 0 && type_ != Wire::SequenceEnd &&
-                    static_cast<long>(fieldId) >= elemBound_)
-                {
-                    if (static_cast<int>(type_) != elemWire_) { skipElem = true; ++skipped_; }
-                    else if (type_ != Wire::Fixlen) { rejectElementIndex(fieldId); return; }
-                    else boundPending = true; /* decided at the fixlen word */
-                }
-
-                if (type_ == Wire::SequenceEnd)
-                {
-                    if (stopAtEnd) return;
-                    error_ = true; return;
-                }
-
-                /* The metadata that precedes the payload — one parser, shared
-                 * with the top level (@ref parseFieldMeta). It used to be copied
-                 * out here, and the copy silently lost the §6.2 count ceiling on
-                 * a nested fixlen array until #103 put it back; a second copy of
-                 * a validating parser is a hole waiting to reopen. */
-                if (!parseFieldMeta()) return;
-
-                /* the fixlen word is in: §7.3 first, then the §5.1/§7 bound. */
-                if (boundPending)
-                {
-                    if (elemFix_ >= 0 && static_cast<int>(fixType_) != elemFix_)
-                    { skipElem = true; ++skipped_; }
-                    else { rejectElementIndex(fieldId); return; }
-                }
-
-                consumed_ = false;
                 const uint8_t *payload = p_;
                 /* a §7.3-skipped element is never delivered; leaving it unconsumed
                  * runs it through the same skip as an unknown id. */
-                if (!skipElem) cb(fieldId, fixLen_, count_);
-                /* §7: the bytes ran out INSIDE this field -- it is unfinished, not
-                 * declined, and the two must not be confused. The skip below is for
-                 * a field the callback did not want; running it here would rewind
-                 * to a payload the callback has already parsed *into* and re-read
-                 * those bytes under the metadata (@ref type_, @ref count_,
-                 * @ref fixLen_) of whatever innermost field the descent left behind
-                 * -- so a fixlen array's raw payload gets re-parsed as varints and a
-                 * truncation is reported INVALID, decided by payload bytes a
-                 * length-consuming reader must never look at (Crucible F-0056,
-                 * corelib-cpp#71). The whole top-level field is buffered and
-                 * delivered again once the rest arrives, so this level is simply
-                 * abandoned where it began. */
-                if (incomplete_)
-                {
-                    p_ = fieldStart;
-                    return;
-                }
-
-                if (!consumed_)
-                {
-                    p_ = payload;
-                    skipPayload();
-                }
+                if (f != Field::SkipElem) cb(fieldId, fixLen_, count_);
+                if (!finishField(payload, fieldId)) return;
             }
-            /* §7: the bytes ran out with this sequence still open -- INCOMPLETE,
-             * not malformed. The whole top-level field is delivered again once the
-             * remaining bytes arrive. */
-            if (stopAtEnd && !error_) incomplete_ = true;
+            closeLevel(stopAtEnd);
+        }
+
+        /** @brief What @ref beginField found at this level's next field. */
+        enum class Field : uint8_t
+        {
+            Ready,    /**< Deliver it. */
+            SkipElem, /**< §7.3 says it is not this array's element: skip, do not deliver. */
+            Stop,     /**< The level is finished, suspended or refused. */
+        };
+
+        /**
+         * @brief Parse the next field's header and metadata at a nested level, and
+         *        apply every rule that is decided before the value.
+         *
+         * Split out of @ref dispatchLevel so it is compiled **once** rather than
+         * once per callback type: the loop's callback is a template parameter so
+         * the delivery inlines, but everything around it is the same code in every
+         * instantiation, and a dozen copies of it are a dozen copies of the §7.3
+         * and §5.1 rules for a reader to keep in step.
+         *
+         * @param stopAtEnd Whether a @ref Wire::SequenceEnd closes this level.
+         * @return @ref Field::Stop when @ref dispatchLevel must return.
+         */
+        Field beginField(bool stopAtEnd) noexcept
+        {
+            /* #26: a sequence's own bulk accrues field by field — bound it as it
+             * grows, catching many-small-fields that no single payload check
+             * would trip. */
+            if (maxBufferedField_ != SIZE_MAX && spanBase_ && exceedsBuffer(spanned(), 0))
+            { exceedLimit(); return Field::Stop; }
+            const uint8_t *const fieldStart = p_;
+            if (!parseFieldTag())
+            {
+                /* A cut header is backed up whole: it is at most three varints,
+                 * which is what @ref CARRY_CAP is sized for. */
+                if (incomplete_) { p_ = fieldStart; suspendAtBoundary(); }
+                return Field::Stop;
+            }
+            const sofab::id fieldId = fieldId_;
+            /* §5.1/§7: an element index at or past the declared count is
+             * INVALID -- but §7.3 decides first. An element header whose wire
+             * type (or, for a fixlen element type, whose fixlen subtype)
+             * contradicts the declared element type MUST be skipped exactly as
+             * an unknown id is skipped, so it never becomes an element and its
+             * id is not an array index the bound could measure. §7.4 states the
+             * same from the other side ("an occurrence skipped under §7.3 is
+             * not an occurrence"), and CORELIB_PLAN §4.8 gives the reason: the
+             * field was never this array's value.
+             *
+             * The bound is therefore applied only to a header that survives the
+             * §7.3 test. For a fixlen element type that is known only after the
+             * fixlen word below, so a message ending BETWEEN the element header
+             * and its fixlen word is INCOMPLETE, not INVALID (§5.2, the analogue
+             * of §4.8's ruling for the fixlen array's two words). From the
+             * fixlen word on the reject is immediate -- it never waits for
+             * payload bytes. Format-level rejects (over-64-bit varint,
+             * ARRAY_MAX, a reserved fixlen subtype, ...) still fire on a skipped
+             * field's own metadata: §7.3 subordinates the SCHEMA bound only.
+             *
+             * A collector that publishes no element type (elemWire_ < 0) keeps
+             * the bound to itself and enforces it in its deserialize. */
+            bool skipElem = false;     /* §7.3: not an element of this array */
+            bool boundPending = false; /* over-index, subtype not yet known */
+            if (elemBound_ >= 0 && elemWire_ >= 0 && type_ != Wire::SequenceEnd &&
+                static_cast<long>(fieldId) >= elemBound_)
+            {
+                if (static_cast<int>(type_) != elemWire_) { skipElem = true; ++skipped_; }
+                else if (type_ != Wire::Fixlen) { rejectElementIndex(fieldId); return Field::Stop; }
+                else boundPending = true; /* decided at the fixlen word */
+            }
+
+            if (type_ == Wire::SequenceEnd)
+            {
+                if (!stopAtEnd) error_ = true; /* §7: a dangling end */
+                return Field::Stop;
+            }
+
+            /* The metadata that precedes the payload — one parser, shared
+             * with the top level (@ref parseFieldMeta). It used to be copied
+             * out here, and the copy silently lost the §6.2 count ceiling on
+             * a nested fixlen array until #103 put it back; a second copy of
+             * a validating parser is a hole waiting to reopen. */
+            if (!parseFieldMeta())
+            {
+                if (incomplete_) { p_ = fieldStart; suspendAtBoundary(); }
+                return Field::Stop;
+            }
+
+            /* the fixlen word is in: §7.3 first, then the §5.1/§7 bound. */
+            if (boundPending)
+            {
+                if (elemFix_ >= 0 && static_cast<int>(fixType_) != elemFix_)
+                { skipElem = true; ++skipped_; }
+                else { rejectElementIndex(fieldId); return Field::Stop; }
+            }
+
+            /* From here the field's metadata is settled, so a chunk boundary
+             * inside it no longer costs a rewind: it suspends. The progress
+             * counters start at zero for a field nothing has delivered yet;
+             * @ref pend_ / @ref pendSkip_ need no reset, since every suspension
+             * writes them (@ref suspendHere, @ref suspendAtBoundary). */
+            pendDone_ = 0;
+            utf8State_ = 0;
+            consumed_ = false;
+            return skipElem ? Field::SkipElem : Field::Ready;
         }
 
         /**
-         * @brief Skip the payload of the current field, leaving the cursor at the next field.
+         * @brief Settle a field the callback has been offered: skip it if the
+         *        callback did not want it, suspend it if its bytes ran out.
          *
-         * Called for fields the user callback chose not to read. Assumes the cursor
-         * sits at the start of the payload and the field metadata is set.
+         * The callback did not want this field: rewind to the payload — which the
+         * declining read left the cursor at anyway — and skip it, resumably, so a
+         * long payload nobody asked for is stepped over as it arrives rather than
+         * buffered (§6.6.2).
+         *
+         * §7: the bytes running out INSIDE the field is a different thing. It is
+         * unfinished, not declined, and the two must not be confused — hence the
+         * `!incomplete_` in the test. Skipping a truncation would rewind into a
+         * payload the callback has already parsed *into* and re-read those bytes
+         * under the metadata of whatever innermost field the descent left behind,
+         * reporting INVALID for a truncation (Crucible F-0056, corelib-cpp#71).
+         *
+         * @param payload The field's first payload byte.
+         * @param fieldId Its id, for the path entry a suspension records.
+         * @return `false` when the level must return.
+         */
+        [[gnu::always_inline]] inline bool finishField(const uint8_t *payload, sofab::id fieldId) noexcept
+        {
+            bool declined = false;
+            if (!incomplete_ && !consumed_)
+            {
+                declined = true;
+                p_ = payload;
+                skipPayload();
+            }
+            if (incomplete_)
+            {
+                suspendHere(fieldId, declined);
+                return false;
+            }
+            return true;
+        }
+
+        /**
+         * @brief The bytes ran out with this sequence still open — `INCOMPLETE`,
+         *        not malformed (§7). The level is re-entered along @ref pathId_
+         *        once the remaining bytes arrive.
+         */
+        void closeLevel(bool stopAtEnd) noexcept
+        {
+            if (stopAtEnd && !error_ && !incomplete_)
+            {
+                incomplete_ = true;
+                suspendAtBoundary();
+            }
+        }
+
+        /** @brief Take the @ref Entry::Descend or @ref Entry::Resume path. */
+        bool reenterLevel(FieldCb cb, Entry entry) noexcept
+        {
+            if (entry == Entry::Descend) return descendResume(cb);
+            restorePending();
+            return deliverPending(cb, pendSkip_);
+        }
+
+        /**
+         * @brief Record that this level's current field is the suspension point.
+         *
+         * The innermost level claims @ref suspendDepth_; every level above it then
+         * writes its own @ref pathId_ entry as the stack unwinds, so the path is
+         * complete by the time @ref feed sees the `INCOMPLETE`.
+         *
+         * @param fieldId Id of this level's field, for the @ref pathId_ entry a
+         *        level above the suspension records.
+         * @param declined Whether the field was being skipped rather than read.
+         */
+        void suspendHere(sofab::id fieldId, bool declined) noexcept
+        {
+            if (suspendDepth_ >= 0)
+            {
+                /* A deeper level is the suspension point; this one is on the path
+                 * that reaches it. */
+                pathId_[seqDepth_] = fieldId;
+                pathSkip_[seqDepth_] = declined;
+                return;
+            }
+            suspendDepth_ = seqDepth_;
+            pend_ = true;
+            pendSkip_ = declined;
+            pendId_ = fieldId;
+            pendType_ = type_;
+            pendFix_ = fixType_;
+            pendLen_ = fixLen_;
+            pendCount_ = count_;
+        }
+
+        /**
+         * @brief Claim the suspension for this level at a **field boundary** —
+         *        nothing half-delivered, only a header cut in two or a sequence
+         *        still open.
+         *
+         * The ≤ @ref CARRY_CAP bytes of the cut header ride in @ref carry_ and are
+         * parsed again from their first byte; there is no pending field, so nothing
+         * is re-delivered.
+         */
+        void suspendAtBoundary() noexcept
+        {
+            if (suspendDepth_ >= 0) return;
+            suspendDepth_ = seqDepth_;
+            pend_ = false;
+            pendSkip_ = false;
+        }
+
+        /** @brief Put the suspended field's header back before continuing it. */
+        void restorePending() noexcept
+        {
+            fieldId_ = pendId_;
+            type_ = pendType_;
+            fixType_ = pendFix_;
+            fixLen_ = pendLen_;
+            count_ = pendCount_;
+        }
+
+        /**
+         * @brief Re-deliver the half-delivered field at this level.
+         *
+         * Its metadata (@ref type_, @ref fixLen_, @ref count_, @ref fieldId_) is
+         * still the state the previous chunk left, and @ref pendDone_ says how far
+         * it got, so the read (or the skip) continues where it stopped instead of
+         * starting over.
+         *
+         * @return `false` when the level must return — the field suspended again,
+         *         or the decode failed.
+         */
+        bool deliverPending(FieldCb cb, bool declined) noexcept
+        {
+            /* A descent below this field clobbers @ref fieldId_, so the id this
+             * level would have to record is taken before the delivery. */
+            const sofab::id id = fieldId_;
+            consumed_ = false;
+            if (declined) skipPayload();
+            else          cb(id, fixLen_, count_);
+            if (error_) return false;
+            if (!incomplete_ && !consumed_ && !declined)
+            {
+                declined = true;
+                skipPayload();
+                if (error_) return false;
+            }
+            if (incomplete_)
+            {
+                suspendHere(id, declined);
+                return false;
+            }
+            pend_ = false;
+            pendSkip_ = false;
+            pendDone_ = 0;
+            return true;
+        }
+
+        /**
+         * @brief Re-descend one recorded level of @ref pathId_ towards
+         *        @ref suspendDepth_.
+         *
+         * Replays the sequence field this level was inside when the chunk ran out:
+         * either by handing its id back to @p cb — whose `deserialize` dispatches
+         * on the id and calls `read` on the same member, re-establishing exactly the
+         * handler that was open — or, for a level that was being **skipped**, by
+         * re-entering the skip descent directly. Nothing is parsed here: the bytes
+         * of the sequence header were consumed by an earlier chunk and are gone.
+         *
+         * @param cb This level's per-field callback.
+         * @return `false` when the level must return.
+         */
+        bool descendResume(FieldCb cb) noexcept
+        {
+            const int d = seqDepth_;
+            const sofab::id fieldId = pathId_[d];
+            const bool declined = pathSkip_[d];
+            fieldId_ = fieldId;
+            type_ = Wire::SequenceStart;
+            fixLen_ = 0;
+            count_ = 0;
+            if (declined)
+            {
+                if (seqDepth_ >= MAX_DEPTH) { error_ = true; return false; }
+                skipSequence();
+            }
+            else
+            {
+                consumed_ = false;
+                cb(fieldId, size_t{0}, size_t{0});
+            }
+            if (error_) return false;
+            if (incomplete_)
+            {
+                suspendHere(fieldId, declined);
+                return false;
+            }
+            return true;
+        }
+
+        /**
+         * @brief Step over the payload of the current field, resumably.
+         *
+         * Called for a field the callback declined. Like every read, it never
+         * buffers what it has not finished: a payload cut by a chunk boundary
+         * leaves its byte (or element) progress in @ref pendDone_ and is continued
+         * on the next @ref feed, and a **small** item cut in half — a lone varint,
+         * an element — is backed up to its own start so the ≤ @ref CARRY_CAP bytes
+         * of it can be carried (§6.6.2).
+         *
+         * Assumes the cursor sits at the payload's resume point and the field
+         * metadata is set.
          */
         void skipPayload() noexcept
         {
@@ -3423,39 +3886,61 @@ namespace sofab
                 case Wire::Unsigned:
                 case Wire::Signed:
                 {
+                    /* One varint, at most @ref detail::VARINT_MAX_BYTES bytes: cut
+                     * in half it is backed up whole rather than half-consumed, so
+                     * the carry holds it and this runs again from its first byte. */
                     bool ovf = false;
-                    if (!skipVarint(p_, end_, &ovf)) (ovf ? error_ : incomplete_) = true;
+                    if (!skipVarint(p_, end_, &ovf))
+                        (ovf ? error_ : incomplete_) = true;
                     break;
                 }
                 case Wire::Fixlen:
-                    if (static_cast<size_t>(end_ - p_) < fixLen_)
+                {
+                    /* A payload of any length, stepped over as it arrives. */
+                    const size_t left = fixLen_ - pendDone_;
+                    const size_t avail = static_cast<size_t>(end_ - p_);
+                    if (avail < left)
                     {
+                        p_ += avail;
+                        pendDone_ += avail;
                         incomplete_ = true;
                         break;
                     }
-                    p_ += fixLen_;
+                    p_ += left;
+                    pendDone_ = 0;
                     break;
+                }
                 case Wire::ArrayUnsigned:
                 case Wire::ArraySigned:
-                    for (size_t i = 0; i < count_; ++i)
+                {
+                    for (size_t i = pendDone_; i < count_; ++i)
                     {
                         bool ovf = false;
                         if (!skipVarint(p_, end_, &ovf))
                         {
-                            (ovf ? error_ : incomplete_) = true;
-                            break;
+                            if (ovf) { error_ = true; return; }
+                            pendDone_ = i;
+                            incomplete_ = true;
+                            return;
                         }
                     }
+                    pendDone_ = 0;
                     break;
+                }
                 case Wire::ArrayFixlen:
                 {
-                    size_t bytes = count_ * fixLen_;
-                    if (static_cast<size_t>(end_ - p_) < bytes)
+                    const size_t bytes = count_ * fixLen_;
+                    const size_t left = bytes - pendDone_;
+                    const size_t avail = static_cast<size_t>(end_ - p_);
+                    if (avail < left)
                     {
+                        p_ += avail;
+                        pendDone_ += avail;
                         incomplete_ = true;
                         break;
                     }
-                    p_ += bytes;
+                    p_ += left;
+                    pendDone_ = 0;
                     break;
                 }
                 case Wire::SequenceStart:
@@ -3465,36 +3950,50 @@ namespace sofab
                         error_ = true;
                         break;
                     }
-                    /* §7.3: this sequence is being skipped, so it is not an element
-                     * of the enclosing wrapper -- and the fields INSIDE it are not
-                     * that wrapper's elements either. Their ids are child ids of a
-                     * field that never became a value, not array indices, so the
-                     * element-index bound must not measure them: it is suspended for
-                     * the whole subtree and restored after. Without this a child id
-                     * at or past the wrapper's `count` would trip the §5.1/§7 reject
-                     * from inside a field §7.3 says is not the array's at all
-                     * (Crucible F-0051, corelib-cpp#65). The suspension is not
-                     * specific to a §7.3-mistyped element: an unknown id skipped
-                     * inside the wrapper reaches the same place and is equally not
-                     * an element. Format-level rejects (§4.9 depth, over-64-bit
-                     * varint, ...) still fire inside the subtree -- §7.3
-                     * subordinates the SCHEMA bound only. */
-                    const long outerBound = elemBound_;
-                    const int outerElemWire = elemWire_, outerElemFix = elemFix_;
-                    elemBound_ = -1;
-                    elemWire_ = -1;
-                    elemFix_ = -1;
-                    ++seqDepth_;
-                    dispatchLevel([](sofab::id, size_t, size_t) {}, /*stopAtEnd*/ true);
-                    --seqDepth_;
-                    elemBound_ = outerBound;
-                    elemWire_ = outerElemWire;
-                    elemFix_ = outerElemFix;
+                    skipSequence();
                     break;
                 }
                 case Wire::SequenceEnd:
                     break;
             }
+        }
+
+        /**
+         * @brief Walk a sub-sequence nobody asked for, delivering nothing.
+         *
+         * Split out of @ref skipPayload because a skipped sequence, like every
+         * other construct, has to be **re-enterable**: when a chunk ends inside one
+         * the level is recorded in @ref pathSkip_ and @ref descendResume comes back
+         * through here, with no callback to replay.
+         *
+         * §7.3: this sequence is not an element of the enclosing wrapper — and the
+         * fields INSIDE it are not that wrapper's elements either. Their ids are
+         * child ids of a field that never became a value, not array indices, so the
+         * element-index bound must not measure them: it is suspended for the whole
+         * subtree and restored after. Without this a child id at or past the
+         * wrapper's `count` would trip the §5.1/§7 reject from inside a field §7.3
+         * says is not the array's at all (Crucible F-0051, corelib-cpp#65). The
+         * suspension is not specific to a §7.3-mistyped element: an unknown id
+         * skipped inside the wrapper reaches the same place and is equally not an
+         * element. Format-level rejects (§4.9 depth, over-64-bit varint, ...) still
+         * fire inside the subtree — §7.3 subordinates the SCHEMA bound only.
+         */
+        void skipSequence() noexcept
+        {
+            const long outerBound = elemBound_, outerSchema = elemSchema_;
+            const long outerDyn = elemDyn_, outerDest = elemDest_;
+            const int outerElemWire = elemWire_, outerElemFix = elemFix_;
+            elemBound_ = elemSchema_ = elemDyn_ = elemDest_ = -1;
+            elemWire_ = elemFix_ = -1;
+            ++seqDepth_;
+            dispatchLevel([](sofab::id, size_t, size_t) noexcept {}, /*stopAtEnd*/ true);
+            --seqDepth_;
+            elemBound_ = outerBound;
+            elemSchema_ = outerSchema;
+            elemDyn_ = outerDyn;
+            elemDest_ = outerDest;
+            elemWire_ = outerElemWire;
+            elemFix_ = outerElemFix;
         }
 
     public:
@@ -3508,8 +4007,17 @@ namespace sofab
          * @brief Feed bytes into the decoder, delivering every complete top-level field.
          *
          * May be called repeatedly with successive chunks; a field split across
-         * chunks is buffered internally and completed on a later call. When nothing
-         * is buffered, the chunk is parsed in place without copying.
+         * chunks is **resumed** on a later call — its pieces are written into the
+         * caller's destination as they arrive, and only what a chunk boundary can
+         * cut in half (a field header, the words before a payload, one varint
+         * element — at most @ref CARRY_CAP bytes) is carried over. Every chunk is
+         * parsed in place; nothing is copied but the value itself.
+         *
+         * @note A field split across chunks is therefore **delivered once per
+         *       chunk that carries part of it**, with the same id and header, and
+         *       the typed read continues where it stopped (@ref progress). The
+         *       destination has to stay put until the field completes: a member of
+         *       the message object does, a local in the callback does not.
          *
          * @param buffer Bytes to decode.
          * @param buflen Number of bytes in @p buffer.
@@ -3517,8 +4025,8 @@ namespace sofab
          *         @ref Error::None (`COMPLETE`) when the fed bytes end exactly at a
          *         field boundary; @ref Error::Incomplete (`INCOMPLETE`) when they end
          *         **inside** a field (partial varint, short fixlen/array payload) or
-         *         with an open sequence — the partial tail is buffered for the next
-         *         @ref feed and is **not** an error; or @ref Error::InvalidMessage
+         *         with an open sequence — the decoder keeps its place for the next
+         *         @ref feed and this is **not** an error; or @ref Error::InvalidMessage
          *         (`INVALID`) when the bytes are malformed regardless of what follows.
          *         @ref Error::LimitExceeded is the fourth, receiver-policy outcome
          *         (§6.2.1) — well-formed bytes this receiver refuses to buffer.
@@ -3551,64 +4059,80 @@ namespace sofab
          */
         Result feed(const uint8_t *buffer, size_t buflen) noexcept
         {
-            /* §5.2/§6.3: INVALID and LimitExceeded are TERMINAL. Once the stream has
-             * returned one, no later chunk can change it — the bytes were malformed
-             * regardless of what follows, or the receiver's policy already refused
-             * them. Answering from the latch before parsing is also what keeps the
-             * two paths below in agreement: the fast path returns without retaining
-             * the offending bytes, so re-parsing would silently "recover" and the
-             * outcome would depend on where the chunk boundaries fell (#79). */
+            /* §5.2/§6.3: INVALID, LimitExceeded and InvalidArgument are TERMINAL.
+             * Once the stream has returned one, no later chunk can change it — the
+             * bytes were malformed regardless of what follows, or the receiver's
+             * policy already refused them. */
             if (terminal_ != Error::None) [[unlikely]] return Result{terminal_, skipped_};
 
-            /* Fast path: nothing buffered. Parse straight over the caller's
-             * memory — no copy, no allocation. This is the common case (a whole
-             * message handed in at once). Only an incomplete trailing field is
-             * copied into the accumulator for the next feed(). */
-            if (acc_.empty()) [[likely]]
-            {
-                error_ = false;
-                limitExceeded_ = false;
-                argError_ = false;
-                const uint8_t *stop = parseTopLevel(buffer, buffer + buflen);
-                /* #26: a field over the buffering cap fails as policy — checked
-                 * before the incomplete tail is copied into acc_, so a claimed
-                 * oversize is rejected even though its payload never arrived. */
-                if (limitExceeded_) { terminal_ = Error::LimitExceeded; return Result{terminal_, skipped_}; }
-                /* §6.3's third tier before the first: a destination too short is a
-                 * refusal of a message that is otherwise beyond reproach, and every
-                 * refusal raises @ref error_ so the parse loops need test only it. */
-                if (argError_) { terminal_ = Error::InvalidArgument; return Result{terminal_, skipped_}; }
-                if (error_) { terminal_ = Error::InvalidMessage; return Result{terminal_, skipped_}; }
-                if (stop != buffer + buflen)
-                {
-                    /* §7: bytes remain that begin but do not finish a field (or an
-                     * open sequence). Retain the partial tail and report INCOMPLETE —
-                     * distinct from COMPLETE, and never folded into INVALID. */
-                    appendBytes(acc_, stop, static_cast<size_t>(buffer + buflen - stop));
-                    return Result{Error::Incomplete, skipped_};
-                }
-                return Result{Error::None, skipped_};
-            }
+            /* §5.2.4: an empty feed is the end-of-input probe, and the verdict is
+             * read off the decoder's own state. It is also the empty message
+             * (MESSAGE_SPEC §2), which is COMPLETE for every schema. */
+            if (buflen == 0)
+                return Result{atBoundary() ? Error::None : Error::Incomplete, skipped_};
 
-            /* Continuation path: append and resume from the buffered tail. */
-            appendBytes(acc_, buffer, buflen);
             error_ = false;
             limitExceeded_ = false;
             argError_ = false;
-            const uint8_t *base = acc_.data();
-            const uint8_t *stop = parseTopLevel(base + topPos_, base + acc_.size());
-            /* #26: re-checked from the buffered tail, so the cap is chunk-independent —
-             * the same field crosses it whether fed whole or dribbled byte by byte. */
-            if (limitExceeded_) { terminal_ = Error::LimitExceeded; return Result{terminal_, skipped_}; }
-            if (argError_) { terminal_ = Error::InvalidArgument; return Result{terminal_, skipped_}; }
-            if (error_) { terminal_ = Error::InvalidMessage; return Result{terminal_, skipped_}; }
-            topPos_ = static_cast<size_t>(stop - base);
-            if (topPos_ == acc_.size()) /* fully drained: COMPLETE */
+
+            const uint8_t *cur = buffer;
+            size_t left = buflen;
+
+            if (carryLen_) [[unlikely]]
             {
-                acc_.clear(); topPos_ = 0;
-                return Result{Error::None, skipped_};
+                /* An item was cut in half by the previous chunk boundary. Stitch it
+                 * back together in a window of @ref CARRY_CAP bytes on the stack —
+                 * never the whole chunk — and parse out of that; whatever of this
+                 * chunk the window did not need is then parsed in place, with no
+                 * copy at all. At most @ref CARRY_CAP bytes are ever copied,
+                 * whatever the caller's chunk size, which is the property §6.6
+                 * protects: "can a sender make this allocation bigger by sending
+                 * different bytes?" — no. */
+                uint8_t stitch[CARRY_CAP];
+                const size_t held = carryLen_;
+                const size_t take = std::min(CARRY_CAP - held, left);
+                std::memcpy(stitch, carry_, held);
+                std::memcpy(stitch + held, cur, take);
+                const size_t window = held + take;
+                carryLen_ = 0;
+                const size_t used = parseWindow(stitch, window);
+                if (error_) return latchTerminal();
+                if (used < held)
+                {
+                    /* Still short of a complete item, so the parse consumed nothing
+                     * — the carry holds exactly one item's prefix — and the chunk
+                     * went in whole. */
+                    if (take < left) { error_ = true; return latchTerminal(); }
+                    std::memcpy(carry_, stitch + used, window - used);
+                    carryLen_ = window - used;
+                    return Result{Error::Incomplete, skipped_};
+                }
+                cur += used - held;
+                left -= used - held;
+                if (left == 0)
+                {
+                    stash(stitch + used, window - used);
+                    return Result{incomplete_ || carryLen_ ? Error::Incomplete : Error::None,
+                                  skipped_};
+                }
+                /* Anything the window left unconsumed is still ahead of `cur` in the
+                 * caller's own chunk, so the parse below simply reaches it again. */
             }
-            return Result{Error::Incomplete, skipped_}; /* §7: a partial field is still buffered */
+
+            const size_t used = parseWindow(cur, left);
+            if (error_) return latchTerminal();
+            stash(cur + used, left - used);
+            if (error_) return latchTerminal();
+            return Result{incomplete_ || carryLen_ ? Error::Incomplete : Error::None, skipped_};
+        }
+
+        /**
+         * @return `true` when the decoder sits at a clean message boundary: nothing
+         *         carried, no open sequence, no half-delivered field (§5.2.4).
+         */
+        [[nodiscard]] bool atBoundary() const noexcept
+        {
+            return carryLen_ == 0 && suspendDepth_ < 0;
         }
 
         /**
@@ -3618,11 +4142,10 @@ namespace sofab
          * Discards the buffered partial field, the sticky error/limit flags, the
          * latched terminal verdict (§5.2/§6.3 — this is the only way to clear an
          * `INVALID` or `LimitExceeded` stream), the nesting depth and the §7.3
-         * @ref skipped counter. The reassembly buffer's
-         * *capacity* is deliberately kept: this is the message-loop call, and
-         * handing the allocation back only to take it again next message is the one
-         * thing it must not cost (`Limits::max_buffered_field` is what bounds that
-         * capacity in the first place).
+         * @ref skipped counter. There is no buffer to hand back: the decoder's
+         * working state is the fixed-size carry, path and progress it was
+         * constructed with (§6.6), so a reset is a handful of stores and the
+         * message loop pays no allocator for it.
          *
          * **It does not touch the destination** — this class has none; it only
          * dispatches. @ref IStreamObject overrides this to reset the message it
@@ -3638,9 +4161,16 @@ namespace sofab
          */
         virtual void reset() noexcept
         {
-            acc_.clear();
-            topPos_ = 0;
-            p_ = end_ = fieldStart_ = nullptr;
+            carryLen_ = 0;
+            suspendDepth_ = -1;
+            replay_ = false;
+            pend_ = false;
+            pendSkip_ = false;
+            pendDone_ = 0;
+            utf8State_ = 0;
+            spanCarry_ = 0;
+            spanBase_ = nullptr;
+            p_ = end_ = nullptr;
             type_ = Wire{};
             fixType_ = Fix{};
             fixLen_ = 0;
@@ -3652,7 +4182,6 @@ namespace sofab
             argError_ = false;
             terminal_ = Error::None;
             incomplete_ = false;
-            declined_ = false;
             seqDepth_ = 0;
             skipped_ = 0;
             elemBound_ = -1;
@@ -3741,28 +4270,115 @@ namespace sofab
 
     protected:
         /**
-         * @brief Deliver every complete top-level field in `[p, end)`.
-         * @param p Start of the bytes to parse.
-         * @param end One past the last readable byte.
-         * @return The start of the first incomplete field (equals @p end when all
-         *         bytes were consumed).
+         * @brief The bytes of the current top-level field seen so far, across every
+         *        chunk it spans (#26, @ref Limits::max_buffered_field).
+         *
+         * Pointer arithmetic alone stopped being enough once a field could span
+         * chunks without being buffered: within one window the span is
+         * `p_ - spanBase_`, and what earlier windows already consumed of the same
+         * field is carried in @ref spanCarry_. Without that the cap would be a
+         * property of the caller's chunking, which §7.2 item 4 forbids.
          */
-        const uint8_t *parseTopLevel(const uint8_t *p, const uint8_t *end) noexcept
+        [[nodiscard]] size_t spanned() const noexcept
+        {
+            return spanCarry_ + static_cast<size_t>(p_ - spanBase_);
+        }
+
+        /** @brief Latch the refusal this feed produced, in §6.3's order of tiers. */
+        Result latchTerminal() noexcept
+        {
+            terminal_ = limitExceeded_  ? Error::LimitExceeded
+                        : argError_     ? Error::InvalidArgument
+                                        : Error::InvalidMessage;
+            return Result{terminal_, skipped_};
+        }
+
+        /**
+         * @brief Hold the ≤ @ref CARRY_CAP bytes of a cut item until the next
+         *        @ref feed.
+         */
+        void stash(const uint8_t *p, size_t n) noexcept
+        {
+            if (n == 0) return;
+            if (n > CARRY_CAP) [[unlikely]]
+            {
+                /* Unreachable: the parse backs up only to the start of a small
+                 * item, and @ref CARRY_CAP is derived from the widest of those.
+                 * Deliberately not silent — an item wider than this format admits
+                 * is malformed either way. */
+                error_ = true;
+                return;
+            }
+            std::memcpy(carry_, p, n);
+            carryLen_ = n;
+        }
+
+        /**
+         * @brief Parse one window of bytes, resuming whatever the last one left
+         *        open, and report how much of it was consumed.
+         *
+         * @param p Window start.
+         * @param n Window length.
+         * @return Bytes consumed. Whatever follows is a cut item, at most
+         *         @ref CARRY_CAP bytes of it.
+         */
+        size_t parseWindow(const uint8_t *p, size_t n) noexcept
+        {
+            p_ = p;
+            end_ = p + n;
+            incomplete_ = false;
+            replay_ = suspendDepth_ >= 0;
+            const bool capped = maxBufferedField_ != SIZE_MAX;
+            if (capped) spanBase_ = p_;
+            parseTopLevel();
+            if (capped && incomplete_) spanCarry_ += static_cast<size_t>(p_ - spanBase_);
+            replay_ = false;
+            return static_cast<size_t>(p_ - p);
+        }
+
+        /**
+         * @brief Deliver every complete top-level field in the current window,
+         *        leaving @ref p_ at the first byte not consumed.
+         *
+         * The same shape as @ref dispatchLevel, and for the same reasons: a level
+         * the previous window left open is **re-entered** rather than re-parsed,
+         * either by descending @ref pathId_ to the suspended level or — when this
+         * level is it — by continuing the field @ref pendDone_ describes.
+         */
+        void parseTopLevel() noexcept
         {
             const bool capped = maxBufferedField_ != SIZE_MAX;
-            while (p < end)
+            sofab::id fieldId = 0;
+            bool declined = false;
+
+            const Entry entry = levelEntry();
+            if (entry != Entry::Fresh) [[unlikely]]
+                if (!reenterLevel(wrapCb(topCallback_), entry)) return;
+
+            const uint8_t *const end = end_;
+            while (p_ < end)
             {
                 /* Header-first: parse the field's header and metadata, then deliver
                  * immediately. The callback's typed read decides the tag (§7.3), the
                  * schema bound (§7.1/§5.2) and finally whether the payload is here —
                  * in that order, so a bound rejection wins over a truncation without
                  * anyone having to know the schema up front. */
-                const uint8_t *fieldStart = p;
-                fieldStart_ = p;
-                p_ = p; end_ = end;
+                const uint8_t *fieldStart = p_;
+                if (capped) { spanCarry_ = 0; spanBase_ = p_; }
                 incomplete_ = false;
-                if (!parseFieldHeader()) return fieldStart; /* error_ or incomplete_ set */
-                if (capped && exceedsBufferAtHeader(fieldStart))
+                declined = false;
+                if (!parseFieldHeader())
+                {
+                    /* error_ or incomplete_ set. A cut header is backed up whole:
+                     * it is at most three varints, which is what @ref CARRY_CAP is
+                     * sized for. */
+                    if (incomplete_) { p_ = fieldStart; suspendAtBoundary(); }
+                    return;
+                }
+                fieldId = fieldId_;
+                pendDone_ = 0;
+                utf8State_ = 0;
+                if (capped && exceedsBufferAtHeader())
                 {
                     /* §6.2.1/§6.3: a receiver-side cap "MUST NOT be applied to a
                      * field the schema already bounds" — there the schema governs
@@ -3773,7 +4389,7 @@ namespace sofab
                      * end_ sits at the payload's first byte, so a typed read still
                      * settles the tag (§7.3) and the bound (§7.1) — both decided
                      * before a byte is copied — and then reports INCOMPLETE instead
-                     * of materialising anything. Nothing is buffered and nothing is
+                     * of materialising anything. Nothing is copied and nothing is
                      * allocated; the only verdict that can come out of it is the
                      * INVALID the same bytes get on an uncapped stream. */
                     if (schemaBoundsHeader(type_))
@@ -3781,49 +4397,42 @@ namespace sofab
                         consumed_ = false;
                         const uint8_t *held = end_;
                         end_ = p_;
-                        if (!declined_) topCallback_(fieldId_, fixLen_, count_);
+                        topCallback_(fieldId_, fixLen_, count_);
                         end_ = held;
                         incomplete_ = false;
+                        pendDone_ = 0;
                         /* The schema bound spoke first — and so does a receiver cap
                          * the callback applied itself. An ARGUMENT refusal does not:
                          * §6.3 puts the configured cap ahead of the caller's
                          * destination, and the cap enforced below is one. */
-                        if (error_ && !argError_) return fieldStart;
+                        if (error_ && !argError_) return;
+                        error_ = false;
+                        argError_ = false;
                     }
                     exceedLimit();
-                    return fieldStart;
+                    return;
                 }
 
                 consumed_ = false;
                 const uint8_t *payload = p_;
-                /* A field the callback already declined is skipped without being
-                 * offered again -- it said no once, and the answer cannot change.
-                 * Only a field whose VALUE was wanted is re-delivered. */
-                if (!declined_) topCallback_(fieldId_, fixLen_, count_);
-                if (error_) return fieldStart;
-                /* Not enough bytes yet: rewind to the field header and buffer it. The
-                 * whole field is delivered again once it is complete; every generated
-                 * destination is either reset wholesale (readArray, prepare()) or
-                 * assigned by id, so re-delivery is idempotent. */
-                if (incomplete_)
+                topCallback_(fieldId_, fixLen_, count_);
+                if (error_) return;
+                if (!incomplete_ && !consumed_)
                 {
-                    declined_ = false;
-                    return fieldStart;
-                }
-                if (!consumed_)
-                {
+                    declined = true;
                     p_ = payload;
                     skipPayload();
-                    if (error_ || incomplete_)
-                    {
-                        declined_ = true;
-                        return fieldStart;
-                    }
+                    if (error_) return;
                 }
-                declined_ = false;
-                p = p_;
+                /* Not enough bytes yet: the field keeps its place. What it has
+                 * already delivered stays delivered — @ref pendDone_ says how much —
+                 * so nothing is re-read and nothing is buffered (§6.6.2). */
+                if (incomplete_)
+                {
+                    suspendHere(fieldId, declined);
+                    return;
+                }
             }
-            return p;
         }
 
         /**
@@ -3984,7 +4593,7 @@ namespace sofab
          * @brief Does this wire type's header state a size the schema can bound?
          *
          * True for the length-prefixed payload (`maxlen`) and the three array kinds
-         * (`count`) — exactly the fields whose §7.1 verdict outranks the reassembly
+         * (`count`) — exactly the fields whose §7.1 verdict outranks the field-size
          * cap (#86), and exactly the ones @ref exceedsBufferAtHeader derives a size
          * from. A sequence states no size of its own (it accrues in
          * @ref dispatchLevel) and a varint carries no length word at all.
@@ -4006,13 +4615,12 @@ namespace sofab
          * a varint array's count is a lower bound on its bytes. A sequence accrues
          * instead, and is bounded field by field in @ref dispatchLevel.
          *
-         * @param fieldStart First byte of the field being delivered.
-         * @return `true` when the field must be rejected before its bytes are
-         *         buffered.
+         * @return `true` when the field must be rejected before its payload is
+         *         read.
          */
-        [[nodiscard]] bool exceedsBufferAtHeader(const uint8_t *fieldStart) noexcept
+        [[nodiscard]] bool exceedsBufferAtHeader() noexcept
         {
-            const size_t spanned = static_cast<size_t>(p_ - fieldStart);
+            const size_t seen = spanned();
             uint64_t need = 0;
             switch (type_)
             {
@@ -4022,7 +4630,7 @@ namespace sofab
                 case Wire::ArraySigned: need = count_; break;
                 default:                need = 0; break;
             }
-            return exceedsBuffer(spanned, need);
+            return exceedsBuffer(seen, need);
         }
 
         /**
@@ -4078,7 +4686,10 @@ namespace sofab
              * number it is about to discard. A BOUNDED surplus is decoded
              * instead: §7.1 makes an over-width element INVALID whether or not
              * it had a destination to be stored in. */
-            size_t i = 0;
+            /* Elements already decoded by an earlier chunk (§6.6.2): the run
+             * continues where it stopped. What it never does is start over — the
+             * bytes of the elements already delivered are gone. */
+            size_t i = pendDone_;
             while (i < n)
             {
                 /* One bounds check for a whole run: with R bytes readable,
@@ -4095,7 +4706,11 @@ namespace sofab
                     bool ovf = false;
                     if (!getVarint(p_, end_, raw, &ovf))
                     {
-                        (ovf ? error_ : incomplete_) = true;
+                        if (ovf) { error_ = true; return false; }
+                        /* The cut element is left at its first byte: the carry
+                         * holds it and the run resumes at element `i`. */
+                        pendDone_ = i;
+                        incomplete_ = true;
                         return false;
                     }
                     if (!store(i, raw)) return false;
@@ -4120,19 +4735,19 @@ namespace sofab
                 bool ovf = false;
                 if (fit == 0) [[unlikely]]
                 {
+                    bool cut = false;
                     if constexpr (Bounded)
                     {
                         uint64_t raw;
-                        if (!getVarint(p_, end_, raw, &ovf))
-                        {
-                            (ovf ? error_ : incomplete_) = true;
-                            return false;
-                        }
-                        if (!admits(raw)) { error_ = true; return false; }
+                        if (!getVarint(p_, end_, raw, &ovf)) cut = true;
+                        else if (!admits(raw)) { error_ = true; return false; }
                     }
-                    else if (!skipVarint(p_, end_, &ovf))
+                    else if (!skipVarint(p_, end_, &ovf)) cut = true;
+                    if (cut)
                     {
-                        (ovf ? error_ : incomplete_) = true;
+                        if (ovf) { error_ = true; return false; }
+                        pendDone_ = i;
+                        incomplete_ = true;
                         return false;
                     }
                     ++i;
@@ -4159,6 +4774,7 @@ namespace sofab
                 }
             }
             consumed_ = true;
+            pendDone_ = 0;
             return true;
         }
 
@@ -4209,6 +4825,9 @@ namespace sofab
                 bool ovf = false;
                 if (!getVarint(p_, end_, raw, &ovf))
                 {
+                    /* A varint cut by a chunk boundary stays where it is (§6.6.2's
+                     * "partial varint"): its ≤ 9 bytes ride in the carry and the
+                     * field is continued, not re-parsed from its header. */
                     (ovf ? error_ : incomplete_) = true;
                     return false;
                 }
@@ -4297,7 +4916,12 @@ namespace sofab
                  * collector that needs the reset says so by declaring prepare();
                  * plain struct/union targets do not and pay nothing, since this is a
                  * template and the call disappears at compile time. */
-                if constexpr (requires { value.prepare(); }) value.prepare();
+                /* ...and only on the FIRST entry. A sequence re-entered along
+                 * @ref pathId_ after a chunk boundary is the SAME occurrence, so
+                 * resetting the collector here would throw away the elements that
+                 * already arrived with the earlier chunks. */
+                if (!replay_)
+                    if constexpr (requires { value.prepare(); }) value.prepare();
                 /* §5.1: in a wrapper sequence the element id IS its index, so the
                  * bound belongs to the stream rather than to the collector, where a
                  * truncated element would outrun it. A collector declares it by
@@ -4387,21 +5011,44 @@ namespace sofab
                 {
                     constexpr Fix want = std::is_same_v<Elem, float> ? Fix::Fp32 : Fix::Fp64;
                     if (!tagMatches(Wire::ArrayFixlen, want)) return false; /* §7.3 */
-                    size_t bytes = count_ * sizeof(Elem);
-                    if (static_cast<size_t>(end_ - p_) < bytes)
+                    const size_t bytes = count_ * sizeof(Elem);
+                    if (pendDone_ == 0 &&
+                        static_cast<size_t>(end_ - p_) >= bytes) [[likely]]
                     {
-                        incomplete_ = true;
-                        return false;
-                    }
-                    if constexpr (std::endian::native == std::endian::little)
-                    {
-                        /* An empty destination span has a null data(), which
-                         * memcpy forbids even for a zero length. */
-                        if (n) std::memcpy(sp.data(), p_, n * sizeof(Elem)); /* wire == native */
+                        /* The whole payload in one piece: one bulk move, which is
+                         * what the fixlen array's wire form exists for. */
+                        if constexpr (std::endian::native == std::endian::little)
+                        {
+                            /* An empty destination span has a null data(), which
+                             * memcpy forbids even for a zero length. */
+                            if (n) std::memcpy(sp.data(), p_, n * sizeof(Elem)); /* wire == native */
+                        }
+                        else
+                            for (size_t i = 0; i < n; ++i)
+                                sp[i] = loadFloat<Elem>(p_ + i * sizeof(Elem));
+                        p_ += bytes;
                     }
                     else
-                        for (size_t i = 0; i < n; ++i) sp[i] = loadFloat<Elem>(p_ + i * sizeof(Elem));
-                    p_ += bytes;
+                    {
+                        /* Split across feeds: element by element into the caller's
+                         * destination as each one lands (§6.6.2). A part-arrived
+                         * element is left where it is — at most seven bytes, which
+                         * the carry holds. */
+                        size_t i = pendDone_;
+                        while (i < count_)
+                        {
+                            if (static_cast<size_t>(end_ - p_) < sizeof(Elem))
+                            {
+                                pendDone_ = i;
+                                incomplete_ = true;
+                                return false;
+                            }
+                            if (i < n) sp[i] = loadFloat<Elem>(p_);
+                            p_ += sizeof(Elem);
+                            ++i;
+                        }
+                        pendDone_ = 0;
+                    }
                     consumed_ = true;
                 }
                 else
@@ -4590,7 +5237,7 @@ namespace sofab
                  * Clamping is what keeps a hostile count from deciding anything: a
                  * declared 2^31 elements whose payload is absent or withheld reaches
                  * nothing, so it neither refuses a sound destination nor asks anyone
-                 * to size one — which is also what lets the reassembly cap withhold
+                 * to size one — which is also what lets the field-size cap withhold
                  * an over-cap payload while the schema `count` above still gets to
                  * speak (#86). When the payload is complete the reach IS `count_`, so
                  * a destination genuinely too short is refused exactly then, and
@@ -4601,7 +5248,8 @@ namespace sofab
                                               ? (fixLen_ ? readable / fixLen_ : uint64_t{0})
                                               : readable;
                 const size_t reach = static_cast<size_t>(
-                    std::min<uint64_t>(static_cast<uint64_t>(count_), fillable));
+                    std::min<uint64_t>(static_cast<uint64_t>(count_),
+                                       static_cast<uint64_t>(pendDone_) + fillable));
                 if (reach > dst.size())
                 {
                     rejectDestination();
@@ -4626,8 +5274,15 @@ namespace sofab
              * * **room the caller sized**: the fill writes the `M` elements it was
              *   given room for, and the length is published **after**, as a shrink
              *   (below). Growing it here is exactly what §6.6 forbids. */
-            if constexpr (detail::destCapacity<T>() >= 0)      detail::destSetLen(dst, count_);
-            else if constexpr (!requires { dst.resize(size_t{}); }) dst = T{};
+            if (pendDone_ == 0)
+            {
+                /* Only on the FIRST delivery: a field resumed from an earlier chunk
+                 * already holds the elements that arrived with it, and resetting
+                 * here would throw them away (§6.6.2 — the destination is written
+                 * as the pieces arrive, not from scratch each feed). */
+                if constexpr (detail::destCapacity<T>() >= 0)      detail::destSetLen(dst, count_);
+                else if constexpr (!requires { dst.resize(size_t{}); }) dst = T{};
+            }
             const bool ok = [&]() noexcept {
                 if constexpr (std::is_integral_v<Elem> && !std::is_same_v<Elem, bool>)
                 {
@@ -4672,28 +5327,39 @@ namespace sofab
         size_t read(void *dst, size_t maxlen) noexcept
         {
             if (!tagMatches(Wire::Fixlen, Fix::Blob)) return 0; /* §7.3 */
-            size_t n = std::min(maxlen, fixLen_);
-            if (static_cast<size_t>(end_ - p_) < fixLen_)
+            const size_t done = pendDone_;
+            const size_t avail = static_cast<size_t>(end_ - p_);
+            const size_t take = std::min(avail, fixLen_ - done);
+            /* The piece that lands inside the caller's buffer is copied; the rest of
+             * the payload is stepped over, exactly as the truncating contract above
+             * says. Both halves resume, so a blob split across feeds needs no buffer
+             * of the decoder's own (§6.6.2). */
+            if (done < maxlen && take)
+                std::memcpy(static_cast<uint8_t *>(dst) + done, p_,
+                            std::min(take, maxlen - done));
+            p_ += take;
+            if (done + take < fixLen_)
             {
                 /* The payload has not fully arrived. That is INCOMPLETE, not an
-                 * error: more bytes may complete it, and the field is delivered
-                 * again once they do. Setting error_ here made a truncated blob
-                 * INVALID and — because the run is then condemned — unrecoverable
-                 * even after the remaining bytes arrived. Matches @ref readBlob and
+                 * error: more bytes may complete it, and the field is continued
+                 * once they do. Setting error_ here made a truncated blob INVALID
+                 * and — because the run is then condemned — unrecoverable even
+                 * after the remaining bytes arrived. Matches @ref readBlob and
                  * @ref readString, which guard the identical condition. */
+                pendDone_ = done + take;
                 incomplete_ = true;
                 return 0;
             }
-            std::memcpy(dst, p_, n);
-            p_ += fixLen_;
+            pendDone_ = 0;
             consumed_ = true;
-            return n;
+            return std::min(maxlen, fixLen_);
         }
 
         /**
          * @return `true` when a read in this delivery consumed the field. `false`
          *         means the field was declined (skipped) or its payload has not
-         *         arrived yet, in which case it is delivered again later.
+         *         arrived yet, in which case the field is delivered again with the
+         *         next chunk and the read continues where it stopped.
          */
         [[nodiscard]] bool consumed() const noexcept { return consumed_; }
 
@@ -4750,6 +5416,40 @@ namespace sofab
         {
             return static_cast<size_t>(end_ - p_);
         }
+
+        /**
+         * @brief How much of the current field earlier chunks already delivered —
+         *        payload bytes written, or array elements decoded.
+         *
+         * Zero on a field's first delivery. A field split across `feed` calls is
+         * **continued**, not re-parsed (§6.6.2), so a helper sizing the destination
+         * has to add what is already in it to what has just arrived; sizing from
+         * this chunk alone would ask the codec to fit a value into less room than it
+         * has already used.
+         */
+        [[nodiscard]] size_t progress() const noexcept { return pendDone_; }
+
+        /**
+         * @brief `true` when this delivery **re-enters a sequence** an earlier
+         *        `feed` left open, rather than announcing a new field.
+         *
+         * A nested sequence cut by a chunk boundary cannot be resumed from a byte
+         * offset — the handler chain that was inside it lives on the C++ stack, and
+         * a `feed` returning unwinds it. The decoder therefore replays the field ids
+         * of the open levels, so each handler is asked for the same member again and
+         * the chain is rebuilt exactly as it was. Nothing about the field is new: the
+         * id, the sequence and everything already decoded inside it are the ones the
+         * previous chunks produced.
+         *
+         * A handler that only dispatches on the id — every generated `deserialize`,
+         * and any handler written the same way — needs this for nothing: reading the
+         * same member again is precisely right, and the codec continues where it
+         * stopped. It exists for a handler that keeps a **position** of its own
+         * rather than a schema, which must not advance it twice.
+         *
+         * Distinct from @ref progress, which is about the bytes of one field.
+         */
+        [[nodiscard]] bool resumed() const noexcept { return replay_; }
 
         /**
          * @brief The §7.3 and §7.1 decisions @ref readString makes, taken **before
@@ -4962,12 +5662,25 @@ namespace sofab
          *
          * Only ever grows: a destination the caller deliberately sized larger keeps
          * its room, and the decoded length is published by
-         * @ref detail::destSetLen when the value is in.
+         * @ref sofab::detail::destSetLen when the value is in.
          *
          * @param dst  Destination.
          * @param want Room the announced value needs, already clamped by the caller
          *             to what the bytes in hand could fill.
          */
+        /**
+         * @brief Is @p D a destination the **caller** has to size?
+         *
+         * True only for heap-growable storage: it can be resized and publishes no
+         * static capacity. A @ref sofab::FixedString / @ref sofab::FixedBytes /
+         * @ref sofab::InlineVector
+         * already holds everything it can hold, and a `std::array` or a bound span
+         * cannot be sized at all — for those the whole helper below compiles away
+         * and generated code pays nothing for calling it.
+         */
+        template <typename D>
+        concept sizable = requires(D &d) { d.resize(size_t{}); } && !requires { D::capacity(); };
+
         template <typename D>
         void fitDest(D &dst, size_t want) noexcept
         {
@@ -4995,7 +5708,8 @@ namespace sofab
                                                  : uint64_t{0})
                                           : readable;
             return static_cast<size_t>(
-                std::min<uint64_t>(static_cast<uint64_t>(is.announcedCount()), fillable));
+                std::min<uint64_t>(static_cast<uint64_t>(is.announcedCount()),
+                                   static_cast<uint64_t>(is.progress()) + fillable));
         }
 
         /** @brief Does the delivered tag match the array kind @p Elem declares (§7.3)? */
@@ -5034,9 +5748,11 @@ namespace sofab
     template <typename S>
     bool readString(IStreamImpl &is, S &dst, long maxlen = -1) noexcept
     {
+        if constexpr (detail::sizable<S>)
         if (is.wire() == detail::Wire::Fixlen && is.fixType() == detail::Fix::String &&
             (maxlen < 0 || is.announcedSize() <= static_cast<size_t>(maxlen)))
-            detail::fitDest(dst, std::min(is.announcedSize(), is.available()));
+            detail::fitDest(dst, std::min(is.announcedSize(),
+                                          is.progress() + is.available()));
         return is.readString(dst, maxlen);
     }
 
@@ -5047,9 +5763,11 @@ namespace sofab
     template <typename B>
     bool readBlob(IStreamImpl &is, B &dst, long maxlen = -1) noexcept
     {
+        if constexpr (detail::sizable<B>)
         if (is.wire() == detail::Wire::Fixlen && is.fixType() == detail::Fix::Blob &&
             (maxlen < 0 || is.announcedSize() <= static_cast<size_t>(maxlen)))
-            detail::fitDest(dst, std::min(is.announcedSize(), is.available()));
+            detail::fitDest(dst, std::min(is.announcedSize(),
+                                          is.progress() + is.available()));
         return is.readBlob(dst, maxlen);
     }
 
@@ -5076,11 +5794,14 @@ namespace sofab
                    ElemBound elem = {}) noexcept
     {
         using Elem = typename T::value_type;
-        const size_t n = is.announcedCount();
-        if (detail::arrayTagMatches<Elem>(is) &&
-            (schemaCount < 0 || n <= static_cast<size_t>(schemaCount)) &&
-            (dynCap < 0 || n <= static_cast<size_t>(dynCap)))
-            detail::fitDest(dst, detail::arrayReach(is));
+        if constexpr (detail::sizable<T>)
+        {
+            const size_t n = is.announcedCount();
+            if (detail::arrayTagMatches<Elem>(is) &&
+                (schemaCount < 0 || n <= static_cast<size_t>(schemaCount)) &&
+                (dynCap < 0 || n <= static_cast<size_t>(dynCap)))
+                detail::fitDest(dst, detail::arrayReach(is));
+        }
         return is.readArray(dst, schemaCount, dynCap, elem);
     }
 
@@ -5100,7 +5821,8 @@ namespace sofab
         {
             if (is.wire() == detail::Wire::Fixlen &&
                 (is.fixType() == detail::Fix::String || is.fixType() == detail::Fix::Blob))
-                detail::fitDest(dst, std::min(is.announcedSize(), is.available()));
+                detail::fitDest(dst, std::min(is.announcedSize(),
+                                              is.progress() + is.available()));
         }
         else if constexpr (requires(T &d) {
                                typename T::value_type;
@@ -5109,8 +5831,9 @@ namespace sofab
                                requires !InputMessage<T>;
                            })
         {
-            if (detail::arrayTagMatches<typename T::value_type>(is))
-                detail::fitDest(dst, detail::arrayReach(is));
+            if constexpr (detail::sizable<T>)
+                if (detail::arrayTagMatches<typename T::value_type>(is))
+                    detail::fitDest(dst, detail::arrayReach(is));
         }
         return is.read(dst);
     }

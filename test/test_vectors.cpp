@@ -784,6 +784,19 @@ struct GenericMsg : sofab::IStreamMessage
 
     void deserialize(sofab::IStreamImpl &is, sofab::id, size_t, size_t) noexcept override
     {
+        /* Re-entering a sequence the previous chunk left open (CORELIB_PLAN §6.6.2:
+         * the decoder resumes rather than re-parses, and rebuilds the handler chain
+         * by replaying the open levels' field ids). Nothing here is new — the op
+         * cursor is already inside the sequence — so descend without touching it.
+         * A generated `deserialize`, which only dispatches on the id, needs none of
+         * this; this verifier keeps a position of its own. */
+        if (is.resumed())
+        {
+            GenericMsg child;
+            child.cur = cur;
+            is.read(child);
+            return;
+        }
         const auto &ops = *cur->ops;
         while (cur->i < ops.size() && ops[cur->i].kind == K::SeqE) cur->i++;
         if (cur->i >= ops.size()) { cur->fail = true; cur->err = "extra field"; return; }
@@ -840,10 +853,18 @@ struct GenericMsg : sofab::IStreamMessage
             case K::B:   { bool x = false; is.read(x); if (x != (op.u != 0)) bad("bool"); break; }
             case K::F32: { float x = 0;    is.read(x); if (!eq32(x, static_cast<float>(op.f))) bad("fp32"); break; }
             case K::F64: { double x = 0;   is.read(x); if (!eq64(x, op.f)) bad("fp64"); break; }
-            case K::Str: { std::string x;  sofab::read(is, x); if (x != op.str) bad("string"); break; }
+            /* The payload destinations are `static` on purpose: a field split
+             * across chunks is delivered once per chunk that carries part of it and
+             * written into the caller's destination as the pieces arrive
+             * (CORELIB_PLAN §6.6.2), so a destination that dies with the delivery
+             * would lose the earlier halves. Only one field is ever in progress, so
+             * one scratch each is enough. A delivery that did not complete the field
+             * is discarded wholesale by `rewind` above. */
+            case K::Str: { static std::string x; sofab::read(is, x); if (x != op.str) bad("string"); break; }
             case K::Blob:
             {
-                std::vector<uint8_t> buf(op.blob.size() + 1);
+                static std::vector<uint8_t> buf;
+                if (is.progress() == 0) buf.assign(op.blob.size() + 1, 0);
                 size_t n = is.read(buf.data(), buf.size());
                 /* An empty blob's data() is null, and memcmp forbids that even
                  * for a zero length, so the compare is skipped in that case. */
@@ -854,24 +875,59 @@ struct GenericMsg : sofab::IStreamMessage
             }
             case K::Arr:
             {
-                auto cmpU = [&](auto vec) { is.read(vec); for (size_t k = 0; k < vec.size(); k++) if (static_cast<uint64_t>(vec[k]) != op.au[k]) { bad("arr-u"); break; } };
-                auto cmpI = [&](auto vec) { is.read(vec); for (size_t k = 0; k < vec.size(); k++) if (static_cast<int64_t>(vec[k]) != op.ai[k]) { bad("arr-i"); break; } };
+                auto cmpU = [&](auto &vec) {
+                    if (is.progress() == 0) vec.assign(op.au.size(), 0);
+                    is.read(vec);
+                    for (size_t k = 0; k < vec.size(); k++)
+                        if (static_cast<uint64_t>(vec[k]) != op.au[k]) { bad("arr-u"); break; }
+                };
+                auto cmpI = [&](auto &vec) {
+                    if (is.progress() == 0) vec.assign(op.ai.size(), 0);
+                    is.read(vec);
+                    for (size_t k = 0; k < vec.size(); k++)
+                        if (static_cast<int64_t>(vec[k]) != op.ai[k]) { bad("arr-i"); break; }
+                };
+                /* Stable across deliveries, like the payload scratch above. */
+                static std::vector<uint8_t>  a8;   static std::vector<uint16_t> a16;
+                static std::vector<uint32_t> a32;  static std::vector<uint64_t> a64;
+                static std::vector<int8_t>   s8;   static std::vector<int16_t>  s16;
+                static std::vector<int32_t>  s32;  static std::vector<int64_t>  s64;
+                static std::vector<float>    af32; static std::vector<double>   af64;
                 switch (op.elem)
                 {
-                    case E::U8:  cmpU(std::vector<uint8_t>(op.au.size()));  break;
-                    case E::U16: cmpU(std::vector<uint16_t>(op.au.size())); break;
-                    case E::U32: cmpU(std::vector<uint32_t>(op.au.size())); break;
-                    case E::U64: cmpU(std::vector<uint64_t>(op.au.size())); break;
-                    case E::I8:  cmpI(std::vector<int8_t>(op.ai.size()));   break;
-                    case E::I16: cmpI(std::vector<int16_t>(op.ai.size()));  break;
-                    case E::I32: cmpI(std::vector<int32_t>(op.ai.size()));  break;
-                    case E::I64: cmpI(std::vector<int64_t>(op.ai.size()));  break;
-                    case E::F32: { std::vector<float> v(op.af.size());  is.read(v); for (size_t k = 0; k < v.size(); k++) if (!eq32(v[k], static_cast<float>(op.af[k]))) { bad("arr-f32"); break; } break; }
-                    case E::F64: { std::vector<double> v(op.af.size()); is.read(v); for (size_t k = 0; k < v.size(); k++) if (!eq64(v[k], op.af[k])) { bad("arr-f64"); break; } break; }
+                    case E::U8:  cmpU(a8);  break;
+                    case E::U16: cmpU(a16); break;
+                    case E::U32: cmpU(a32); break;
+                    case E::U64: cmpU(a64); break;
+                    case E::I8:  cmpI(s8);  break;
+                    case E::I16: cmpI(s16); break;
+                    case E::I32: cmpI(s32); break;
+                    case E::I64: cmpI(s64); break;
+                    case E::F32:
+                        if (is.progress() == 0) af32.assign(op.af.size(), 0.0f);
+                        is.read(af32);
+                        for (size_t k = 0; k < af32.size(); k++)
+                            if (!eq32(af32[k], static_cast<float>(op.af[k]))) { bad("arr-f32"); break; }
+                        break;
+                    case E::F64:
+                        if (is.progress() == 0) af64.assign(op.af.size(), 0.0);
+                        is.read(af64);
+                        for (size_t k = 0; k < af64.size(); k++)
+                            if (!eq64(af64[k], op.af[k])) { bad("arr-f64"); break; }
+                        break;
                 }
                 break;
             }
-            case K::SeqB: { GenericMsg child; child.cur = cur; is.read(child); break; }
+            case K::SeqB:
+            {
+                /* A sequence's delivery is never "undone": its children were
+                 * delivered and stay delivered, and only a child that did not
+                 * finish rewinds (its own Rewind above). Leaving this one armed
+                 * would put the op cursor back on the SequenceStart, where the
+                 * resumed child would then be compared against the wrong op. */
+                rewind.armed = false;
+                GenericMsg child; child.cur = cur; is.read(child); break;
+            }
             case K::SeqE: break;
         }
     }
