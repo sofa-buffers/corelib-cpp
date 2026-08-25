@@ -177,8 +177,11 @@ callback-driven decoder clears its own targets.)
 ### Deserialize stream
 
 `feed()` takes whatever bytes have arrived; a field straddling a chunk boundary
-is buffered and re-parsed once its remainder comes, so a chunked stream decodes
-identically to a one-shot buffer.
+is **resumed** — each piece is written into the destination as it lands, and only
+what a boundary can cut in half rides in a fixed 30-byte carry — so a chunked
+stream decodes identically to a one-shot buffer and allocates just as little.
+Such a field is delivered once per chunk that carries part of it, so its
+destination has to outlive the chunk (see `## Memory handling`).
 
 ```cpp
 sofab::IStreamObject<Sensor> in;
@@ -193,7 +196,7 @@ Each `feed()` returns a three-valued decode outcome. There is **no** separate
 | `Result`                | `code()`                 | `status()`                    | meaning |
 |-------------------------|--------------------------|-------------------------------|---------|
 | `complete()` / `ok()`   | `Error::None`            | `DecodeStatus::Complete`      | the consumed bytes end **exactly** at a field boundary — a valid message |
-| `incomplete()`          | `Error::Incomplete`      | `DecodeStatus::Incomplete`    | the bytes end **inside** a field (a partial varint, a short fixlen/array payload) or with an open sequence; the partial tail is retained for the next `feed()` |
+| `incomplete()`          | `Error::Incomplete`      | `DecodeStatus::Incomplete`    | the bytes end **inside** a field (a partial varint, a short fixlen/array payload) or with an open sequence; the decoder keeps its place for the next `feed()` |
 | `invalid()`             | `Error::InvalidMessage`  | `DecodeStatus::Invalid`       | the bytes are malformed **regardless of what follows** (varint over 64 bits, bad subtype/length, count/id over max, nesting past `MAX_DEPTH`, dangling sequence-end, …) |
 | `limitExceeded()`       | `Error::LimitExceeded`   | `DecodeStatus::LimitExceeded` | a configured receiver cap was exceeded on a field the schema leaves unbounded; the bytes are well-formed and decode under a looser cap |
 | `invalidArgument()`     | `Error::InvalidArgument` | `DecodeStatus::InvalidArgument` | the value broke no schema bound and no configured cap, but does not fit the destination this caller passed |
