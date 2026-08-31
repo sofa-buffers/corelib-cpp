@@ -2735,6 +2735,196 @@ static void destinationIsNeverGrown()
     }
 }
 
+/* --- §6.2.1: the receiver cap rides INTO the read -------------------------
+ *
+ * §6.2.1 fixes the provenance of the number ("The numbers and the allocation are
+ * not the codec's") but leaves the site of the comparison open: "A corelib MAY
+ * take a limit as an argument and perform the check itself, and a port that does
+ * is conformant." readString / readBlob / readArray each take one, so the check
+ * lands where §6.2.1 requires it and nowhere else:
+ *
+ *   - at the LENGTH HEADER, "before the allocation it is meant to prevent";
+ *   - BEHIND the MESSAGE_SPEC §7.3 tag test, because "a skipped field is never
+ *     capped";
+ *   - only where the SCHEMA declares no bound, because a receiver limit "MUST NOT
+ *     be applied to a field the schema already bounds".
+ *
+ * A caller testing the length in front of its own read cannot get the second of
+ * those right -- the tag is inside the read -- which is the defect this replaces.
+ *
+ * The first case below is the one that needed a test rather than a review: the
+ * HELPER layer sizes a growable destination before delegating, and it used to
+ * consult only `maxlen`. A schema-unbounded field therefore had its destination
+ * grown to the wire-announced length before any cap was consulted, so an over-cap
+ * value was materialised and only then rejected. Asserting that the decode failed
+ * would have passed throughout. What pins it is asserting the destination is still
+ * EMPTY, and that nothing was allocated. --- */
+struct DynCapMsg : sofab::IStreamMessage
+{
+    std::string text;             /* id 1: string, schema declares no maxlen */
+    std::vector<uint8_t> bytes;   /* id 2: blob,   schema declares no maxlen */
+    std::string bounded;          /* id 3: string, schema maxlen 32          */
+    long strCap = -1;             /* what the DEPLOYMENT configures; -1 = none passed */
+    long blobCap = -1;
+    bool viaHelper = true;
+
+    void deserialize(sofab::IStreamImpl &is, sofab::id id, size_t, size_t) noexcept override
+    {
+        if (viaHelper)
+            switch (id)
+            {
+                case 1: (void)sofab::readString(is, text, -1, strCap); break;
+                case 2: (void)sofab::readBlob(is, bytes, -1, blobCap); break;
+                case 3: (void)sofab::readString(is, bounded, 32, strCap); break;
+                default: break;
+            }
+        else
+            switch (id)
+            {
+                case 1: (void)is.readString(text, -1, strCap); break;
+                case 2: (void)is.readBlob(bytes, -1, blobCap); break;
+                case 3: (void)is.readString(bounded, 32, strCap); break;
+                default: break;
+            }
+    }
+};
+
+static void receiverCapAtTheRead()
+{
+    /* One fixlen field: [ (id<<3)|0b010 ][ (len<<3)|subtype ][ payload ]. */
+    auto field = [](sofab::id id, sofab::detail::Fix sub, size_t len, uint8_t fill) {
+        std::vector<uint8_t> w;
+        appendVarint(w, (static_cast<uint64_t>(id) << 3) | 2u);
+        appendVarint(w, (static_cast<uint64_t>(len) << 3) | static_cast<unsigned>(sub));
+        w.insert(w.end(), len, fill);
+        return w;
+    };
+    constexpr auto kStr = sofab::detail::Fix::String;
+    constexpr auto kBlob = sofab::detail::Fix::Blob;
+
+    /* --- 1. THE PIN: an over-cap schema-unbounded string never reaches storage.
+     *        64 announced bytes under a cap of 16. --- */
+    {
+        const auto w = field(1, kStr, 64, 'x');
+        auto in = std::make_unique<sofab::IStreamObject<DynCapMsg>>();
+        (**in).strCap = 16;
+        const unsigned long before = g_allocCount;
+        const auto r = in->feed(w.data(), w.size());
+        CHECK(r.limitExceeded() && !r.invalid(),
+              "cap-at-read: an over-cap unbounded string is LimitExceeded, not INVALID");
+        CHECK(r.code() == sofab::Error::LimitExceeded, "cap-at-read: and carries that code");
+        CHECK((**in).text.empty(),
+              "cap-at-read: and the destination was never sized for it (the eager-fitDest bug)");
+        CHECK(g_allocCount == before,
+              "cap-at-read: and the refusal allocated nothing (§6.6)");
+    }
+    {
+        const auto w = field(2, kBlob, 64, 0xab);
+        auto in = std::make_unique<sofab::IStreamObject<DynCapMsg>>();
+        (**in).blobCap = 16;
+        const unsigned long before = g_allocCount;
+        const auto r = in->feed(w.data(), w.size());
+        CHECK(r.limitExceeded() && !r.invalid(),
+              "cap-at-read: an over-cap unbounded blob is LimitExceeded");
+        CHECK((**in).bytes.empty(), "cap-at-read: and the blob destination is still empty");
+        CHECK(g_allocCount == before, "cap-at-read: and nothing was allocated for it");
+    }
+
+    /* --- 2. under the cap the same field decodes, destination and all. --- */
+    {
+        const auto w = field(1, kStr, 64, 'x');
+        auto in = std::make_unique<sofab::IStreamObject<DynCapMsg>>();
+        (**in).strCap = 128;
+        CHECK(in->feed(w.data(), w.size()).complete(),
+              "cap-at-read: a field inside the cap decodes COMPLETE");
+        CHECK((**in).text.size() == 64, "cap-at-read: and lands in full");
+    }
+
+    /* --- 3. §7.3 first: a skipped field is NEVER capped. Id 1 arrives as a
+     *        `blob`, which the readString for it declines -- so the field is
+     *        skipped like an unknown id and the cap must not look at its length,
+     *        even though 64 is far past it. --- */
+    {
+        const auto w = field(1, kBlob, 64, 0xab);
+        auto in = std::make_unique<sofab::IStreamObject<DynCapMsg>>();
+        (**in).strCap = 16;
+        const auto r = in->feed(w.data(), w.size());
+        CHECK(r.complete() && !r.limitExceeded(),
+              "cap-at-read: a §7.3-skipped field stays COMPLETE and is never capped");
+        CHECK(in->skipped() == 1, "cap-at-read: and is counted as a skip");
+        CHECK((**in).text.empty(), "cap-at-read: leaving the destination untouched");
+    }
+    {
+        const auto w = field(2, kStr, 64, 'x'); /* a string arriving at the blob read */
+        auto in = std::make_unique<sofab::IStreamObject<DynCapMsg>>();
+        (**in).blobCap = 16;
+        const auto r = in->feed(w.data(), w.size());
+        CHECK(r.complete() && !r.limitExceeded(),
+              "cap-at-read: the same for a mistyped blob field");
+    }
+
+    /* --- 4. the cap is not applied to a field the SCHEMA bounds. Id 3 declares
+     *        maxlen 32; a 24-byte payload is valid under it, and a receiver cap
+     *        of 16 must have nothing to say about it (§6.2.1). --- */
+    {
+        const auto w = field(3, kStr, 24, 'y');
+        auto in = std::make_unique<sofab::IStreamObject<DynCapMsg>>();
+        (**in).strCap = 16;
+        CHECK(in->feed(w.data(), w.size()).complete(),
+              "cap-at-read: a schema-bounded field is not subject to the receiver cap");
+        CHECK((**in).bounded.size() == 24, "cap-at-read: and decodes in full");
+    }
+    {
+        /* and past the schema bound it is INVALID, never LimitExceeded */
+        const auto w = field(3, kStr, 40, 'y');
+        auto in = std::make_unique<sofab::IStreamObject<DynCapMsg>>();
+        (**in).strCap = 16;
+        const auto r = in->feed(w.data(), w.size());
+        CHECK(r.invalid() && !r.limitExceeded(),
+              "cap-at-read: past the schema maxlen stays InvalidMessage");
+    }
+
+    /* --- 5. the codec surface carries the identical check, so the two routes
+     *        cannot drift ("One implementation, wherever it runs"). --- */
+    {
+        const auto w = field(1, kStr, 64, 'x');
+        auto in = std::make_unique<sofab::IStreamObject<DynCapMsg>>();
+        (**in).viaHelper = false;
+        (**in).strCap = 16;
+        const unsigned long before = g_allocCount;
+        const auto r = in->feed(w.data(), w.size());
+        CHECK(r.limitExceeded() && !r.invalid(),
+              "cap-at-read: IStreamImpl::readString applies the same cap");
+        CHECK((**in).text.empty() && g_allocCount == before,
+              "cap-at-read: and refuses before the destination is touched");
+    }
+    {
+        const auto w = field(1, kBlob, 64, 0xab);
+        auto in = std::make_unique<sofab::IStreamObject<DynCapMsg>>();
+        (**in).viaHelper = false;
+        (**in).strCap = 16;
+        CHECK(in->feed(w.data(), w.size()).complete(),
+              "cap-at-read: and skips a §7.3-mistyped field ahead of the cap, as the helper does");
+    }
+
+    /* --- 6. no cap passed means NO CAP -- not "unlimited by default", and not a
+     *        format ceiling dressed up as a receiver limit. §6.2.1: a codec "MUST
+     *        NOT supply a default for one it was not given" and "A format ceiling
+     *        reached because no cap was stated is the FORMAT's bound, not a
+     *        receiver cap, and a port MUST NOT present it as one." The library
+     *        holds no `max_dyn_*` number at all, so there is nothing to fire. --- */
+    {
+        const auto w = field(1, kStr, 64, 'x');
+        auto in = std::make_unique<sofab::IStreamObject<DynCapMsg>>();
+        /* strCap left at -1: the caller stated nothing */
+        const auto r = in->feed(w.data(), w.size());
+        CHECK(r.complete() && !r.limitExceeded(),
+              "cap-at-read: with no cap passed the codec invents none");
+        CHECK((**in).text.size() == 64, "cap-at-read: and the field decodes");
+    }
+
+}
+
 static void refusalTiers()
 {
     auto fixlen = [](uint8_t idAndType, sofab::detail::Fix sub, const std::string &payload) {
@@ -3606,9 +3796,10 @@ struct CapStringMsg : sofab::IStreamMessage
 {
     std::vector<std::string> tags;
     long dynCap = -1;
+    long elemCap = -1;
     void deserialize(sofab::IStreamImpl &is, sofab::id id, size_t, size_t) noexcept override
     {
-        if (id == 1) { sofab::StringSeq c{tags, -1, -1, dynCap}; sofab::read(is, c); }
+        if (id == 1) { sofab::StringSeq c{tags, -1, -1, dynCap, elemCap}; sofab::read(is, c); }
     }
 };
 
@@ -3769,31 +3960,69 @@ static void wrapperArrayIndexCaps()
         CHECK((*in).rows.size() <= 1, "index cap: and the row container is not extended");
     }
 
-    /* --- the stream-level fallback: a caller driving the corelib directly
-     *     states the cap once, in Limits, and every collector that declares
-     *     none of its own inherits it (§6.2.1's max_dyn_array_count). --- */
+    /* --- there is NO stream-level fallback, and that is the rule (§6.2.1).
+     *     The stream used to carry a `Limits::max_dyn_array_count` that any
+     *     collector declaring no `dynCap` of its own inherited. That is a codec
+     *     holding a limit and defaulting one it was not given, which §6.2.1
+     *     forbids twice over: "A codec MUST NOT hold a limit of its own, MUST NOT
+     *     supply a default for one it was not given". The member is gone, so a
+     *     collector with no cap has no cap -- the number has to come from the
+     *     caller, per call. --- */
     {
         const auto w = strAt(4);
-        sofab::IStreamObject<CapStringMsg> in(sofab::Limits{SIZE_MAX, 4});
+        sofab::IStreamObject<CapStringMsg> in; /* no cap stated anywhere */
+        auto r = in.feed(w.data(), w.size());
+        CHECK(r.complete() && !r.limitExceeded(),
+              "index cap: with no cap passed there is no cap -- the stream holds none");
+        CHECK((*in).tags.size() == 5, "index cap: and the uncapped array is index+1 long");
+    }
+    {
+        /* The one place the number may come from is the collector, per decode. */
+        const auto w = strAt(4);
+        sofab::IStreamObject<CapStringMsg> in;
+        (*in).dynCap = 4;
         auto r = in.feed(w.data(), w.size());
         CHECK(r.limitExceeded() && !r.invalid(),
-              "index cap: Limits::max_dyn_array_count bounds a collector that declares none");
+              "index cap: the collector's own dynCap is what bounds the index");
         CHECK((*in).tags.size() <= 1, "index cap: and the container is not extended for it");
     }
+
+    /* --- BOTH caps, not one. `dynCap` bounds how many elements
+     *        the array may have; `elemDynCap` bounds how long one element may be,
+     *        and an array of two one-gigabyte strings is under any index cap. The
+     *        element cap goes in at the same seam (`acceptsString`), so it is
+     *        behind §7.3 and ahead of the placement. --- */
     {
-        const auto w = strAt(3);
-        sofab::IStreamObject<CapStringMsg> in(sofab::Limits{SIZE_MAX, 4});
-        CHECK(in.feed(w.data(), w.size()).complete(),
-              "index cap: cap-1 still decodes under the stream-level cap");
-        CHECK((*in).tags.size() == 4, "index cap: and the array is cap long");
-    }
-    {
-        /* the collector's own dynCap wins over the stream's fallback */
-        const auto w = strAt(4);
-        sofab::IStreamObject<CapStringMsg> in(sofab::Limits{SIZE_MAX, 2});
-        (*in).dynCap = 8;
-        CHECK(in.feed(w.data(), w.size()).complete(),
-              "index cap: a collector's own dynCap overrides the stream fallback");
+        /* id 1 SequenceStart, element id 0 = a 64-byte string, sequence end */
+        std::vector<uint8_t> w;
+        appendVarint(w, (1ull << 3) | 6u);
+        appendVarint(w, (0ull << 3) | 2u);
+        appendVarint(w, (64ull << 3) | 2u);
+        w.insert(w.end(), 64, 'z');
+        w.push_back(0x07);
+
+        {
+            sofab::IStreamObject<CapStringMsg> in;
+            (*in).elemCap = 16;
+            const auto r = in.feed(w.data(), w.size());
+            CHECK(r.limitExceeded() && !r.invalid(),
+                  "index cap: an over-cap element of a wrapper array is LimitExceeded");
+            CHECK((*in).tags.empty(),
+                  "index cap: and the container was never extended for it");
+        }
+        {
+            sofab::IStreamObject<CapStringMsg> in;
+            (*in).elemCap = 128;
+            CHECK(in.feed(w.data(), w.size()).complete(),
+                  "index cap: an element inside the element cap decodes");
+            CHECK((*in).tags.size() == 1 && (*in).tags[0].size() == 64,
+                  "index cap: and lands in full");
+        }
+        {
+            sofab::IStreamObject<CapStringMsg> in; /* no element cap stated */
+            CHECK(in.feed(w.data(), w.size()).complete(),
+                  "index cap: with no element cap the collector invents none");
+        }
     }
 
     /* --- growth GEOMETRY (§7.2 item 8's last paragraph): "extending to at least
@@ -7299,6 +7528,7 @@ int main()
     schemaBoundOutranksCap();
     refusalTiers();
     destinationIsNeverGrown();
+    receiverCapAtTheRead();
     utf8ValidatorSweep();
     strictUtf8();
     messageLayerFraming();
