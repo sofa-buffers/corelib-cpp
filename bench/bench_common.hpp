@@ -63,6 +63,11 @@ public:
 class IStreamRaw : public sofab::IStreamImpl
 {
 public:
+    /* The bench measures the codec, not the receiver's field-span policy, so it
+     * states the platform ceiling: the check runs on every field and never
+     * fires. There is no default to fall back on -- CORELIB_PLAN §6.2.1 leaves
+     * the library no number to invent. */
+    IStreamRaw() noexcept : sofab::IStreamImpl(sofab::Limits{SIZE_MAX}) {}
     template <class F> void init(F &&cb) noexcept { topCallback_ = std::forward<F>(cb); }
 };
 

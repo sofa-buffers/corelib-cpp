@@ -16,6 +16,18 @@
  */
 
 #include "sofab/sofab.hpp"
+
+/* Every decoder states the receiver's field-span budget: `sofab::Limits` has no
+ * default member and `IStreamObject`/`IStreamInline` have no default
+ * constructor, because CORELIB_PLAN §6.2.1 forbids the codec a limit of its own
+ * ("MUST NOT supply a default for one it was not given, MUST NOT read an omitted
+ * argument as *unlimited*").
+ *
+ * A test that is not about the field-span cap states the platform's own ceiling.
+ * That is a number this CALLER chose, not a mode the library offers: the check
+ * still runs on every field and simply never fires. The tests that ARE about the
+ * cap state a small number of their own. */
+static constexpr sofab::Limits kMaxSpan{SIZE_MAX};
 #include "sofab_test_json.h"
 
 #include <bit>
@@ -567,7 +579,7 @@ struct GrowthStringMsg : sofab::IStreamMessage
     std::vector<std::string> out;
     void deserialize(sofab::IStreamImpl &is, sofab::id id, size_t, size_t) noexcept override
     {
-        if (id == field) { sofab::StringSeq c{out, -1, -1, kGrowthCap}; is.read(c); }
+        if (id == field) { sofab::StringSeq c{out, -1, -1, kGrowthCap, kGrowthCap}; is.read(c); }
     }
 };
 
@@ -936,7 +948,7 @@ struct GenericMsg : sofab::IStreamMessage
 bool decode(const Vector &v, bool oneByte, std::string &err, const std::vector<uint32_t> *skip = nullptr)
 {
     Cursor cur; cur.ops = &v.ops; cur.skip = skip;
-    sofab::IStreamObject<GenericMsg> in;
+    sofab::IStreamObject<GenericMsg> in{kMaxSpan};
     (*in).cur = &cur;
 
     if (oneByte)
@@ -1054,7 +1066,7 @@ int main()
          * (corelib-cpp#79). */
         static const uint8_t goodTail[] = {0x08, 0x2a}; /* id 1, unsigned = 42 */
         {
-            sofab::IStreamObject<NegReadMsg> in;
+            sofab::IStreamObject<NegReadMsg> in{kMaxSpan};
             auto r = in.feed(nv.serialized.data(), nv.serialized.size());
             run(r.code() == sofab::Error::InvalidMessage && r.status() == sofab::DecodeStatus::Invalid,
                 named(nv.name.c_str()), "utf8-decode-invalid",
@@ -1066,7 +1078,7 @@ int main()
                     std::to_string(static_cast<int>(r2.code())));
         }
         {
-            sofab::IStreamObject<NegReadMsg> in;
+            sofab::IStreamObject<NegReadMsg> in{kMaxSpan};
             sofab::Error last = sofab::Error::None;
             for (uint8_t b : nv.serialized) last = in.feed(&b, 1).code();
             run(last == sofab::Error::InvalidMessage,
@@ -1136,7 +1148,7 @@ int main()
 
         if (c.structElems)
         {
-            sofab::IStreamObject<GrowthStructMsg> in;
+            sofab::IStreamObject<GrowthStructMsg> in{kMaxSpan};
             (*in).field = c.fieldId;
             const auto &rows = (*in).out;
             const sofab::Error code = in.feed(wire.data(), wire.size()).code();
@@ -1145,7 +1157,7 @@ int main()
         }
         else
         {
-            sofab::IStreamObject<GrowthStringMsg> in;
+            sofab::IStreamObject<GrowthStringMsg> in{kMaxSpan};
             (*in).field = c.fieldId;
             const auto &tags = (*in).out;
             const sofab::Error code = in.feed(wire.data(), wire.size()).code();
