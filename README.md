@@ -254,19 +254,47 @@ with its **payload withheld**: `readString`/`readArray`/… settle the wire type
 materialising anything. Only a field the schema leaves unbounded ends in
 `LimitExceeded`.
 
-`max_dyn_array_count` is the second cap. A wrapper array — an array of `string`,
-`blob`, `struct` or nested rows — carries no count header: its length is *highest
-present id + 1*, so the element **index** is what a cap has to bind, and it is
-checked before the container is extended. The `StringSeq` / `BlobSeq` /
-`MessageSeq` collectors take the same cap per field as their `dynCap` argument,
-which generated code sets from the schema; the `Limits` value is the fallback for
-a collector that declares none. Its default is no cap for the same reason
-`max_buffered_field`'s is: the numbers belong to the layer that knows the schema
-and the target.
+#### The §6.2.1 receiver caps are arguments, not settings
+
+`max_dyn_string_len`, `max_dyn_blob_len` and `max_dyn_array_count` are **not**
+fields of `Limits` and are not held anywhere in this library. Each is a parameter
+on the call that reads the field it bounds, supplied per call by the layer that
+knows the schema and the target:
 
 ```cpp
-sofab::IStreamObject<Sensor> in{ sofab::Limits{ .max_dyn_array_count = 4096 } };
+sofab::readString(is, name,  -1, SOFAB_MAX_DYN_STRING_LEN);   // schema declares no maxlen
+sofab::readBlob  (is, sig,   -1, SOFAB_MAX_DYN_BLOB_LEN);
+sofab::readArray (is, nums,  -1, SOFAB_MAX_DYN_ARRAY_COUNT);
+sofab::StringSeq tags{out, /*count*/ -1, /*elemMax*/ -1, SOFAB_MAX_DYN_ARRAY_COUNT};
 ```
+
+The third argument is always the **schema** bound (`-1` where the schema declares
+none) and the fourth is the receiver cap; the cap is consulted only where the
+third is `-1`. §6.2.1 puts the numbers in generated code and leaves this library
+"the report and the category", so a codec "**MUST NOT** hold a limit of its own,
+**MUST NOT** supply a default for one it was not given, **MUST NOT** read an
+omitted argument as *unlimited*, and **MUST NOT** clamp to one."
+
+**A negative cap means no cap was supplied — not "unlimited".** There is no
+stream-wide fallback to inherit and no ceiling this library will present as a
+receiver limit in one's place. Reading a schema-unbounded `string`, `blob` or
+array into a *growable* destination without passing a cap lets the sender decide
+how much this process holds; that is a defect in the **call**, not a mode on
+offer. A destination with static room (`FixedString`, `FixedBytes`,
+`InlineVector`) needs no cap to be safe — it already holds all it can ever hold,
+and refuses the rest under `Error::InvalidArgument`.
+
+**Why the cap is passed in rather than checked in front of the call.** The check
+has to run at the count/length header, *behind* the MESSAGE_SPEC §7.3 tag test: a
+field whose wire type contradicts the declared one is skipped like an unknown id,
+and a skipped field is never capped. The tag test lives inside the read, so a
+caller testing the length before calling caps exactly the field it was required
+to skip. Handing the number in makes both conditions a property of the structure.
+
+A wrapper array — an array of `string`, `blob`, `struct` or nested rows — carries
+no count header: its length is *highest present id + 1*, so the element **index**
+is what the cap binds, and it is checked before the container is extended. The
+`StringSeq` / `BlobSeq` / `MessageSeq` collectors take it as their `dynCap`.
 
 #### Strict UTF-8 validation (`SOFAB_STRICT_UTF8`, default ON)
 
@@ -445,11 +473,14 @@ the bytes arrive, whole or one byte at a time.
   **destination must stay put** for the duration: a member of the message object
   does, a local in the handler does not.
 - **Receiver caps.** `Limits::max_buffered_field` bounds how many bytes one
-  top-level field may span; `Limits::max_dyn_array_count` bounds the element **index** of
-  a wrapper array the schema leaves unbounded, and the `StringSeq` / `BlobSeq` /
-  `MessageSeq` collectors take the same cap per field as `dynCap`. Neither has a
-  default: the numbers belong to generated code, which knows the schema and the
-  target. Breaching one is `Error::LimitExceeded`, never `InvalidMessage`.
+  top-level field may span. The §6.2.1 caps —  `max_dyn_string_len`,
+  `max_dyn_blob_len`, `max_dyn_array_count` — are **arguments**, not settings:
+  `readString` / `readBlob` / `readArray` take one, and the `StringSeq` /
+  `BlobSeq` / `MessageSeq` collectors take one as `dynCap` for the element index
+  of a wrapper array. None has a default: the numbers belong to generated code,
+  which knows the schema and the target, and an omitted one is no cap rather than
+  an unlimited one. Breaching one is `Error::LimitExceeded`, never
+  `InvalidMessage`.
 
 `read()` pulls the value out immediately: no input buffer has to outlive the call
 it was passed to.
