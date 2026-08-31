@@ -14,6 +14,27 @@
 
 #include "sofab/sofab.hpp"
 
+/* Every decoder states the receiver's field-span budget: `sofab::Limits` has no
+ * default member and `IStreamObject`/`IStreamInline` have no default
+ * constructor, because CORELIB_PLAN §6.2.1 forbids the codec a limit of its own
+ * ("MUST NOT supply a default for one it was not given, MUST NOT read an omitted
+ * argument as *unlimited*").
+ *
+ * A test that is not about the field-span cap states the platform's own ceiling.
+ * That is a number this CALLER chose, not a mode the library offers: the check
+ * still runs on every field and simply never fires. The tests that ARE about the
+ * cap state a small number of their own. */
+static constexpr sofab::Limits kMaxSpan{SIZE_MAX};
+
+/* The same idea for the per-read caps: a test that is not about a receiver cap
+ * still has to state one, because `readStringCapped` / `readBlobCapped` /
+ * `readArrayCapped` take a REQUIRED, non-negative number and there is no
+ * uncapped entry point to call instead. These are the widest the format can
+ * carry, so the comparison runs and never fires -- a number this caller chose,
+ * not a mode the library offers. Tests that are about a cap state their own. */
+static constexpr long kAnyLen   = static_cast<long>(sofab::FIXLEN_MAX);
+static constexpr long kAnyCount = static_cast<long>(sofab::ARRAY_MAX);
+
 #include <algorithm>
 #include <array>
 #include <bit>
@@ -153,7 +174,7 @@ static void checkStreamReuse(const char *name)
     static const uint8_t overlong[] = {0x00, 0x80, 0x80, 0x80, 0x80, 0x80,
                                        0x80, 0x80, 0x80, 0x80, 0x02};
 
-    sofab::IStreamObject<M> in;
+    sofab::IStreamObject<M> in{kMaxSpan};
     CHECK(in.feed(partial, sizeof partial).code() == sofab::Error::Incomplete,
           say("a lone field header is INCOMPLETE, and its byte is buffered"));
     in.reset();
@@ -247,7 +268,7 @@ static void roundtripScalars()
       .write(5, std::string_view{"hello sofab"})
       .write(6, true);
 
-    sofab::IStreamObject<ScalarMsg> in;
+    sofab::IStreamObject<ScalarMsg> in{kMaxSpan};
     in.feed(os.data(), os.bytesUsed());
 
     CHECK((*in).a == 123456789u, "roundtrip a");
@@ -274,7 +295,7 @@ static void roundtripArrays()
     std::array<float,3> f{1.5f, -2.5f, 1e30f};
     os.write(1, u).write(2, f);
 
-    sofab::IStreamObject<ArrMsg> in;
+    sofab::IStreamObject<ArrMsg> in{kMaxSpan};
     in.feed(os.data(), os.bytesUsed());
 
     CHECK(((*in).u == std::array<uint32_t,5>{10,20,30,0x80000000u,UINT32_MAX}), "roundtrip uint array");
@@ -313,7 +334,7 @@ static void roundtripNested()
     CHECK(toHex(std::span<const uint8_t>(os.data(), os.bytesUsed())) == "002a0e002a1153071153",
           "nested encode bytes");
 
-    sofab::IStreamObject<Parent> in;
+    sofab::IStreamObject<Parent> in{kMaxSpan};
     in.feed(os.data(), os.bytesUsed());
     CHECK((*in).top == 42u, "nested top");
     CHECK((*in).child.x == 42u, "nested child.x");
@@ -327,7 +348,7 @@ static void chunkedDecode()
     os.write(1, uint64_t{123456789}).write(2, int64_t{-987654321}).write(5, std::string_view{"chunked"});
 
     /* feed one byte at a time */
-    sofab::IStreamObject<ScalarMsg> in;
+    sofab::IStreamObject<ScalarMsg> in{kMaxSpan};
     for (size_t i = 0; i < os.bytesUsed(); ++i)
         in.feed(os.data() + i, 1);
 
@@ -339,7 +360,7 @@ static void chunkedDecode()
 /* A truncated blob read through the RAW read(void*, size_t) overload is INCOMPLETE,
  * not INVALID — and it recovers once the rest arrives.
  *
- * readBlob() and readString() guard the identical condition and have always set
+ * readBlobCapped(, kAnyLen) and readStringCapped(, kAnyLen) guard the identical condition and have always set
  * incomplete_; the raw overload set error_, which made a truncated payload INVALID
  * *and* condemned the run, so the message never completed even after the remaining
  * bytes were fed. Generated code never calls this overload (it uses readBlob), which
@@ -363,7 +384,7 @@ static void rawBlobReadTruncation()
      * correct — they are kept as controls. */
     for (size_t cut = 2; cut <= 6; ++cut)
     {
-        sofab::IStreamObject<RawBlobMsg> in;
+        sofab::IStreamObject<RawBlobMsg> in{kMaxSpan};
         auto r1 = in.feed(msg, cut);
         CHECK(!r1.ok() || cut == 2, "raw blob: a short payload is not COMPLETE");
         CHECK(r1.incomplete() || cut == 2, "raw blob: a short payload is INCOMPLETE, not INVALID");
@@ -376,7 +397,7 @@ static void rawBlobReadTruncation()
 
     /* The same field alone, truncated, in a single feed: INCOMPLETE, never INVALID. */
     static const uint8_t lone[] = {0x0a, 0x23, 0x41, 0x42};
-    sofab::IStreamObject<RawBlobMsg> one;
+    sofab::IStreamObject<RawBlobMsg> one{kMaxSpan};
     CHECK(one.feed(lone, sizeof(lone)).incomplete(),
           "raw blob: a lone truncated blob is INCOMPLETE");
 }
@@ -393,7 +414,7 @@ static void skippingUnknownFields()
         { if (id == 2) sofab::read(is, b); }
     };
     checkStreamReuse<Only2>("skippingUnknownFields/Only2");
-    sofab::IStreamObject<Only2> in;
+    sofab::IStreamObject<Only2> in{kMaxSpan};
     in.feed(os.data(), os.bytesUsed());
     CHECK((*in).b == -222, "skip: read only field 2");
 }
@@ -410,7 +431,7 @@ static void malformedInput()
      * streaming decoder treats this as an incomplete tail — no field delivered,
      * no crash — and reports INCOMPLETE (distinct from COMPLETE), never INVALID. */
     {
-        sofab::IStreamObject<ScalarMsg> in;
+        sofab::IStreamObject<ScalarMsg> in{kMaxSpan};
         const uint8_t bytes[] = {0x08, 0x80}; /* id 1, unsigned, dangling varint */
         auto r = in.feed(bytes, sizeof bytes);
         CHECK(r.code() == sofab::Error::Incomplete, "malformed: truncated varint is INCOMPLETE, not COMPLETE/INVALID");
@@ -420,7 +441,7 @@ static void malformedInput()
 
     /* Overlong varint (more than 10 groups → exceeds 64 bits): rejected. */
     {
-        sofab::IStreamObject<ScalarMsg> in;
+        sofab::IStreamObject<ScalarMsg> in{kMaxSpan};
         std::vector<uint8_t> bytes = {0x08}; /* id 1, unsigned */
         for (int i = 0; i < 12; ++i) bytes.push_back(0x80);
         bytes.push_back(0x01);
@@ -433,7 +454,7 @@ static void malformedInput()
      * follows, so the measure phase must reject it rather than mistake the
      * unterminated tail for a truncated field (corelib-cpp#29). */
     {
-        sofab::IStreamObject<ScalarMsg> in;
+        sofab::IStreamObject<ScalarMsg> in{kMaxSpan};
         std::vector<uint8_t> bytes = {0x08}; /* id 1, unsigned */
         for (int i = 0; i < 11; ++i) bytes.push_back(0x80); /* 11 continuation bytes, no terminator */
         auto r = in.feed(bytes.data(), bytes.size());
@@ -451,7 +472,7 @@ static void malformedInput()
         /* id 1 (unsigned `a`) → getVarint path: 9×0xff then a high 10th byte. */
         for (uint8_t last : {uint8_t{0x02}, uint8_t{0x7f}})
         {
-            sofab::IStreamObject<ScalarMsg> in;
+            sofab::IStreamObject<ScalarMsg> in{kMaxSpan};
             std::vector<uint8_t> bytes = {0x08};
             for (int i = 0; i < 9; ++i) bytes.push_back(0xff);
             bytes.push_back(last);
@@ -461,7 +482,7 @@ static void malformedInput()
         }
         /* id 9 (unknown) → skipVarint path: same overlong must also be INVALID. */
         {
-            sofab::IStreamObject<ScalarMsg> in;
+            sofab::IStreamObject<ScalarMsg> in{kMaxSpan};
             std::vector<uint8_t> bytes = {0x48}; /* id 9, unsigned, skipped */
             for (int i = 0; i < 9; ++i) bytes.push_back(0xff);
             bytes.push_back(0x7f);
@@ -471,7 +492,7 @@ static void malformedInput()
         }
         /* Control: 9×0xff then 0x01 is exactly 2^64-1 and must still decode. */
         {
-            sofab::IStreamObject<ScalarMsg> in;
+            sofab::IStreamObject<ScalarMsg> in{kMaxSpan};
             std::vector<uint8_t> bytes = {0x08};
             for (int i = 0; i < 9; ++i) bytes.push_back(0xff);
             bytes.push_back(0x01);
@@ -484,7 +505,7 @@ static void malformedInput()
     /* Oversized fixlen length: the header claims far more payload than is
      * present. Held as INCOMPLETE, never read past the buffer. */
     {
-        sofab::IStreamObject<ScalarMsg> in;
+        sofab::IStreamObject<ScalarMsg> in{kMaxSpan};
         const uint8_t bytes[] = {0x2a, static_cast<uint8_t>((200u << 3) | 2u), 'h', 'i'};
         auto r = in.feed(bytes, sizeof bytes); /* id 5, string, len=200 */
         CHECK(r.code() == sofab::Error::Incomplete, "malformed: oversized fixlen is INCOMPLETE, no OOB read");
@@ -501,13 +522,13 @@ static void malformedInput()
      * skippable no-op. Both the bare `0x07` (id 0) and an end with a nonzero id
      * after a complete field must be rejected. */
     {
-        sofab::IStreamObject<ScalarMsg> in;
+        sofab::IStreamObject<ScalarMsg> in{kMaxSpan};
         const uint8_t bytes[] = {0x07};
         auto r = in.feed(bytes, sizeof bytes);
         CHECK(r.code() == sofab::Error::InvalidMessage, "malformed: stray sequence-end rejected");
     }
     {
-        sofab::IStreamObject<ScalarMsg> in;
+        sofab::IStreamObject<ScalarMsg> in{kMaxSpan};
         const uint8_t bytes[] = {0x08, 0x00, 0x7f}; /* id1 unsigned=0, then dangling end (id15) */
         auto r = in.feed(bytes, sizeof bytes);
         CHECK(r.code() == sofab::Error::InvalidMessage, "malformed: dangling sequence-end after a field rejected");
@@ -519,7 +540,7 @@ static void malformedInput()
      * F-0005 reproducer class (`56 0a 59` = seq{ fp64 with length 11 }). */
     {
         const uint8_t repro[] = {0x56, 0x0a, 0x59}; /* seq id10 { fixlen id1, fp64, len 11 } */
-        sofab::IStreamObject<ScalarMsg> in;
+        sofab::IStreamObject<ScalarMsg> in{kMaxSpan};
         auto r = in.feed(repro, sizeof repro);
         CHECK(r.code() == sofab::Error::InvalidMessage, "malformed: fp64 length 11 rejected (F-0005 reproducer)");
     }
@@ -528,7 +549,7 @@ static void malformedInput()
         for (uint8_t len : {0u, 3u, 5u, 8u})
         {
             const uint8_t bytes[] = {0x2a, static_cast<uint8_t>((len << 3) | 0u)}; /* fp32 */
-            sofab::IStreamObject<ScalarMsg> in;
+            sofab::IStreamObject<ScalarMsg> in{kMaxSpan};
             auto r = in.feed(bytes, sizeof bytes);
             CHECK(r.code() == sofab::Error::InvalidMessage, "malformed: fp32 with length != 4 rejected");
         }
@@ -537,7 +558,7 @@ static void malformedInput()
         /* An fp32 with the correct length but a truncated payload stays INCOMPLETE
          * (buffered), so the strictness above never swallows a split chunk. */
         const uint8_t bytes[] = {0x2a, static_cast<uint8_t>((4u << 3) | 0u), 0x00, 0x00}; /* 2 of 4 bytes */
-        sofab::IStreamObject<ScalarMsg> in;
+        sofab::IStreamObject<ScalarMsg> in{kMaxSpan};
         auto r = in.feed(bytes, sizeof bytes);
         CHECK(r.code() == sofab::Error::Incomplete, "malformed: fp32 correct length but truncated payload is INCOMPLETE");
     }
@@ -545,7 +566,7 @@ static void malformedInput()
     /* Reserved fixlen subtype (0b100..0b111) is INVALID (§4.6). */
     {
         const uint8_t bytes[] = {0x2a, static_cast<uint8_t>((4u << 3) | 4u)}; /* subtype 4 = reserved */
-        sofab::IStreamObject<ScalarMsg> in;
+        sofab::IStreamObject<ScalarMsg> in{kMaxSpan};
         auto r = in.feed(bytes, sizeof bytes);
         CHECK(r.code() == sofab::Error::InvalidMessage, "malformed: reserved fixlen subtype rejected");
     }
@@ -554,13 +575,13 @@ static void malformedInput()
      * element subtype, or a wrong element size, is INVALID. */
     {
         const uint8_t bytes[] = {0x2d, 0x01, static_cast<uint8_t>((1u << 3) | 2u)}; /* array id5, count1, string elem */
-        sofab::IStreamObject<ScalarMsg> in;
+        sofab::IStreamObject<ScalarMsg> in{kMaxSpan};
         auto r = in.feed(bytes, sizeof bytes);
         CHECK(r.code() == sofab::Error::InvalidMessage, "malformed: string element in fixlen array rejected");
     }
     {
         const uint8_t bytes[] = {0x2d, 0x01, static_cast<uint8_t>((3u << 3) | 0u)}; /* fp32 elem size 3 */
-        sofab::IStreamObject<ScalarMsg> in;
+        sofab::IStreamObject<ScalarMsg> in{kMaxSpan};
         auto r = in.feed(bytes, sizeof bytes);
         CHECK(r.code() == sofab::Error::InvalidMessage, "malformed: fixlen array fp32 element size != 4 rejected");
     }
@@ -569,7 +590,7 @@ static void malformedInput()
      * rejected up front rather than driving an unbounded element-skip loop. */
     {
         const uint8_t bytes[] = {0x03, 0x80, 0x80, 0x80, 0x80, 0x08}; /* array id0, count = 2^31 */
-        sofab::IStreamObject<ScalarMsg> in;
+        sofab::IStreamObject<ScalarMsg> in{kMaxSpan};
         auto r = in.feed(bytes, sizeof bytes);
         CHECK(r.code() == sofab::Error::InvalidMessage, "malformed: array count above ARRAY_MAX rejected");
     }
@@ -578,7 +599,7 @@ static void malformedInput()
      * reject it, not treat it as an unknown id and skip it (issue #47 / F-0028). */
     {
         const uint8_t bytes[] = {0x80, 0x80, 0x80, 0x80, 0x40, 0x05}; /* id = 2^31, unsigned, value 5 */
-        sofab::IStreamObject<ScalarMsg> in;
+        sofab::IStreamObject<ScalarMsg> in{kMaxSpan};
         auto r = in.feed(bytes, sizeof bytes);
         CHECK(r.code() == sofab::Error::InvalidMessage, "malformed: field id above ID_MAX rejected");
     }
@@ -595,7 +616,7 @@ static void malformedInput()
             { if (id == 2) sofab::read(is, b); }
         };
         checkStreamReuse<Only2>("malformedInput/Only2");
-        sofab::IStreamObject<Only2> in;
+        sofab::IStreamObject<Only2> in{kMaxSpan};
         in.feed(os.data(), os.bytesUsed());
         CHECK((*in).b == -222, "malformed/skip: resync after skipped sub-sequence");
     }
@@ -642,7 +663,7 @@ static void terminalVerdictsAreLatched()
 
     /* ---- A: the bad byte lands on the fast path (nothing buffered). ---- */
     {
-        sofab::IStreamObject<ScalarMsg> in;
+        sofab::IStreamObject<ScalarMsg> in{kMaxSpan};
         const uint8_t bad[] = {0x0f}; /* id 1, sequence-end: stray end at the root */
         CHECK(in.feed(bad, sizeof bad).code() == sofab::Error::InvalidMessage,
               "terminal: a stray sequence-end is INVALID");
@@ -657,7 +678,7 @@ static void terminalVerdictsAreLatched()
     /* ---- B: the same bytes, bad byte on the continuation path. Both paths must
      *         agree — this leg already passed before #79 and is the control. ---- */
     {
-        sofab::IStreamObject<ScalarMsg> in;
+        sofab::IStreamObject<ScalarMsg> in{kMaxSpan};
         const uint8_t head[] = {0x08};
         const uint8_t tail[] = {0x2a, 0x0f};
         CHECK(in.feed(head, sizeof head).code() == sofab::Error::Incomplete,
@@ -686,7 +707,7 @@ static void terminalVerdictsAreLatched()
 
     /* ---- D: reset() is the documented way back to a usable stream. ---- */
     {
-        sofab::IStreamObject<ScalarMsg> in;
+        sofab::IStreamObject<ScalarMsg> in{kMaxSpan};
         const uint8_t bad[] = {0x07};
         CHECK(in.feed(bad, sizeof bad).invalid(), "terminal: bare stray end is INVALID");
         in.reset();
@@ -723,15 +744,15 @@ static void terminalVerdictsAreLatched()
     for (int i = 0; i <= 255; ++i) tooDeep.push_back(0x0e); /* 256 opens > MAX_DEPTH */
 
     const std::vector<Bad> corpus = {
-        {"stray sequence-end (id 0)",        {0x07},                   {}},
-        {"stray sequence-end (id 1)",        {0x0f},                   {}},
-        {"dangling end after a field",       {0x08, 0x00, 0x7f},       {}},
-        {"overlong varint",                  overlong,                 {}},
-        {"unterminated overlong varint",     unterminated,             {}},
-        {"overlong varint, high 10th byte",  highBits,                 {}},
-        {"fp64 fixlen of length 11",         {0x56, 0x0a, 0x59},       {}},
-        {"reserved fixlen subtype",          {0x2a, 0x2c},             {}},
-        {"nesting past MAX_DEPTH",           tooDeep,                  {}},
+        {"stray sequence-end (id 0)",        {0x07},                   kMaxSpan},
+        {"stray sequence-end (id 1)",        {0x0f},                   kMaxSpan},
+        {"dangling end after a field",       {0x08, 0x00, 0x7f},       kMaxSpan},
+        {"overlong varint",                  overlong,                 kMaxSpan},
+        {"unterminated overlong varint",     unterminated,             kMaxSpan},
+        {"overlong varint, high 10th byte",  highBits,                 kMaxSpan},
+        {"fp64 fixlen of length 11",         {0x56, 0x0a, 0x59},       kMaxSpan},
+        {"reserved fixlen subtype",          {0x2a, 0x2c},             kMaxSpan},
+        {"nesting past MAX_DEPTH",           tooDeep,                  kMaxSpan},
         {"claimed-oversize field",           {0x2a, 0xa2, 0x06},       sofab::Limits{8}},
     };
 
@@ -776,7 +797,7 @@ static void threeValuedOutcomes()
     {
         sofab::OStreamInline<64> os;
         os.write(1, uint64_t{123456789}).write(2, int64_t{-987654321});
-        sofab::IStreamObject<ScalarMsg> in;
+        sofab::IStreamObject<ScalarMsg> in{kMaxSpan};
         auto r = in.feed(os.data(), os.bytesUsed());
         CHECK(r.code() == sofab::Error::None, "three-valued: complete message is COMPLETE");
         CHECK(r.status() == sofab::DecodeStatus::Complete, "three-valued: complete status");
@@ -788,7 +809,7 @@ static void threeValuedOutcomes()
     /* INCOMPLETE: a lone dangling 0x80 — a well-formed *prefix* of a varint. More
      * bytes could complete it, so it is INCOMPLETE, not INVALID (spec §7). */
     {
-        sofab::IStreamObject<ScalarMsg> in;
+        sofab::IStreamObject<ScalarMsg> in{kMaxSpan};
         const uint8_t bytes[] = {0x80};
         auto r = in.feed(bytes, sizeof bytes);
         CHECK(r.code() == sofab::Error::Incomplete, "three-valued: lone 0x80 is INCOMPLETE");
@@ -800,7 +821,7 @@ static void threeValuedOutcomes()
     /* INCOMPLETE: an open (unclosed) sequence — a bare sequence-start with no
      * matching end. Feeding the end would complete it, so it too is INCOMPLETE. */
     {
-        sofab::IStreamObject<ScalarMsg> in;
+        sofab::IStreamObject<ScalarMsg> in{kMaxSpan};
         const uint8_t bytes[] = {0x0e}; /* id 1, sequence-start, never closed */
         auto r = in.feed(bytes, sizeof bytes);
         CHECK(r.code() == sofab::Error::Incomplete, "three-valued: open sequence is INCOMPLETE");
@@ -809,7 +830,7 @@ static void threeValuedOutcomes()
     /* INVALID: a varint that exceeds 64 bits is malformed regardless of what
      * follows (spec §7) and must be terminal, never held as INCOMPLETE. */
     {
-        sofab::IStreamObject<ScalarMsg> in;
+        sofab::IStreamObject<ScalarMsg> in{kMaxSpan};
         std::vector<uint8_t> bytes = {0x08}; /* id 1, unsigned */
         for (int i = 0; i < 12; ++i) bytes.push_back(0x80);
         bytes.push_back(0x01);
@@ -824,7 +845,7 @@ static void threeValuedOutcomes()
     {
         sofab::OStreamInline<64> os;
         os.write(1, uint64_t{123456789});
-        sofab::IStreamObject<ScalarMsg> in;
+        sofab::IStreamObject<ScalarMsg> in{kMaxSpan};
         size_t n = os.bytesUsed();
         auto first = in.feed(os.data(), n - 1);
         CHECK(first.code() == sofab::Error::Incomplete, "three-valued: split head is INCOMPLETE");
@@ -860,7 +881,7 @@ static void callbackInvalidate()
     /* Control: count == capacity decodes COMPLETE. */
     {
         const uint8_t bytes[] = {0x03, 0x04, 1, 2, 3, 4};
-        sofab::IStreamObject<BoundedArr> in;
+        sofab::IStreamObject<BoundedArr> in{kMaxSpan};
         auto r = in.feed(bytes, sizeof bytes);
         CHECK(r.code() == sofab::Error::None, "invalidate: count == capacity stays COMPLETE");
         CHECK(((*in).u == std::array<uint32_t, 4>{1, 2, 3, 4}), "invalidate: control values decoded");
@@ -869,7 +890,7 @@ static void callbackInvalidate()
     /* count > capacity: the callback invalidates; feed reports INVALID. */
     {
         const uint8_t bytes[] = {0x03, 0x05, 1, 2, 3, 4, 5};
-        sofab::IStreamObject<BoundedArr> in;
+        sofab::IStreamObject<BoundedArr> in{kMaxSpan};
         auto r = in.feed(bytes, sizeof bytes);
         CHECK(r.code() == sofab::Error::InvalidMessage, "invalidate: over-count array is INVALID");
         CHECK(r.invalid() && !r.complete() && !r.incomplete(), "invalidate: predicates report Invalid");
@@ -879,7 +900,7 @@ static void callbackInvalidate()
     /* Dispatch stops at the invalidated field: nothing after it is delivered. */
     {
         const uint8_t bytes[] = {0x03, 0x05, 1, 2, 3, 4, 5, 0x08, 0x2a}; /* then id1 unsigned 42 */
-        sofab::IStreamObject<BoundedArr> in;
+        sofab::IStreamObject<BoundedArr> in{kMaxSpan};
         auto r = in.feed(bytes, sizeof bytes);
         CHECK(r.code() == sofab::Error::InvalidMessage, "invalidate: INVALID with a trailing field");
         CHECK((*in).delivered == 1, "invalidate: no field delivered past the invalidated one");
@@ -894,7 +915,7 @@ static void callbackInvalidate()
      * earlier; there is no such two-tier behaviour any more. */
     {
         const uint8_t bytes[] = {0x03, 0x05, 1, 2, 3, 4, 5};
-        sofab::IStreamObject<BoundedArr> in;
+        sofab::IStreamObject<BoundedArr> in{kMaxSpan};
         auto r = in.feed(bytes, 3); /* header + count + 1 element */
         CHECK(r.code() == sofab::Error::InvalidMessage,
               "invalidate: an over-count array is INVALID at the count word, mid-stream");
@@ -902,7 +923,7 @@ static void callbackInvalidate()
     /* An IN-bound array split the same way still reports INCOMPLETE and completes. */
     {
         const uint8_t bytes[] = {0x03, 0x04, 1, 2, 3, 4};
-        sofab::IStreamObject<BoundedArr> in;
+        sofab::IStreamObject<BoundedArr> in{kMaxSpan};
         auto r = in.feed(bytes, 3);
         CHECK(r.code() == sofab::Error::Incomplete, "invalidate: in-bound split array is INCOMPLETE");
         r = in.feed(bytes + 3, sizeof bytes - 3);
@@ -937,26 +958,26 @@ static void headerFirstBounds()
     checkStreamReuse<BoundedArr>("headerFirstBounds/BoundedArr");
     {   /* count 6 (>4) then EOF after 2 elements — over-count AND truncated */
         const uint8_t bytes[] = {0x7b, 0x06, 1, 2};
-        sofab::IStreamObject<BoundedArr> in;
+        sofab::IStreamObject<BoundedArr> in{kMaxSpan};
         CHECK(in.feed(bytes, sizeof bytes).code() == sofab::Error::InvalidMessage,
               "header-first: truncated over-count is INVALID (anti-folding)");
     }
     {   /* count 6 (>4), complete */
         const uint8_t bytes[] = {0x7b, 0x06, 1, 2, 3, 4, 5, 6};
-        sofab::IStreamObject<BoundedArr> in;
+        sofab::IStreamObject<BoundedArr> in{kMaxSpan};
         CHECK(in.feed(bytes, sizeof bytes).code() == sofab::Error::InvalidMessage,
               "header-first: complete over-count is INVALID");
     }
     {   /* count 4 (==bound) then EOF — clean truncation control */
         const uint8_t bytes[] = {0x7b, 0x04, 1, 2};
-        sofab::IStreamObject<BoundedArr> in;
+        sofab::IStreamObject<BoundedArr> in{kMaxSpan};
         CHECK(in.feed(bytes, sizeof bytes).code() == sofab::Error::Incomplete,
               "header-first: clean truncation at the bound stays INCOMPLETE");
     }
     {   /* the same truncated over-count, fed one byte at a time: the count word
          * arrives on a later feed and the verdict must not fold to INCOMPLETE */
         const uint8_t bytes[] = {0x7b, 0x06, 1, 2};
-        sofab::IStreamObject<BoundedArr> in;
+        sofab::IStreamObject<BoundedArr> in{kMaxSpan};
         CHECK(in.feed(bytes, 1).code() == sofab::Error::Incomplete,
               "header-first: a lone header buffers as INCOMPLETE");
         CHECK(in.feed(bytes + 1, sizeof bytes - 1).code() == sofab::Error::InvalidMessage,
@@ -974,26 +995,26 @@ static void headerFirstBounds()
     checkStreamReuse<BoundedStr>("headerFirstBounds/BoundedStr");
     {   /* len 10 (>8), complete */
         const uint8_t bytes[] = {0x2a, 0x52, 'A','B','C','D','E','F','G','H','I','J'};
-        sofab::IStreamObject<BoundedStr> in;
+        sofab::IStreamObject<BoundedStr> in{kMaxSpan};
         CHECK(in.feed(bytes, sizeof bytes).code() == sofab::Error::InvalidMessage,
               "header-first: complete over-maxlen is INVALID");
     }
     {   /* len 10 (>8) then EOF after 2 payload bytes */
         const uint8_t bytes[] = {0x2a, 0x52, 'A','B'};
-        sofab::IStreamObject<BoundedStr> in;
+        sofab::IStreamObject<BoundedStr> in{kMaxSpan};
         CHECK(in.feed(bytes, sizeof bytes).code() == sofab::Error::InvalidMessage,
               "header-first: truncated over-maxlen is INVALID (anti-folding)");
     }
     {   /* len 8 (==maxlen) then EOF — clean truncation control */
         const uint8_t bytes[] = {0x2a, 0x42, 'A','B'};
-        sofab::IStreamObject<BoundedStr> in;
+        sofab::IStreamObject<BoundedStr> in{kMaxSpan};
         CHECK(in.feed(bytes, sizeof bytes).code() == sofab::Error::Incomplete,
               "header-first: clean truncation at the maxlen stays INCOMPLETE");
     }
     {   /* §7.3 still wins over the bound: a BLOB at the string id contradicts the
          * declaration, so it is skipped and never measured against maxlen 8 */
         const uint8_t bytes[] = {0x2a, 0x53, 'A','B','C','D','E','F','G','H','I','J'};
-        sofab::IStreamObject<BoundedStr> in;
+        sofab::IStreamObject<BoundedStr> in{kMaxSpan};
         auto r = in.feed(bytes, sizeof bytes);
         CHECK(r.code() == sofab::Error::None && r.skipped() == 1,
               "header-first: a contradicting subtype is skipped, not bounded (§7.3)");
@@ -1016,19 +1037,19 @@ static void headerFirstBounds()
     checkStreamReuse<WrapMsg>("headerFirstBounds/WrapMsg");
     {   /* elements 0,1 then element index 2 (>=2), complete */
         const uint8_t bytes[] = {0x1e, 0x00, 0x2a, 0x08, 0x2a, 0x10, 0x2a, 0x07};
-        sofab::IStreamObject<WrapMsg> in;
+        sofab::IStreamObject<WrapMsg> in{kMaxSpan};
         CHECK(in.feed(bytes, sizeof bytes).code() == sofab::Error::InvalidMessage,
               "header-first: complete over-index is INVALID");
     }
     {   /* elements 0,1 then the index-2 header, then EOF */
         const uint8_t bytes[] = {0x1e, 0x00, 0x2a, 0x08, 0x2a, 0x10};
-        sofab::IStreamObject<WrapMsg> in;
+        sofab::IStreamObject<WrapMsg> in{kMaxSpan};
         CHECK(in.feed(bytes, sizeof bytes).code() == sofab::Error::InvalidMessage,
               "header-first: truncated over-index is INVALID (anti-folding)");
     }
     {   /* element 0 then a truncated in-bounds element 1 */
         const uint8_t bytes[] = {0x1e, 0x00, 0x2a, 0x08};
-        sofab::IStreamObject<WrapMsg> in;
+        sofab::IStreamObject<WrapMsg> in{kMaxSpan};
         CHECK(in.feed(bytes, sizeof bytes).code() == sofab::Error::Incomplete,
               "header-first: in-bounds truncation stays INCOMPLETE");
     }
@@ -1042,7 +1063,7 @@ static void headerFirstBounds()
         { void deserialize(sofab::IStreamImpl &, sofab::id, size_t, size_t) noexcept override {} };
         checkStreamReuse<Quiet>("headerFirstBounds/Quiet");
         const uint8_t over[] = {0x7b, 0x06, 1, 2, 3, 4, 5, 6};
-        sofab::IStreamObject<Quiet> in;
+        sofab::IStreamObject<Quiet> in{kMaxSpan};
         CHECK(in.feed(over, sizeof over).code() == sofab::Error::None,
               "header-first: an unread over-count field carries no bound");
     }
@@ -1069,7 +1090,7 @@ static void elementWidthBound()
     {
         std::array<uint8_t, 4> u{};
         void deserialize(sofab::IStreamImpl &is, sofab::id id, size_t, size_t) noexcept override
-        { if (id == 15) sofab::readArray(is, u, 4, -1, sofab::ElemBound::of<uint8_t>()); }
+        { if (id == 15) sofab::readArray(is, u, 4, sofab::ElemBound::of<uint8_t>()); }
     };
     checkStreamReuse<U8Arr>("elementWidthBound/U8Arr");
     /* the same array read WITHOUT a declared width, as a hand-written caller
@@ -1088,7 +1109,7 @@ static void elementWidthBound()
     {
         std::array<int8_t, 4> i{};
         void deserialize(sofab::IStreamImpl &is, sofab::id id, size_t, size_t) noexcept override
-        { if (id == 15) sofab::readArray(is, i, 4, -1, sofab::ElemBound::of<int8_t>()); }
+        { if (id == 15) sofab::readArray(is, i, 4, sofab::ElemBound::of<int8_t>()); }
     };
     checkStreamReuse<I8Arr>("elementWidthBound/I8Arr");
 
@@ -1096,7 +1117,7 @@ static void elementWidthBound()
      *      §7.1 says the message is INVALID. ---- */
     {
         const uint8_t bytes[] = {0x7b, 0x04, 0xff, 0x7f, 2, 3, 4};
-        sofab::IStreamObject<U8Arr> in;
+        sofab::IStreamObject<U8Arr> in{kMaxSpan};
         CHECK(in.feed(bytes, sizeof bytes).code() == sofab::Error::InvalidMessage,
               "§7.1: an over-width array element is INVALID, not masked");
         CHECK((*in).u[0] != 255, "§7.1: the over-width element is not kept masked either");
@@ -1106,7 +1127,7 @@ static void elementWidthBound()
      * always had — it is generated code, holding the declaration, that passes it. */
     {
         const uint8_t bytes[] = {0x7b, 0x04, 0xff, 0x7f, 2, 3, 4};
-        sofab::IStreamObject<U8ArrUnbounded> in;
+        sofab::IStreamObject<U8ArrUnbounded> in{kMaxSpan};
         CHECK(in.feed(bytes, sizeof bytes).code() == sofab::Error::None,
               "§7.1: without a declared width the decode is unchanged");
     }
@@ -1114,21 +1135,21 @@ static void elementWidthBound()
     /* ---- the boundary itself: 255 fits a u8, 256 does not. ---- */
     {
         const uint8_t bytes[] = {0x7b, 0x04, 0xff, 0x01, 2, 3, 4}; /* 255 */
-        sofab::IStreamObject<U8Arr> in;
+        sofab::IStreamObject<U8Arr> in{kMaxSpan};
         auto r = in.feed(bytes, sizeof bytes);
         CHECK(r.code() == sofab::Error::None, "§7.1: the largest in-width element is admitted");
         CHECK(((*in).u == std::array<uint8_t, 4>{255, 2, 3, 4}), "§7.1: in-width elements decode");
     }
     {
         const uint8_t bytes[] = {0x7b, 0x04, 0x80, 0x02, 2, 3, 4}; /* 256 */
-        sofab::IStreamObject<U8Arr> in;
+        sofab::IStreamObject<U8Arr> in{kMaxSpan};
         CHECK(in.feed(bytes, sizeof bytes).code() == sofab::Error::InvalidMessage,
               "§7.1: one past the width is INVALID");
     }
     /* not only the first element: the bound applies to every one of them */
     {
         const uint8_t bytes[] = {0x7b, 0x04, 1, 2, 3, 0x80, 0x02};
-        sofab::IStreamObject<U8Arr> in;
+        sofab::IStreamObject<U8Arr> in{kMaxSpan};
         CHECK(in.feed(bytes, sizeof bytes).code() == sofab::Error::InvalidMessage,
               "§7.1: a LAST over-width element is INVALID too");
     }
@@ -1136,20 +1157,20 @@ static void elementWidthBound()
     /* ---- signed elements are measured after the zig-zag, at both ends. ---- */
     {
         const uint8_t bytes[] = {0x7c, 0x02, 0xff, 0x01, 0xfe, 0x01}; /* -128, 127 */
-        sofab::IStreamObject<I8Arr> in;
+        sofab::IStreamObject<I8Arr> in{kMaxSpan};
         auto r = in.feed(bytes, sizeof bytes);
         CHECK(r.code() == sofab::Error::None, "§7.1: the i8 extremes are admitted");
         CHECK(((*in).i == std::array<int8_t, 4>{-128, 127, 0, 0}), "§7.1: i8 elements decode");
     }
     {
         const uint8_t bytes[] = {0x7c, 0x01, 0x81, 0x02}; /* -129 */
-        sofab::IStreamObject<I8Arr> in;
+        sofab::IStreamObject<I8Arr> in{kMaxSpan};
         CHECK(in.feed(bytes, sizeof bytes).code() == sofab::Error::InvalidMessage,
               "§7.1: an element below the signed minimum is INVALID");
     }
     {
         const uint8_t bytes[] = {0x7c, 0x01, 0x80, 0x02}; /* 128 */
-        sofab::IStreamObject<I8Arr> in;
+        sofab::IStreamObject<I8Arr> in{kMaxSpan};
         CHECK(in.feed(bytes, sizeof bytes).code() == sofab::Error::InvalidMessage,
               "§7.1: an element above the signed maximum is INVALID");
     }
@@ -1161,19 +1182,19 @@ static void elementWidthBound()
         {
             std::array<uint32_t, 2> u{};
             void deserialize(sofab::IStreamImpl &is, sofab::id id, size_t, size_t) noexcept override
-            { if (id == 15) sofab::readArray(is, u, 2, -1, sofab::ElemBound::of<uint32_t>()); }
+            { if (id == 15) sofab::readArray(is, u, 2, sofab::ElemBound::of<uint32_t>()); }
         };
         checkStreamReuse<U32Arr>("elementWidthBound/U32Arr");
         {   /* 4294967295 = ff ff ff ff 0f */
             const uint8_t bytes[] = {0x7b, 0x01, 0xff, 0xff, 0xff, 0xff, 0x0f};
-            sofab::IStreamObject<U32Arr> in;
+            sofab::IStreamObject<U32Arr> in{kMaxSpan};
             auto r = in.feed(bytes, sizeof bytes);
             CHECK(r.code() == sofab::Error::None && (*in).u[0] == 4294967295u,
                   "§7.1: the largest u32 element is admitted");
         }
         {   /* 4294967296 = 80 80 80 80 10 */
             const uint8_t bytes[] = {0x7b, 0x01, 0x80, 0x80, 0x80, 0x80, 0x10};
-            sofab::IStreamObject<U32Arr> in;
+            sofab::IStreamObject<U32Arr> in{kMaxSpan};
             CHECK(in.feed(bytes, sizeof bytes).code() == sofab::Error::InvalidMessage,
                   "§7.1: one past the u32 width is INVALID");
         }
@@ -1188,12 +1209,12 @@ static void elementWidthBound()
         {
             std::array<uint64_t, 1> u{};
             void deserialize(sofab::IStreamImpl &is, sofab::id id, size_t, size_t) noexcept override
-            { if (id == 15) sofab::readArray(is, u, 1, -1, sofab::ElemBound::of<uint64_t>()); }
+            { if (id == 15) sofab::readArray(is, u, 1, sofab::ElemBound::of<uint64_t>()); }
         };
         checkStreamReuse<U64Arr>("elementWidthBound/U64Arr");
         const uint8_t bytes[] = {0x7b, 0x01, 0xff, 0xff, 0xff, 0xff, 0xff,
                                  0xff, 0xff, 0xff, 0xff, 0x01}; /* UINT64_MAX */
-        sofab::IStreamObject<U64Arr> in;
+        sofab::IStreamObject<U64Arr> in{kMaxSpan};
         auto r = in.feed(bytes, sizeof bytes);
         CHECK(r.code() == sofab::Error::None && (*in).u[0] == UINT64_MAX,
               "§7.1: a u64 element is unbounded, as its declared width is the whole range");
@@ -1207,18 +1228,18 @@ static void elementWidthBound()
         {
             std::array<uint8_t, 2> u{};
             void deserialize(sofab::IStreamImpl &is, sofab::id id, size_t, size_t) noexcept override
-            { if (id == 15) sofab::readArray(is, u, -1, -1, sofab::ElemBound::of<uint8_t>()); }
+            { if (id == 15) sofab::readArrayCapped(is, u, kAnyCount, sofab::ElemBound::of<uint8_t>()); }
         };
         checkStreamReuse<ShortDst>("elementWidthBound/ShortDst");
         {   /* four elements into a two-element destination, the LAST over-width */
             const uint8_t bytes[] = {0x7b, 0x04, 1, 2, 3, 0x80, 0x02};
-            sofab::IStreamObject<ShortDst> in;
+            sofab::IStreamObject<ShortDst> in{kMaxSpan};
             CHECK(in.feed(bytes, sizeof bytes).code() == sofab::Error::InvalidMessage,
                   "§7.1: an over-width SURPLUS element is INVALID too");
         }
         {   /* control: the same shape, all elements in width */
             const uint8_t bytes[] = {0x7b, 0x04, 1, 2, 3, 4};
-            sofab::IStreamObject<ShortDst> in;
+            sofab::IStreamObject<ShortDst> in{kMaxSpan};
             auto r = in.feed(bytes, sizeof bytes);
             CHECK(r.code() == sofab::Error::None && ((*in).u == std::array<uint8_t, 2>{1, 2}),
                   "§7.1: in-width surplus elements are still discarded, not rejected");
@@ -1230,7 +1251,7 @@ static void elementWidthBound()
      *      like an unknown id and its elements are never measured. ---- */
     {
         const uint8_t bytes[] = {0x7c, 0x01, 0x80, 0x02}; /* ArraySigned, element 256 */
-        sofab::IStreamObject<U8Arr> in;
+        sofab::IStreamObject<U8Arr> in{kMaxSpan};
         auto r = in.feed(bytes, sizeof bytes);
         CHECK(r.code() == sofab::Error::None && r.skipped() == 1,
               "§7.1: a contradicting array kind is skipped, never width-checked (§7.3)");
@@ -1239,7 +1260,7 @@ static void elementWidthBound()
      *    its count word, before any element is looked at. */
     {
         const uint8_t bytes[] = {0x7b, 0x06, 1, 2, 3, 4, 5, 6};
-        sofab::IStreamObject<U8Arr> in;
+        sofab::IStreamObject<U8Arr> in{kMaxSpan};
         CHECK(in.feed(bytes, sizeof bytes).code() == sofab::Error::InvalidMessage,
               "§7.1: the count bound still applies ahead of the element bound");
     }
@@ -1249,7 +1270,7 @@ static void elementWidthBound()
      *      The elements before the cut are in width, so nothing else fires. ---- */
     {
         const uint8_t bytes[] = {0x7b, 0x04, 1, 2};
-        sofab::IStreamObject<U8Arr> in;
+        sofab::IStreamObject<U8Arr> in{kMaxSpan};
         CHECK(in.feed(bytes, sizeof bytes).code() == sofab::Error::Incomplete,
               "§7.1: a truncated in-width array stays INCOMPLETE");
     }
@@ -1257,7 +1278,7 @@ static void elementWidthBound()
      *    the same way the count bound does (INVALID dominates INCOMPLETE). */
     {
         const uint8_t bytes[] = {0x7b, 0x04, 0x80, 0x02};
-        sofab::IStreamObject<U8Arr> in;
+        sofab::IStreamObject<U8Arr> in{kMaxSpan};
         CHECK(in.feed(bytes, sizeof bytes).code() == sofab::Error::InvalidMessage,
               "§7.1: an over-width element decides before the truncation");
     }
@@ -1265,7 +1286,7 @@ static void elementWidthBound()
      *    re-delivered whole, so the verdict is the same as in one chunk. */
     {
         const uint8_t bytes[] = {0x7b, 0x04, 1, 2, 3, 0x80, 0x02};
-        sofab::IStreamObject<U8Arr> in;
+        sofab::IStreamObject<U8Arr> in{kMaxSpan};
         CHECK(in.feed(bytes, 3).code() == sofab::Error::Incomplete,
               "§7.1: the leading chunk of the array buffers as INCOMPLETE");
         CHECK(in.feed(bytes + 3, sizeof bytes - 3).code() == sofab::Error::InvalidMessage,
@@ -1278,19 +1299,19 @@ static void elementWidthBound()
         {
             std::vector<uint16_t> u;
             void deserialize(sofab::IStreamImpl &is, sofab::id id, size_t, size_t) noexcept override
-            { if (id == 15) sofab::readArray(is, u, 4, -1, sofab::ElemBound::of<uint16_t>()); }
+            { if (id == 15) sofab::readArray(is, u, 4, sofab::ElemBound::of<uint16_t>()); }
         };
         checkStreamReuse<VecArr>("elementWidthBound/VecArr");
         {   /* 65535 = ff ff 03 */
             const uint8_t bytes[] = {0x7b, 0x02, 0xff, 0xff, 0x03, 7};
-            sofab::IStreamObject<VecArr> in;
+            sofab::IStreamObject<VecArr> in{kMaxSpan};
             auto r = in.feed(bytes, sizeof bytes);
             CHECK((r.code() == sofab::Error::None && (*in).u == std::vector<uint16_t>{65535, 7}),
                   "§7.1: a dynamic destination decodes its in-width elements");
         }
         {   /* 65536 = 80 80 04 */
             const uint8_t bytes[] = {0x7b, 0x02, 0x80, 0x80, 0x04, 7};
-            sofab::IStreamObject<VecArr> in;
+            sofab::IStreamObject<VecArr> in{kMaxSpan};
             CHECK(in.feed(bytes, sizeof bytes).code() == sofab::Error::InvalidMessage,
                   "§7.1: a dynamic destination rejects an over-width element");
         }
@@ -1302,25 +1323,25 @@ static void elementWidthBound()
         {
             std::array<int32_t, 2> i{};
             void deserialize(sofab::IStreamImpl &is, sofab::id id, size_t, size_t) noexcept override
-            { if (id == 15) sofab::readArray(is, i, 2, -1, sofab::ElemBound{-10, 10}); }
+            { if (id == 15) sofab::readArray(is, i, 2, sofab::ElemBound{-10, 10}); }
         };
         checkStreamReuse<RangedArr>("elementWidthBound/RangedArr");
         {   /* -10, 10 -> zig-zag 19 (13), 20 (14) */
             const uint8_t bytes[] = {0x7c, 0x02, 19, 20};
-            sofab::IStreamObject<RangedArr> in;
+            sofab::IStreamObject<RangedArr> in{kMaxSpan};
             auto r = in.feed(bytes, sizeof bytes);
             CHECK(r.code() == sofab::Error::None && ((*in).i == std::array<int32_t, 2>{-10, 10}),
                   "§7.1: an explicit range admits its endpoints");
         }
         {   /* 11 -> zig-zag 22 */
             const uint8_t bytes[] = {0x7c, 0x01, 22};
-            sofab::IStreamObject<RangedArr> in;
+            sofab::IStreamObject<RangedArr> in{kMaxSpan};
             CHECK(in.feed(bytes, sizeof bytes).code() == sofab::Error::InvalidMessage,
                   "§7.1: an explicit range rejects one past its top");
         }
         {   /* -11 -> zig-zag 21 */
             const uint8_t bytes[] = {0x7c, 0x01, 21};
-            sofab::IStreamObject<RangedArr> in;
+            sofab::IStreamObject<RangedArr> in{kMaxSpan};
             CHECK(in.feed(bytes, sizeof bytes).code() == sofab::Error::InvalidMessage,
                   "§7.1: an explicit range rejects one below its bottom");
         }
@@ -1354,7 +1375,7 @@ static void callbackExceedLimit()
     /* Control: count within the cap decodes COMPLETE. */
     {
         const uint8_t bytes[] = {0x03, 0x04, 1, 2, 3, 4};
-        sofab::IStreamObject<CappedArr> in;
+        sofab::IStreamObject<CappedArr> in{kMaxSpan};
         auto r = in.feed(bytes, sizeof bytes);
         CHECK(r.code() == sofab::Error::None, "exceedLimit: count within cap stays COMPLETE");
         CHECK(((*in).u == std::array<uint32_t, 8>{1, 2, 3, 4, 0, 0, 0, 0}), "exceedLimit: control values decoded");
@@ -1364,7 +1385,7 @@ static void callbackExceedLimit()
      * returns LimitExceeded — not InvalidMessage (the bytes are well-formed). */
     {
         const uint8_t bytes[] = {0x03, 0x05, 1, 2, 3, 4, 5};
-        sofab::IStreamObject<CappedArr> in;
+        sofab::IStreamObject<CappedArr> in{kMaxSpan};
         auto r = in.feed(bytes, sizeof bytes);
         CHECK(r.code() == sofab::Error::LimitExceeded, "exceedLimit: over-cap array is LimitExceeded");
         CHECK(r.limitExceeded() && !r.invalid() && !r.complete() && !r.incomplete(), "exceedLimit: predicates report LimitExceeded");
@@ -1373,7 +1394,7 @@ static void callbackExceedLimit()
     /* Dispatch stops at the over-cap field: nothing after it is delivered. */
     {
         const uint8_t bytes[] = {0x03, 0x05, 1, 2, 3, 4, 5, 0x08, 0x2a}; /* then id1 unsigned 42 */
-        sofab::IStreamObject<CappedArr> in;
+        sofab::IStreamObject<CappedArr> in{kMaxSpan};
         auto r = in.feed(bytes, sizeof bytes);
         CHECK(r.code() == sofab::Error::LimitExceeded, "exceedLimit: LimitExceeded with a trailing field");
         CHECK((*in).delivered == 1, "exceedLimit: no field delivered past the over-cap one");
@@ -1412,7 +1433,7 @@ static void wireTypeGuard()
     /* Correctly typed: id 0, Unsigned, value 6 -> read as 6. */
     {
         const uint8_t bytes[] = {0x00, 0x06};
-        sofab::IStreamObject<GuardedU> in;
+        sofab::IStreamObject<GuardedU> in{kMaxSpan};
         auto r = in.feed(bytes, sizeof bytes);
         CHECK(r.code() == sofab::Error::None, "wire-guard: correctly-typed field is COMPLETE");
         CHECK((*in).read && (*in).v == 6, "wire-guard: matching wire type reads the value");
@@ -1424,7 +1445,7 @@ static void wireTypeGuard()
      * COMPLETE (a skip is not an error). */
     {
         const uint8_t bytes[] = {0x01, 0x06};
-        sofab::IStreamObject<GuardedU> in;
+        sofab::IStreamObject<GuardedU> in{kMaxSpan};
         auto r = in.feed(bytes, sizeof bytes);
         CHECK(r.code() == sofab::Error::None, "wire-guard: mismatched field skipped, still COMPLETE");
         CHECK(!(*in).read && (*in).v == 0xABCD, "wire-guard: mismatched wire type is not read (no silent mis-decode)");
@@ -1445,7 +1466,7 @@ static void wireTypeGuard()
         };
         checkStreamReuse<UnguardedU>("wireTypeGuard/UnguardedU");
         const uint8_t bytes[] = {0x01, 0x06}; /* Signed, zig-zag 6 = 3 */
-        sofab::IStreamObject<UnguardedU> in;
+        sofab::IStreamObject<UnguardedU> in{kMaxSpan};
         auto r = in.feed(bytes, sizeof bytes);
         CHECK(r.code() == sofab::Error::None, "read-seam: a skipped mismatch stays COMPLETE");
         CHECK((*in).v == 0 && !(*in).taken, "read-seam: read() skips a mismatched wire type (no silent mis-decode)");
@@ -1467,7 +1488,7 @@ static void wireTypeGuard()
         };
         checkStreamReuse<TwoU>("wireTypeGuard/TwoU");
         const uint8_t bytes[] = {0x01, 0x06, 0x09, 0x06}; /* id0 Signed, id1 Signed */
-        sofab::IStreamObject<TwoU> in;
+        sofab::IStreamObject<TwoU> in{kMaxSpan};
         auto r1 = in.feed(bytes, 2);
         CHECK(r1.skipped() == 1, "read-seam: first chunk reports its skip");
         auto r2 = in.feed(bytes + 2, 2);
@@ -1487,7 +1508,7 @@ static void wireTypeGuard()
      * The last case is the residual limit: a callback that decides NOT to read is
      * indistinguishable from one that is uninterested, so a hand-written guard
      * hides its own skip. Generated code no longer does this anywhere — since
-     * readArray()/prepare() folded the array reset behind the tag match, every
+     * readArrayCapped(, kAnyCount)/prepare() folded the array reset behind the tag match, every
      * generated arm reaches a read — but a hand-written caller that guards by
      * hand still opts itself out of the diagnostic. The counter therefore never
      * reports a skip that did not happen. */
@@ -1521,7 +1542,7 @@ static void wireTypeGuard()
         };
         for (const auto &c : cases)
         {
-            sofab::IStreamObject<Watched> in;
+            sofab::IStreamObject<Watched> in{kMaxSpan};
             auto r = in.feed(c.bytes, c.n);
             CHECK(r.code() == sofab::Error::None, "skip-count: the probe message decodes COMPLETE");
             CHECK(r.skipped() == c.want, c.what);
@@ -1545,7 +1566,7 @@ static void wireTypeGuard()
         };
         checkStreamReuse<TwoFields>("wireTypeGuard/TwoFields");
         const uint8_t bytes[] = {0x01, 0x06, 0x09, 0x53};
-        sofab::IStreamObject<TwoFields> in;
+        sofab::IStreamObject<TwoFields> in{kMaxSpan};
         auto r = in.feed(bytes, sizeof bytes);
         CHECK(r.code() == sofab::Error::None, "wire-guard: skip-then-resync is COMPLETE");
         CHECK(!(*in).readA, "wire-guard: first (mismatched) field skipped");
@@ -1573,7 +1594,7 @@ static void wireTypeGuard()
         /* delivered as fp32 (0x2a = id5|Fixlen, 0x20 = len4|Fp32, then 4 bytes) -> skip. */
         {
             const uint8_t bytes[] = {0x2a, 0x20, 0x00, 0x00, 0x00, 0x00};
-            sofab::IStreamObject<GuardedStr> in;
+            sofab::IStreamObject<GuardedStr> in{kMaxSpan};
             auto r = in.feed(bytes, sizeof bytes);
             CHECK(r.code() == sofab::Error::None, "wire-guard: fp32-for-string skipped, still COMPLETE");
             CHECK(!(*in).read && (*in).s == "def", "wire-guard: wrong fixlen subtype is not read");
@@ -1581,7 +1602,7 @@ static void wireTypeGuard()
         /* delivered as string (0x12 = len2|String, "hi") -> read. */
         {
             const uint8_t bytes[] = {0x2a, 0x12, 'h', 'i'};
-            sofab::IStreamObject<GuardedStr> in;
+            sofab::IStreamObject<GuardedStr> in{kMaxSpan};
             auto r = in.feed(bytes, sizeof bytes);
             CHECK(r.code() == sofab::Error::None, "wire-guard: matching fixlen subtype is COMPLETE");
             CHECK((*in).read && (*in).s == "hi", "wire-guard: matching fixlen subtype reads the value");
@@ -1642,7 +1663,7 @@ static void wireTypeGuard()
 
         for (const auto &c : cases)
         {
-            sofab::IStreamObject<StrBinder> in;
+            sofab::IStreamObject<StrBinder> in{kMaxSpan};
             auto r = in.feed(c.bytes.data(), c.bytes.size());
             CHECK(r.code() == sofab::Error::None, c.what);
             CHECK((*in).taken == c.taken, c.what);
@@ -1654,7 +1675,7 @@ static void wireTypeGuard()
 
     /* The RAW read(void*, size_t) overload is a typed read too (issue #80).
      *
-     * It binds a `blob`, so §7.3 applies to it exactly as to readBlob(): a field
+     * It binds a `blob`, so §7.3 applies to it exactly as to readBlobCapped(, kAnyLen): a field
      * whose tag contradicts must be SKIPPED — destination untouched, decode still
      * COMPLETE, the following fields still delivered. Without the tag check the
      * overload used fixLen_ blindly, which is 0 for an integer field (cursor does
@@ -1717,7 +1738,7 @@ static void wireTypeGuard()
 
         for (const auto &c : cases)
         {
-            sofab::IStreamObject<RawBlobBinder> in;
+            sofab::IStreamObject<RawBlobBinder> in{kMaxSpan};
             auto r = in.feed(c.bytes.data(), c.bytes.size());
             CHECK(r.code() == sofab::Error::None, c.what);
             CHECK((*in).ids == c.ids, c.what);
@@ -1749,7 +1770,7 @@ static void wireTypeGuard()
             { w.push_back(is.wire()); f.push_back(is.fixType()); } /* no read(): fields auto-skip */
         };
         checkStreamReuse<Recorder>("wireTypeGuard/Recorder");
-        sofab::IStreamObject<Recorder> in;
+        sofab::IStreamObject<Recorder> in{kMaxSpan};
         auto r = in.feed(os.data(), os.bytesUsed());
         CHECK(r.code() == sofab::Error::None, "accessor: readout message is COMPLETE");
         CHECK((*in).w.size() == 4, "accessor: all four fields delivered");
@@ -1804,7 +1825,7 @@ static void zeroLengthForms()
 
     for (int pass = 0; pass < 2; ++pass)
     {
-        sofab::IStreamObject<EmptyArrMsg> in;
+        sofab::IStreamObject<EmptyArrMsg> in{kMaxSpan};
         if (pass == 0)
             in.feed(os.data(), os.bytesUsed());
         else
@@ -1828,7 +1849,7 @@ static void zeroLengthForms()
             { if (id == 2) sofab::read(is, t); }
         };
         checkStreamReuse<OnlyTail>("zeroLengthForms/OnlyTail");
-        sofab::IStreamObject<OnlyTail> in;
+        sofab::IStreamObject<OnlyTail> in{kMaxSpan};
         in.feed(seq.data(), seq.bytesUsed());
         CHECK((*in).t == -7, "empty sequence: resync after empty sub-sequence");
     }
@@ -2321,7 +2342,7 @@ static void maxDepth()
             void deserialize(sofab::IStreamImpl &, sofab::id, size_t, size_t) noexcept override {}
         };
         checkStreamReuse<Empty>("maxDepth/Empty");
-        sofab::IStreamObject<Empty> in;
+        sofab::IStreamObject<Empty> in{kMaxSpan};
         auto r = in.feed(deep.data(), deep.size());
         CHECK(r.code() == sofab::Error::InvalidMessage, "decoder rejects nesting past MAX_DEPTH");
     }
@@ -2403,7 +2424,7 @@ static void bufferLimits()
     {
         std::vector<uint8_t> hdr = {0x2a};
         appendVarint(hdr, (static_cast<uint64_t>(1u << 20) << 3) | 2u);
-        sofab::IStreamObject<ScalarMsg> in; /* default: uncapped */
+        sofab::IStreamObject<ScalarMsg> in{kMaxSpan}; /* default: uncapped */
         auto r = in.feed(hdr.data(), hdr.size());
         CHECK(r.code() == sofab::Error::Incomplete, "limit: without a cap the oversize header stays INCOMPLETE");
     }
@@ -2414,7 +2435,7 @@ static void bufferLimits()
         std::string big(4000, 'x');
         sofab::OStreamInline<8192> os;
         os.write(5, std::string_view{big});
-        sofab::IStreamObject<ScalarMsg> in; /* default: uncapped */
+        sofab::IStreamObject<ScalarMsg> in{kMaxSpan}; /* default: uncapped */
         auto r = in.feed(os.data(), os.bytesUsed());
         CHECK(r.code() == sofab::Error::None, "limit: default (no cap) decodes a large field COMPLETE");
         CHECK((*in).s == big, "limit: uncapped large field round-trips");
@@ -2472,7 +2493,7 @@ struct BoundedMsg : sofab::IStreamMessage
             case 1: sofab::readString(is, s, 4); break;
             case 2: sofab::readArray(is, a, 4);  break;
             case 3: sofab::read(is, u);          break;
-            case 4: sofab::readArray(is, v);     break;
+            case 4: sofab::readArrayCapped(is, v, kAnyCount);     break;
         }
     }
 };
@@ -2486,7 +2507,7 @@ static void schemaBoundOutranksCap()
      * the verdict into a policy rejection. */
     const std::vector<uint8_t> overMaxlen = {0x0a, 0xa2, 0x06}; /* id1 fixlen string, len 100 */
     {
-        sofab::IStreamObject<BoundedMsg> in; /* uncapped: the reference verdict */
+        sofab::IStreamObject<BoundedMsg> in{kMaxSpan}; /* uncapped: the reference verdict */
         CHECK(in.feed(overMaxlen.data(), overMaxlen.size()).code() == sofab::Error::InvalidMessage,
               "bound-vs-cap: an over-maxlen string is INVALID with no cap set");
     }
@@ -2590,9 +2611,9 @@ struct TierMsg : sofab::IStreamMessage
         switch (id)
         {
             case 1: sofab::readString(is, bounded, 4); break;
-            case 2: sofab::readString(is, plain);      break;
-            case 3: sofab::readBlob(is, blob);         break;
-            case 4: sofab::readArray(is, arr, -1, dynCap); break;
+            case 2: sofab::readStringCapped(is, plain, kAnyLen);      break;
+            case 3: sofab::readBlobCapped(is, blob, kAnyLen);         break;
+            case 4: sofab::readArrayCapped(is, arr, dynCap); break;
         }
     }
 };
@@ -2630,17 +2651,17 @@ struct GrowMsg : sofab::IStreamMessage
         if (viaHelper)
             switch (id)
             {
-                case 1: (void)sofab::readString(is, text); break;
-                case 2: (void)sofab::readBlob(is, bytes);  break;
-                case 3: (void)sofab::readArray(is, nums);  break;
+                case 1: (void)sofab::readStringCapped(is, text, kAnyLen); break;
+                case 2: (void)sofab::readBlobCapped(is, bytes, kAnyLen);  break;
+                case 3: (void)sofab::readArrayCapped(is, nums, kAnyCount);  break;
                 default: break;
             }
         else
             switch (id)
             {
-                case 1: (void)is.readString(text); break;
-                case 2: (void)is.readBlob(bytes);  break;
-                case 3: (void)is.readArray(nums);  break;
+                case 1: (void)is.readStringCapped(text, kAnyLen); break;
+                case 2: (void)is.readBlobCapped(bytes, kAnyLen);  break;
+                case 3: (void)is.readArrayCapped(nums, kAnyCount);  break;
                 default: break;
             }
     }
@@ -2664,7 +2685,7 @@ static void destinationIsNeverGrown()
         const std::vector<uint8_t> one =
             field == 1 ? fromHex("0a22736f6661")
                        : (field == 2 ? fromHex("121b010203") : fromHex("1b020708"));
-        auto in = std::make_unique<sofab::IStreamObject<GrowMsg>>();
+        auto in = std::make_unique<sofab::IStreamObject<GrowMsg>>(kMaxSpan);
         const unsigned long before = g_allocCount;
         const auto r = in->feed(one.data(), one.size());
         CHECK(r.code() == sofab::Error::InvalidArgument && r.invalidArgument(),
@@ -2679,7 +2700,7 @@ static void destinationIsNeverGrown()
 
     /* --- 2. the same bytes through the helper layer, which sizes ------------ */
     {
-        auto in = std::make_unique<sofab::IStreamObject<GrowMsg>>();
+        auto in = std::make_unique<sofab::IStreamObject<GrowMsg>>(kMaxSpan);
         (**in).viaHelper = true;
         CHECK(in->feed(wire.data(), wire.size()).code() == sofab::Error::None,
               "no-grow: the helper layer sizes the destination and the message decodes");
@@ -2691,7 +2712,7 @@ static void destinationIsNeverGrown()
     /* --- 3. a destination the CALLER sized: the codec fills it and allocates
      *        nothing, which is the whole point of moving the sizing out. ----- */
     {
-        auto in = std::make_unique<sofab::IStreamObject<GrowMsg>>();
+        auto in = std::make_unique<sofab::IStreamObject<GrowMsg>>(kMaxSpan);
         (**in).text.resize(4);
         (**in).bytes.resize(3);
         (**in).nums.resize(2);
@@ -2708,7 +2729,7 @@ static void destinationIsNeverGrown()
     /* --- 4. over-sized by the caller: the decoded length is `M`, published as
      *        a shrink -- never a grow, and never a silent surplus. ----------- */
     {
-        auto in = std::make_unique<sofab::IStreamObject<GrowMsg>>();
+        auto in = std::make_unique<sofab::IStreamObject<GrowMsg>>(kMaxSpan);
         (**in).text.assign(64, 'x');
         (**in).bytes.assign(64, 0xee);
         (**in).nums.assign(64, 0xffffffffu);
@@ -2725,7 +2746,7 @@ static void destinationIsNeverGrown()
      *        before the tag has spoken. Field id 1 arrives as a `blob`, which a
      *        readString declines. --- */
     {
-        auto in = std::make_unique<sofab::IStreamObject<GrowMsg>>();
+        auto in = std::make_unique<sofab::IStreamObject<GrowMsg>>(kMaxSpan);
         (**in).viaHelper = true;
         const auto mistyped = fromHex("0a23736f6661"); /* id 1, fixlen, subtype blob */
         CHECK(in->feed(mistyped.data(), mistyped.size()).code() == sofab::Error::None,
@@ -2773,17 +2794,17 @@ struct DynCapMsg : sofab::IStreamMessage
         if (viaHelper)
             switch (id)
             {
-                case 1: (void)sofab::readString(is, text, -1, strCap); break;
-                case 2: (void)sofab::readBlob(is, bytes, -1, blobCap); break;
-                case 3: (void)sofab::readString(is, bounded, 32, strCap); break;
+                case 1: (void)sofab::readStringCapped(is, text, strCap); break;
+                case 2: (void)sofab::readBlobCapped(is, bytes, blobCap); break;
+                case 3: (void)sofab::readString(is, bounded, 32); break;
                 default: break;
             }
         else
             switch (id)
             {
-                case 1: (void)is.readString(text, -1, strCap); break;
-                case 2: (void)is.readBlob(bytes, -1, blobCap); break;
-                case 3: (void)is.readString(bounded, 32, strCap); break;
+                case 1: (void)is.readStringCapped(text, strCap); break;
+                case 2: (void)is.readBlobCapped(bytes, blobCap); break;
+                case 3: (void)is.readString(bounded, 32); break;
                 default: break;
             }
     }
@@ -2806,7 +2827,7 @@ static void receiverCapAtTheRead()
      *        64 announced bytes under a cap of 16. --- */
     {
         const auto w = field(1, kStr, 64, 'x');
-        auto in = std::make_unique<sofab::IStreamObject<DynCapMsg>>();
+        auto in = std::make_unique<sofab::IStreamObject<DynCapMsg>>(kMaxSpan);
         (**in).strCap = 16;
         const unsigned long before = g_allocCount;
         const auto r = in->feed(w.data(), w.size());
@@ -2820,7 +2841,7 @@ static void receiverCapAtTheRead()
     }
     {
         const auto w = field(2, kBlob, 64, 0xab);
-        auto in = std::make_unique<sofab::IStreamObject<DynCapMsg>>();
+        auto in = std::make_unique<sofab::IStreamObject<DynCapMsg>>(kMaxSpan);
         (**in).blobCap = 16;
         const unsigned long before = g_allocCount;
         const auto r = in->feed(w.data(), w.size());
@@ -2833,7 +2854,7 @@ static void receiverCapAtTheRead()
     /* --- 2. under the cap the same field decodes, destination and all. --- */
     {
         const auto w = field(1, kStr, 64, 'x');
-        auto in = std::make_unique<sofab::IStreamObject<DynCapMsg>>();
+        auto in = std::make_unique<sofab::IStreamObject<DynCapMsg>>(kMaxSpan);
         (**in).strCap = 128;
         CHECK(in->feed(w.data(), w.size()).complete(),
               "cap-at-read: a field inside the cap decodes COMPLETE");
@@ -2846,7 +2867,7 @@ static void receiverCapAtTheRead()
      *        even though 64 is far past it. --- */
     {
         const auto w = field(1, kBlob, 64, 0xab);
-        auto in = std::make_unique<sofab::IStreamObject<DynCapMsg>>();
+        auto in = std::make_unique<sofab::IStreamObject<DynCapMsg>>(kMaxSpan);
         (**in).strCap = 16;
         const auto r = in->feed(w.data(), w.size());
         CHECK(r.complete() && !r.limitExceeded(),
@@ -2856,7 +2877,7 @@ static void receiverCapAtTheRead()
     }
     {
         const auto w = field(2, kStr, 64, 'x'); /* a string arriving at the blob read */
-        auto in = std::make_unique<sofab::IStreamObject<DynCapMsg>>();
+        auto in = std::make_unique<sofab::IStreamObject<DynCapMsg>>(kMaxSpan);
         (**in).blobCap = 16;
         const auto r = in->feed(w.data(), w.size());
         CHECK(r.complete() && !r.limitExceeded(),
@@ -2868,7 +2889,7 @@ static void receiverCapAtTheRead()
      *        of 16 must have nothing to say about it (§6.2.1). --- */
     {
         const auto w = field(3, kStr, 24, 'y');
-        auto in = std::make_unique<sofab::IStreamObject<DynCapMsg>>();
+        auto in = std::make_unique<sofab::IStreamObject<DynCapMsg>>(kMaxSpan);
         (**in).strCap = 16;
         CHECK(in->feed(w.data(), w.size()).complete(),
               "cap-at-read: a schema-bounded field is not subject to the receiver cap");
@@ -2877,7 +2898,7 @@ static void receiverCapAtTheRead()
     {
         /* and past the schema bound it is INVALID, never LimitExceeded */
         const auto w = field(3, kStr, 40, 'y');
-        auto in = std::make_unique<sofab::IStreamObject<DynCapMsg>>();
+        auto in = std::make_unique<sofab::IStreamObject<DynCapMsg>>(kMaxSpan);
         (**in).strCap = 16;
         const auto r = in->feed(w.data(), w.size());
         CHECK(r.invalid() && !r.limitExceeded(),
@@ -2888,7 +2909,7 @@ static void receiverCapAtTheRead()
      *        cannot drift ("One implementation, wherever it runs"). --- */
     {
         const auto w = field(1, kStr, 64, 'x');
-        auto in = std::make_unique<sofab::IStreamObject<DynCapMsg>>();
+        auto in = std::make_unique<sofab::IStreamObject<DynCapMsg>>(kMaxSpan);
         (**in).viaHelper = false;
         (**in).strCap = 16;
         const unsigned long before = g_allocCount;
@@ -2900,27 +2921,36 @@ static void receiverCapAtTheRead()
     }
     {
         const auto w = field(1, kBlob, 64, 0xab);
-        auto in = std::make_unique<sofab::IStreamObject<DynCapMsg>>();
+        auto in = std::make_unique<sofab::IStreamObject<DynCapMsg>>(kMaxSpan);
         (**in).viaHelper = false;
         (**in).strCap = 16;
         CHECK(in->feed(w.data(), w.size()).complete(),
               "cap-at-read: and skips a §7.3-mistyped field ahead of the cap, as the helper does");
     }
 
-    /* --- 6. no cap passed means NO CAP -- not "unlimited by default", and not a
-     *        format ceiling dressed up as a receiver limit. §6.2.1: a codec "MUST
-     *        NOT supply a default for one it was not given" and "A format ceiling
-     *        reached because no cap was stated is the FORMAT's bound, not a
-     *        receiver cap, and a port MUST NOT present it as one." The library
-     *        holds no `max_dyn_*` number at all, so there is nothing to fire. --- */
+    /* --- 6. no cap passed is REFUSED, not obeyed. §6.2.1: a codec "MUST NOT
+     *        supply a default for one it was not given, MUST NOT read an omitted
+     *        argument as *unlimited*", and "A format ceiling reached because no
+     *        cap was stated is the FORMAT's bound, not a receiver cap, and a port
+     *        MUST NOT present it as one." There is nothing to fall back on, so the
+     *        one honest answer left is §6.3's InvalidArgument: a mistake in the
+     *        CALL, not in the message and not in the deployment.
+     *
+     *        This is the case that used to decode a 64-byte schema-unbounded
+     *        string bounded by nothing at all, and pass. Asserting the verdict is
+     *        not enough on its own -- the destination must also be untouched, or
+     *        a refusal that materialised the value first would still pass. --- */
     {
         const auto w = field(1, kStr, 64, 'x');
-        auto in = std::make_unique<sofab::IStreamObject<DynCapMsg>>();
+        auto in = std::make_unique<sofab::IStreamObject<DynCapMsg>>(kMaxSpan);
         /* strCap left at -1: the caller stated nothing */
+        const unsigned long before = g_allocBytes;
         const auto r = in->feed(w.data(), w.size());
-        CHECK(r.complete() && !r.limitExceeded(),
-              "cap-at-read: with no cap passed the codec invents none");
-        CHECK((**in).text.size() == 64, "cap-at-read: and the field decodes");
+        CHECK(r.invalidArgument() && !r.limitExceeded() && !r.invalid(),
+              "cap-at-read: a schema-unbounded read with no cap is InvalidArgument");
+        CHECK((**in).text.empty(), "cap-at-read: and the value was never materialised");
+        CHECK(g_allocBytes - before < 64,
+              "cap-at-read: and the destination was never sized from the wire");
     }
 
 }
@@ -2938,7 +2968,7 @@ static void refusalTiers()
      * the FixedString<8> destination could hold perfectly well. */
     {
         const auto w = fixlen(0x0a, sofab::detail::Fix::String, "12345");
-        sofab::IStreamObject<TierMsg> in;
+        sofab::IStreamObject<TierMsg> in{kMaxSpan};
         auto r = in.feed(w.data(), w.size());
         CHECK(r.code() == sofab::Error::InvalidMessage && r.invalid(),
               "tiers: past the schema maxlen is InvalidMessage");
@@ -2962,7 +2992,7 @@ static void refusalTiers()
         std::vector<uint8_t> w = {0x23}; /* id 4, array-unsigned */
         appendVarint(w, 3);
         for (uint32_t v : {1u, 2u, 3u}) appendVarint(w, v);
-        sofab::IStreamObject<TierMsg> in;
+        sofab::IStreamObject<TierMsg> in{kMaxSpan};
         (*in).dynCap = 2;
         auto r = in.feed(w.data(), w.size());
         CHECK(r.code() == sofab::Error::LimitExceeded && !r.invalid() && !r.invalidArgument(),
@@ -2973,7 +3003,7 @@ static void refusalTiers()
      * reproach and only this caller's storage is too small. */
     {
         const auto w = fixlen(0x12, sofab::detail::Fix::String, "123456789");
-        sofab::IStreamObject<TierMsg> in;
+        sofab::IStreamObject<TierMsg> in{kMaxSpan};
         auto r = in.feed(w.data(), w.size());
         CHECK(r.code() == sofab::Error::InvalidArgument && r.invalidArgument(),
               "tiers: a string past the destination capacity is InvalidArgument");
@@ -2985,7 +3015,7 @@ static void refusalTiers()
     }
     {
         const auto w = fixlen(0x1a, sofab::detail::Fix::Blob, "123456789");
-        sofab::IStreamObject<TierMsg> in;
+        sofab::IStreamObject<TierMsg> in{kMaxSpan};
         auto r = in.feed(w.data(), w.size());
         CHECK(r.code() == sofab::Error::InvalidArgument,
               "tiers: a blob past the destination capacity is InvalidArgument");
@@ -2995,7 +3025,7 @@ static void refusalTiers()
         std::vector<uint8_t> w = {0x23}; /* id 4, array-unsigned, 5 elements > capacity 4 */
         appendVarint(w, 5);
         for (uint32_t v : {1u, 2u, 3u, 4u, 5u}) appendVarint(w, v);
-        sofab::IStreamObject<TierMsg> in;
+        sofab::IStreamObject<TierMsg> in{kMaxSpan};
         auto r = in.feed(w.data(), w.size());
         CHECK(r.code() == sofab::Error::InvalidArgument && !r.limitExceeded() && !r.invalid(),
               "tiers: an array past the destination capacity is InvalidArgument");
@@ -3006,7 +3036,7 @@ static void refusalTiers()
      * same bytes dribbled one at a time reach the same code. */
     {
         const auto w = fixlen(0x12, sofab::detail::Fix::String, "123456789");
-        sofab::IStreamObject<TierMsg> in;
+        sofab::IStreamObject<TierMsg> in{kMaxSpan};
         sofab::Error last = sofab::Error::None;
         for (size_t i = 0; i < w.size(); ++i)
         {
@@ -3033,7 +3063,7 @@ static void refusalTiers()
     /* A value that fits every tier is untouched by any of this. */
     {
         const auto w = fixlen(0x12, sofab::detail::Fix::String, "12345678");
-        sofab::IStreamObject<TierMsg> in;
+        sofab::IStreamObject<TierMsg> in{kMaxSpan};
         CHECK(in.feed(w.data(), w.size()).code() == sofab::Error::None,
               "tiers: a value inside every tier decodes COMPLETE");
         CHECK((*in).plain.view() == "12345678", "tiers: and lands in the destination");
@@ -3183,7 +3213,7 @@ static void strictUtf8()
         sofab::OStreamInline<64> os;
         auto w = os.write(5, std::string_view{s});
         CHECK(w.code() == sofab::Error::None, "utf8: valid multibyte string encodes");
-        sofab::IStreamObject<ScalarMsg> in;
+        sofab::IStreamObject<ScalarMsg> in{kMaxSpan};
         auto r = in.feed(os.data(), os.bytesUsed());
         CHECK(r.code() == sofab::Error::None, "utf8: valid multibyte string decodes COMPLETE");
         CHECK((*in).s == s, "utf8: valid multibyte string round-trips identically");
@@ -3195,7 +3225,7 @@ static void strictUtf8()
         sofab::OStreamInline<64> os;
         auto w = os.write(5, std::string_view{s});
         CHECK(w.code() == sofab::Error::None, "utf8: embedded-NUL string encodes");
-        sofab::IStreamObject<ScalarMsg> in;
+        sofab::IStreamObject<ScalarMsg> in{kMaxSpan};
         auto r = in.feed(os.data(), os.bytesUsed());
         CHECK(r.code() == sofab::Error::None, "utf8: embedded-NUL string decodes COMPLETE");
         CHECK((*in).s == s, "utf8: embedded-NUL string round-trips (4 bytes, no truncation)");
@@ -3205,7 +3235,7 @@ static void strictUtf8()
      *     completes to COMPLETE — a chunk boundary never forces INVALID. --- */
     {
         auto w = stringFieldWire("\xE2\x82\xAC", sofab::detail::Fix::String); /* 5 bytes total */
-        sofab::IStreamObject<ScalarMsg> in;
+        sofab::IStreamObject<ScalarMsg> in{kMaxSpan};
         auto r1 = in.feed(w.data(), w.size() - 1); /* split mid-sequence (E2 82 | AC) */
         CHECK(r1.code() == sofab::Error::Incomplete, "utf8: cross-chunk split is INCOMPLETE, not INVALID");
         auto r2 = in.feed(w.data() + w.size() - 1, 1);
@@ -3229,7 +3259,7 @@ static void strictUtf8()
     /* --- decode rejects an invalid-UTF-8 materialised string as INVALID. --- */
     {
         auto w = stringFieldWire("\xC0\x80", sofab::detail::Fix::String);
-        sofab::IStreamObject<ScalarMsg> in;
+        sofab::IStreamObject<ScalarMsg> in{kMaxSpan};
         auto r = in.feed(w.data(), w.size());
         CHECK(r.code() == sofab::Error::InvalidMessage, "utf8/strict: decode rejects C0 80 string as INVALID");
         CHECK(r.invalid() && r.status() == sofab::DecodeStatus::Invalid, "utf8/strict: decode reject maps to Invalid status");
@@ -3237,7 +3267,7 @@ static void strictUtf8()
     {
         /* truncated-at-end-of-payload (declared length reached mid-sequence) is INVALID. */
         auto w = stringFieldWire("\xE2\x82", sofab::detail::Fix::String);
-        sofab::IStreamObject<ScalarMsg> in;
+        sofab::IStreamObject<ScalarMsg> in{kMaxSpan};
         auto r = in.feed(w.data(), w.size());
         CHECK(r.code() == sofab::Error::InvalidMessage, "utf8/strict: truncated-at-end string is INVALID");
     }
@@ -3249,7 +3279,7 @@ static void strictUtf8()
         };
         checkStreamReuse<SkipAll>("strictUtf8/SkipAll");
         auto w = stringFieldWire("\xC0\x80", sofab::detail::Fix::String);
-        sofab::IStreamObject<SkipAll> in;
+        sofab::IStreamObject<SkipAll> in{kMaxSpan};
         auto r = in.feed(w.data(), w.size());
         CHECK(r.code() == sofab::Error::None, "utf8/strict: a SKIPPED invalid-UTF-8 string is not validated (COMPLETE)");
     }
@@ -3264,7 +3294,7 @@ static void strictUtf8()
     {
         /* a Blob-subtype fixlen read into a std::string is not validated. */
         auto w = stringFieldWire("\xC0\x80", sofab::detail::Fix::Blob);
-        sofab::IStreamObject<ScalarMsg> in;
+        sofab::IStreamObject<ScalarMsg> in{kMaxSpan};
         auto r = in.feed(w.data(), w.size());
         CHECK(r.code() == sofab::Error::None, "utf8/strict: Blob-subtype payload is not UTF-8 validated");
         CHECK((*in).s == std::string("\xC0\x80", 2), "utf8/strict: Blob payload stored verbatim");
@@ -3325,11 +3355,11 @@ struct SeqMsg : sofab::IStreamMessage
     {
         switch (id)
         {
-            case 1: { sofab::StringSeq c{tags};  sofab::read(is, c); break; }
-            case 2: { sofab::MessageSeq<SeqRow> c; c.out = &rows; sofab::read(is, c); break; }
-            case 3: { sofab::BlobSeq c{blobs};   sofab::read(is, c); break; }
-            case 4: { sofab::MessageSeq<std::vector<uint32_t>> c; c.out = &matrix; sofab::read(is, c); break; }
-            case 5: { sofab::MessageSeq<NestRow> c; c.out = &nested; sofab::read(is, c); break; }
+            case 1: { sofab::StringSeq c{tags, -1, -1, kAnyCount, kAnyLen};  sofab::read(is, c); break; }
+            case 2: { sofab::MessageSeq<SeqRow> c; c.out = &rows; c.dynCap = kAnyCount; sofab::read(is, c); break; }
+            case 3: { sofab::BlobSeq c{blobs, -1, -1, kAnyCount, kAnyLen};   sofab::read(is, c); break; }
+            case 4: { sofab::MessageSeq<std::vector<uint32_t>> c; c.out = &matrix; c.dynCap = kAnyCount; sofab::read(is, c); break; }
+            case 5: { sofab::MessageSeq<NestRow> c; c.out = &nested; c.dynCap = kAnyCount; sofab::read(is, c); break; }
             case 9: sofab::read(is, other); break;
         }
     }
@@ -3342,7 +3372,7 @@ struct RowsAtOneMsg : sofab::IStreamMessage
     std::vector<SeqRow> rows;
     void deserialize(sofab::IStreamImpl &is, sofab::id id, size_t, size_t) noexcept override
     {
-        if (id == 1) { sofab::MessageSeq<SeqRow> c; c.out = &rows; sofab::read(is, c); }
+        if (id == 1) { sofab::MessageSeq<SeqRow> c; c.out = &rows; c.dynCap = kAnyCount; sofab::read(is, c); }
     }
 };
 
@@ -3355,8 +3385,8 @@ struct BoundedSeqMsg : sofab::IStreamMessage
     {
         switch (id)
         {
-            case 1: { sofab::StringSeq c{tags, -1, 2};  sofab::read(is, c); break; }
-            case 2: { sofab::BlobSeq   c{blobs, -1, 2}; sofab::read(is, c); break; }
+            case 1: { sofab::StringSeq c{tags, -1, 2, kAnyCount, -1};  sofab::read(is, c); break; }
+            case 2: { sofab::BlobSeq   c{blobs, -1, 2, kAnyCount, -1}; sofab::read(is, c); break; }
         }
     }
 };
@@ -3405,7 +3435,7 @@ struct DynRowsMsg : sofab::IStreamMessage
         switch (id)
         {
             case 1: { sofab::MessageSeq<std::vector<SeqRow>> c; c.out = &rows; c.cap = 3; sofab::read(is, c); break; }
-            case 4: { sofab::MessageSeq<std::vector<std::vector<uint32_t>>> c; c.out = &matrix; sofab::read(is, c); break; }
+            case 4: { sofab::MessageSeq<std::vector<std::vector<uint32_t>>> c; c.out = &matrix; c.dynCap = kAnyCount; sofab::read(is, c); break; }
         }
     }
 };
@@ -3470,7 +3500,7 @@ static void messageLayerFraming()
         sofab::OStreamInline<64> os;
         SeqRow d{}, s{}; s.a = 7;
         os.sequenceBeginLazy(2).write(0, d).write(1, d).write(2, s).sequenceEnd();
-        sofab::IStreamObject<SeqMsg> in;
+        sofab::IStreamObject<SeqMsg> in{kMaxSpan};
         auto r = in.feed(os.data(), os.bytesUsed());
         CHECK(r.complete(), "wrapper array of all-default rows decodes COMPLETE");
         CHECK((*in).rows.size() == 3, "element framing carries the array length: 3 rows");
@@ -3487,7 +3517,7 @@ static void messageLayerFraming()
         SeqRow d{};
         os.sequenceBeginLazy(2).write(0, d).write(1, d).sequenceEnd();
         CHECK(os.bytesUsed() != 0, "an array of only all-default elements is not empty on the wire");
-        sofab::IStreamObject<SeqMsg> in;
+        sofab::IStreamObject<SeqMsg> in{kMaxSpan};
         in.feed(os.data(), os.bytesUsed());
         CHECK((*in).rows.size() == 2, "two all-default elements decode as length 2");
     }
@@ -3497,7 +3527,7 @@ static void messageLayerFraming()
         sofab::OStreamInline<64> os;
         os.sequenceBeginLazy(2).sequenceEnd();
         CHECK(os.bytesUsed() == 0, "an empty array field with an empty default is omitted");
-        sofab::IStreamObject<SeqMsg> in;
+        sofab::IStreamObject<SeqMsg> in{kMaxSpan};
         in.feed(os.data(), os.bytesUsed());
         CHECK((*in).rows.empty(), "the omitted array field decodes as the empty array");
     }
@@ -3508,7 +3538,7 @@ static void messageLayerFraming()
         os.sequenceBeginLazy(5).write(0, n0).write(1, n1).sequenceEnd();
         CHECK(toHex(std::span<const uint8_t>(os.data(), os.bytesUsed())) == "2e06070e0e0005070707",
               "nested-row array: element 0 keeps a bare frame, element 1 carries its child");
-        sofab::IStreamObject<SeqMsg> in;
+        sofab::IStreamObject<SeqMsg> in{kMaxSpan};
         in.feed(os.data(), os.bytesUsed());
         CHECK((*in).nested.size() == 2, "nested-row array decodes as length 2");
         if ((*in).nested.size() == 2)
@@ -3533,7 +3563,7 @@ static void wrapperArrayCollectors()
         CHECK(toHex(std::span<const uint8_t>(os.data(), os.bytesUsed())) == "0e020a78120a7907",
               "string array omits its default element, leaving an id gap");
 
-        sofab::IStreamObject<SeqMsg> in;
+        sofab::IStreamObject<SeqMsg> in{kMaxSpan};
         auto r = in.feed(os.data(), os.bytesUsed());
         CHECK(r.complete(), "string array with an id gap decodes COMPLETE");
         CHECK((*in).tags.size() == 3, "StringSeq fills the id gap: length 3, not 2");
@@ -3543,7 +3573,7 @@ static void wrapperArrayCollectors()
     }
     {
         /* the auditor's msgA, verbatim */
-        sofab::IStreamObject<SeqMsg> in;
+        sofab::IStreamObject<SeqMsg> in{kMaxSpan};
         auto a = fromHex("0e020a780a0a7907");
         in.feed(a.data(), a.size());
         CHECK((*in).tags.size() == 2 && (*in).tags[0] == "x" && (*in).tags[1] == "y",
@@ -3552,7 +3582,7 @@ static void wrapperArrayCollectors()
     {
         /* §7.4: a repeated wrapper id REPLACES the array whole -- that is what
          * prepare() is for. */
-        sofab::IStreamObject<SeqMsg> in;
+        sofab::IStreamObject<SeqMsg> in{kMaxSpan};
         auto w = fromHex("0e020a780a0a7907" "0e020a7a07"); /* [x,y] then [z] */
         in.feed(w.data(), w.size());
         CHECK((*in).tags.size() == 1 && (*in).tags[0] == "z",
@@ -3572,7 +3602,7 @@ static void wrapperArrayCollectors()
         CHECK(toHex(std::span<const uint8_t>(os.data(), os.bytesUsed())) == "1e02130102120b0307",
               "blob array omits its default element, leaving an id gap");
 
-        sofab::IStreamObject<SeqMsg> in;
+        sofab::IStreamObject<SeqMsg> in{kMaxSpan};
         in.feed(os.data(), os.bytesUsed());
         CHECK((*in).blobs.size() == 3, "BlobSeq fills the id gap: length 3, not 2");
         if ((*in).blobs.size() == 3)
@@ -3588,7 +3618,7 @@ static void wrapperArrayCollectors()
      *     instead silently SHORTENS the array. --- */
     {
         /* the auditor's M3 wire, verbatim: elements at id 0 and id 2, id 1 absent */
-        sofab::IStreamObject<RowsAtOneMsg> in;
+        sofab::IStreamObject<RowsAtOneMsg> in{kMaxSpan};
         auto w = fromHex("0e060005071600090707");
         auto r = in.feed(w.data(), w.size());
         CHECK(r.complete(), "MessageSeq id-gap wire decodes COMPLETE");
@@ -3602,7 +3632,7 @@ static void wrapperArrayCollectors()
         sofab::OStreamInline<64> os;
         const std::vector<uint32_t> r0{1, 2}, r2{3};
         os.sequenceBeginLazy(4).write(0, r0).write(2, r2).sequenceEnd();
-        sofab::IStreamObject<SeqMsg> in;
+        sofab::IStreamObject<SeqMsg> in{kMaxSpan};
         in.feed(os.data(), os.bytesUsed());
         CHECK((*in).matrix.size() == 3, "MessageSeq of native-array rows fills the id gap");
         if ((*in).matrix.size() == 3)
@@ -3614,7 +3644,7 @@ static void wrapperArrayCollectors()
     {
         /* an out-of-order / descending id still lands at its index, so a decoder
          * cannot be talked into appending. */
-        sofab::IStreamObject<RowsAtOneMsg> in;
+        sofab::IStreamObject<RowsAtOneMsg> in{kMaxSpan};
         auto w = fromHex("0e" "1600090707"); /* only element id 2 present */
         in.feed(w.data(), w.size());
         CHECK((*in).rows.size() == 3, "a lone element at id 2 decodes as length 3");
@@ -3625,14 +3655,14 @@ static void wrapperArrayCollectors()
     {
         /* §5.1/§7: with a schema `count: 2`, an element id >= 2 is INVALID --
          * decided from the id alone, before the container is grown. */
-        sofab::IStreamObject<CappedMsg> in;
+        sofab::IStreamObject<CappedMsg> in{kMaxSpan};
         auto w = fromHex("0e060005071600090707");
         auto r = in.feed(w.data(), w.size());
         CHECK(r.invalid(), "count-bounded array: element id 2 with count 2 is INVALID");
     }
     {
         /* and within the bound it still decodes normally. */
-        sofab::IStreamObject<CappedMsg> in;
+        sofab::IStreamObject<CappedMsg> in{kMaxSpan};
         auto w = fromHex("0e0600050707");
         auto r = in.feed(w.data(), w.size());
         CHECK(r.complete(), "count-bounded array: an in-range element decodes COMPLETE");
@@ -3642,26 +3672,26 @@ static void wrapperArrayCollectors()
     /* --- per-element schema bounds ride into the read (§7.1): an over-long
      *     element is INVALID, never truncated. --- */
     {
-        sofab::IStreamObject<BoundedSeqMsg> in;
+        sofab::IStreamObject<BoundedSeqMsg> in{kMaxSpan};
         auto w = fromHex("0e021a61626307");      /* one 3-byte string, maxlen 2 */
         CHECK(in.feed(w.data(), w.size()).invalid(),
               "§7.1: a string element over its maxlen is INVALID");
     }
     {
-        sofab::IStreamObject<BoundedSeqMsg> in;
+        sofab::IStreamObject<BoundedSeqMsg> in{kMaxSpan};
         auto w = fromHex("0e0212616207");        /* one 2-byte string: at the bound */
         CHECK(in.feed(w.data(), w.size()).complete(),
               "§7.1: a string element at its maxlen decodes COMPLETE");
         CHECK((*in).tags.size() == 1 && (*in).tags[0] == "ab", "bounded string element decodes");
     }
     {
-        sofab::IStreamObject<BoundedSeqMsg> in;
+        sofab::IStreamObject<BoundedSeqMsg> in{kMaxSpan};
         auto w = fromHex("16021b01020307");      /* one 3-byte blob, maxlen 2 */
         CHECK(in.feed(w.data(), w.size()).invalid(),
               "§7.1: a blob element over its maxlen is INVALID");
     }
     {
-        sofab::IStreamObject<BoundedSeqMsg> in;
+        sofab::IStreamObject<BoundedSeqMsg> in{kMaxSpan};
         auto w = fromHex("1602130102" "07");
         CHECK(in.feed(w.data(), w.size()).complete(),
               "§7.1: a blob element at its maxlen decodes COMPLETE");
@@ -3670,7 +3700,7 @@ static void wrapperArrayCollectors()
     }
     {
         /* a blob element cut in half is INCOMPLETE, and completes on the next feed. */
-        sofab::IStreamObject<BoundedSeqMsg> in;
+        sofab::IStreamObject<BoundedSeqMsg> in{kMaxSpan};
         auto head = fromHex("160213 01");
         auto tail = fromHex("0207");
         CHECK(in.feed(head.data(), head.size()).incomplete(),
@@ -3683,7 +3713,7 @@ static void wrapperArrayCollectors()
     {
         /* §7.3: a mis-typed wrapper field is SKIPPED, and must not wipe the
          * array a previous, correctly typed occurrence produced. */
-        sofab::IStreamObject<SeqMsg> in;
+        sofab::IStreamObject<SeqMsg> in{kMaxSpan};
         auto w = fromHex("0e020a780a0a7907" "0803");   /* [x,y] then id 1 as an unsigned */
         auto r = in.feed(w.data(), w.size());
         CHECK(r.complete(), "§7.3 mis-typed array occurrence is skipped, not an error");
@@ -3739,8 +3769,8 @@ struct F41Msg : sofab::IStreamMessage
     {
         switch (id)
         {
-            case 200: { sofab::StringSeq c{strs, 5, 64};  sofab::read(is, c); break; }
-            case 201: { sofab::BlobSeq   c{blobs, 5, 64}; sofab::read(is, c); break; }
+            case 200: { sofab::StringSeq c{strs, 5, 64, -1, -1};  sofab::read(is, c); break; }
+            case 201: { sofab::BlobSeq   c{blobs, 5, 64, -1, -1}; sofab::read(is, c); break; }
             case 202: { sofab::MessageSeq<F41Row> c; c.out = &rows; c.cap = 5; sofab::read(is, c); break; }
             case 8:   sofab::read(is, other); break;
         }
@@ -3756,6 +3786,11 @@ struct F41GenSeq : sofab::IStreamMessage
 {
     std::vector<F41Row> *out = nullptr;
     long cap = -1;
+    /* A collector that publishes a schema `cap` must publish a receiver `dynCap`
+     * beside it (§6.2.1); the stream now refuses to compile against one that
+     * does not. This array is schema-bounded, so the cap is inert -- but stating
+     * it is what makes that a decision rather than an omission. */
+    long dynCap = -1;
 
     void prepare() noexcept { if (out != nullptr) out->clear(); }
 
@@ -3795,8 +3830,11 @@ struct F41GenMsg : sofab::IStreamMessage
 struct CapStringMsg : sofab::IStreamMessage
 {
     std::vector<std::string> tags;
-    long dynCap = -1;
-    long elemCap = -1;
+    /* Both caps default to the widest the format carries rather than to "none":
+     * a collector states them or the decode is refused (§6.2.1), so a case that
+     * is not about a cap states one that never fires. */
+    long dynCap = kAnyCount;
+    long elemCap = kAnyLen;
     void deserialize(sofab::IStreamImpl &is, sofab::id id, size_t, size_t) noexcept override
     {
         if (id == 1) { sofab::StringSeq c{tags, -1, -1, dynCap, elemCap}; sofab::read(is, c); }
@@ -3806,10 +3844,10 @@ struct CapStringMsg : sofab::IStreamMessage
 struct CapBlobMsg : sofab::IStreamMessage
 {
     std::vector<std::vector<uint8_t>> blobs;
-    long dynCap = -1;
+    long dynCap = kAnyCount;
     void deserialize(sofab::IStreamImpl &is, sofab::id id, size_t, size_t) noexcept override
     {
-        if (id == 1) { sofab::BlobSeq c{blobs, -1, -1, dynCap}; sofab::read(is, c); }
+        if (id == 1) { sofab::BlobSeq c{blobs, -1, -1, dynCap, kAnyLen}; sofab::read(is, c); }
     }
 };
 
@@ -3818,14 +3856,14 @@ struct FixedStringSeqMsg : sofab::IStreamMessage
     sofab::InlineVector<sofab::FixedString<8>, 4> tags;
     void deserialize(sofab::IStreamImpl &is, sofab::id id, size_t, size_t) noexcept override
     {
-        if (id == 1) { sofab::StringSeq c{tags}; sofab::read(is, c); }
+        if (id == 1) { sofab::StringSeq c{tags, -1, -1, kAnyCount, kAnyLen}; sofab::read(is, c); }
     }
 };
 
 struct CapRowsMsg : sofab::IStreamMessage
 {
     std::vector<SeqRow> rows;
-    long dynCap = -1;
+    long dynCap = kAnyCount;
     void deserialize(sofab::IStreamImpl &is, sofab::id id, size_t, size_t) noexcept override
     {
         if (id == 1)
@@ -3853,7 +3891,7 @@ static void wrapperArrayIndexCaps()
     /* --- the growable destination, with the cap generated code supplies. --- */
     {
         const auto w = strAt(3); /* cap - 1: the last legal index */
-        sofab::IStreamObject<CapStringMsg> in;
+        sofab::IStreamObject<CapStringMsg> in{kMaxSpan};
         (*in).dynCap = 4;
         CHECK(in.feed(w.data(), w.size()).complete(), "index cap: id == cap-1 decodes COMPLETE");
         CHECK((*in).tags.size() == 4 && (*in).tags[3] == "b",
@@ -3861,7 +3899,7 @@ static void wrapperArrayIndexCaps()
     }
     {
         const auto w = strAt(4); /* the cap itself */
-        sofab::IStreamObject<CapStringMsg> in;
+        sofab::IStreamObject<CapStringMsg> in{kMaxSpan};
         (*in).dynCap = 4;
         const unsigned long before = g_allocCount;
         auto r = in.feed(w.data(), w.size());
@@ -3876,7 +3914,7 @@ static void wrapperArrayIndexCaps()
         /* the amplification shape, with a cap in place: eight bytes naming a
          * four-million-element index allocate nothing. */
         const auto w = strAt(4000000);
-        sofab::IStreamObject<CapStringMsg> in;
+        sofab::IStreamObject<CapStringMsg> in{kMaxSpan};
         (*in).dynCap = 4;
         const unsigned long before = g_allocBytes;
         CHECK(in.feed(w.data(), w.size()).limitExceeded(),
@@ -3894,12 +3932,12 @@ static void wrapperArrayIndexCaps()
             std::vector<std::string> *out;
             void deserialize(sofab::IStreamImpl &is, sofab::id id, size_t, size_t) noexcept override
             {   /* schema `count: 4` AND a looser receiver cap of 8 */
-                if (id == 1) { sofab::StringSeq c{*out, 4, -1, 8}; sofab::read(is, c); }
+                if (id == 1) { sofab::StringSeq c{*out, 4, -1, 8, kAnyLen}; sofab::read(is, c); }
             }
         };
         BoundedIdxMsg m;
         m.out = &tags;
-        sofab::IStreamInline is([&](sofab::id i, size_t sz, size_t c) { m.deserialize(is, i, sz, c); });
+        sofab::IStreamInline is([&](sofab::id i, size_t sz, size_t c) { m.deserialize(is, i, sz, c); }, kMaxSpan);
         auto r = is.feed(w.data(), w.size());
         CHECK(r.invalid() && !r.limitExceeded(),
               "index cap: under a declared `count` the breach stays INVALID (§6.2.1)");
@@ -3908,7 +3946,7 @@ static void wrapperArrayIndexCaps()
     /* --- the fixed-capacity destination: the loop that used to hang. --- */
     {
         const auto w = strAt(4); /* capacity is 4, so id 4 is one past it */
-        sofab::IStreamObject<FixedStringSeqMsg> in;
+        sofab::IStreamObject<FixedStringSeqMsg> in{kMaxSpan};
         auto r = in.feed(w.data(), w.size());
         CHECK(r.invalidArgument() && !r.invalid() && !r.limitExceeded(),
               "index cap: past a fixed destination's capacity is InvalidArgument");
@@ -3916,7 +3954,7 @@ static void wrapperArrayIndexCaps()
     }
     {
         const auto w = strAt(4000000);
-        sofab::IStreamObject<FixedStringSeqMsg> in;
+        sofab::IStreamObject<FixedStringSeqMsg> in{kMaxSpan};
         const unsigned long before = g_allocCount;
         CHECK(in.feed(w.data(), w.size()).invalidArgument(),
               "index cap: a huge index into a fixed destination terminates, InvalidArgument");
@@ -3924,7 +3962,7 @@ static void wrapperArrayIndexCaps()
     }
     {
         const auto w = strAt(3); /* capacity - 1 still decodes */
-        sofab::IStreamObject<FixedStringSeqMsg> in;
+        sofab::IStreamObject<FixedStringSeqMsg> in{kMaxSpan};
         CHECK(in.feed(w.data(), w.size()).complete(),
               "index cap: id == capacity-1 into a fixed destination decodes COMPLETE");
         CHECK((*in).tags.size() == 4, "index cap: and the array is capacity long");
@@ -3937,7 +3975,7 @@ static void wrapperArrayIndexCaps()
         w.push_back(0x0b);
         w.push_back(0x02);
         w.push_back(0x07);
-        sofab::IStreamObject<CapBlobMsg> in;
+        sofab::IStreamObject<CapBlobMsg> in{kMaxSpan};
         (*in).dynCap = 4;
         auto r = in.feed(w.data(), w.size());
         CHECK(r.limitExceeded() && !r.invalid(), "index cap: BlobSeq answers LimitExceeded too");
@@ -3952,7 +3990,7 @@ static void wrapperArrayIndexCaps()
         appendVarint(w, (4ull << 3) | 6u);                       /* element id 4, SequenceStart */
         w.push_back(0x00); w.push_back(0x09); w.push_back(0x07);
         w.push_back(0x07);
-        sofab::IStreamObject<CapRowsMsg> in;
+        sofab::IStreamObject<CapRowsMsg> in{kMaxSpan};
         (*in).dynCap = 4;
         auto r = in.feed(w.data(), w.size());
         CHECK(r.limitExceeded() && !r.invalid(),
@@ -3960,26 +3998,46 @@ static void wrapperArrayIndexCaps()
         CHECK((*in).rows.size() <= 1, "index cap: and the row container is not extended");
     }
 
-    /* --- there is NO stream-level fallback, and that is the rule (§6.2.1).
+    /* --- there is NO stream-level fallback and no unlimited mode (§6.2.1).
      *     The stream used to carry a `Limits::max_dyn_array_count` that any
      *     collector declaring no `dynCap` of its own inherited. That is a codec
      *     holding a limit and defaulting one it was not given, which §6.2.1
-     *     forbids twice over: "A codec MUST NOT hold a limit of its own, MUST NOT
-     *     supply a default for one it was not given". The member is gone, so a
-     *     collector with no cap has no cap -- the number has to come from the
-     *     caller, per call. --- */
+     *     forbids twice over. The member is gone -- but "no cap" then read as
+     *     "no bound at all", which is the SAME rule broken from the other end:
+     *     "MUST NOT read an omitted argument as *unlimited*". A wrapper array's
+     *     length is its highest index, so an unbounded, uncapped collector grows
+     *     to whatever index the sender picks, from a nine-byte field.
+     *
+     *     There is nothing to fall back on, so the call is refused:
+     *     InvalidArgument (§6.3's third tier -- neither the message nor the
+     *     deployment is at fault, the CALL is). --- */
     {
         const auto w = strAt(4);
-        sofab::IStreamObject<CapStringMsg> in; /* no cap stated anywhere */
+        sofab::IStreamObject<CapStringMsg> in{kMaxSpan};
+        (*in).dynCap = -1; /* no index cap stated anywhere */
+        const unsigned long before = g_allocCount;
         auto r = in.feed(w.data(), w.size());
-        CHECK(r.complete() && !r.limitExceeded(),
-              "index cap: with no cap passed there is no cap -- the stream holds none");
-        CHECK((*in).tags.size() == 5, "index cap: and the uncapped array is index+1 long");
+        CHECK(r.invalidArgument() && !r.limitExceeded() && !r.invalid(),
+              "index cap: a collector with no index cap is refused, not obeyed");
+        CHECK((*in).tags.size() <= 1,
+              "index cap: and the container never grew toward the index");
+        CHECK(g_allocCount - before <= 1,
+              "index cap: and the refusal allocated nothing for it");
+    }
+    {   /* the amplification shape the refusal actually protects against */
+        const auto w = strAt(4000000);
+        sofab::IStreamObject<CapStringMsg> in{kMaxSpan};
+        (*in).dynCap = -1;
+        const unsigned long before = g_allocBytes;
+        CHECK(in.feed(w.data(), w.size()).invalidArgument(),
+              "index cap: an uncapped four-million index is refused, not grown into");
+        CHECK(g_allocBytes - before < 4096,
+              "index cap: and nothing the sender chose was committed");
     }
     {
         /* The one place the number may come from is the collector, per decode. */
         const auto w = strAt(4);
-        sofab::IStreamObject<CapStringMsg> in;
+        sofab::IStreamObject<CapStringMsg> in{kMaxSpan};
         (*in).dynCap = 4;
         auto r = in.feed(w.data(), w.size());
         CHECK(r.limitExceeded() && !r.invalid(),
@@ -4002,7 +4060,7 @@ static void wrapperArrayIndexCaps()
         w.push_back(0x07);
 
         {
-            sofab::IStreamObject<CapStringMsg> in;
+            sofab::IStreamObject<CapStringMsg> in{kMaxSpan};
             (*in).elemCap = 16;
             const auto r = in.feed(w.data(), w.size());
             CHECK(r.limitExceeded() && !r.invalid(),
@@ -4011,17 +4069,22 @@ static void wrapperArrayIndexCaps()
                   "index cap: and the container was never extended for it");
         }
         {
-            sofab::IStreamObject<CapStringMsg> in;
+            sofab::IStreamObject<CapStringMsg> in{kMaxSpan};
             (*in).elemCap = 128;
             CHECK(in.feed(w.data(), w.size()).complete(),
                   "index cap: an element inside the element cap decodes");
             CHECK((*in).tags.size() == 1 && (*in).tags[0].size() == 64,
                   "index cap: and lands in full");
         }
-        {
-            sofab::IStreamObject<CapStringMsg> in; /* no element cap stated */
-            CHECK(in.feed(w.data(), w.size()).complete(),
-                  "index cap: with no element cap the collector invents none");
+        {   /* An element LENGTH cap is required on the same terms as the index
+             * cap: with none stated the element is refused, not read. */
+            sofab::IStreamObject<CapStringMsg> in{kMaxSpan};
+            (*in).elemCap = -1;
+            const auto r = in.feed(w.data(), w.size());
+            CHECK(r.invalidArgument() && !r.limitExceeded() && !r.invalid(),
+                  "index cap: an element read with no element cap is refused");
+            CHECK((*in).tags.empty(),
+                  "index cap: and no element was materialised for it");
         }
     }
 
@@ -4034,7 +4097,7 @@ static void wrapperArrayIndexCaps()
     {
         constexpr long kSparse = 4095;
         const auto w = strAt(kSparse);
-        sofab::IStreamObject<CapStringMsg> in;
+        sofab::IStreamObject<CapStringMsg> in{kMaxSpan};
         (*in).dynCap = kSparse + 1;
         const unsigned long before = g_allocCount;
         CHECK(in.feed(w.data(), w.size()).complete(), "growth geometry: the sparse index decodes COMPLETE");
@@ -4069,7 +4132,7 @@ static void messageSeqStorageProfiles()
 
     {
         /* the container spelling on growable storage: placement as before. */
-        sofab::IStreamObject<DynRowsMsg> in;
+        sofab::IStreamObject<DynRowsMsg> in{kMaxSpan};
         auto r = in.feed(gapWire.data(), gapWire.size());
         CHECK(r.complete(), "MessageSeq<std::vector<T>>: the id-gap wire decodes COMPLETE");
         CHECK((*in).rows.size() == 3, "MessageSeq<std::vector<T>>: the id gap is filled, length 3");
@@ -4081,7 +4144,7 @@ static void messageSeqStorageProfiles()
         /* ...and on the heap-free destination, which is what the re-template
          * adds. Its decode allocates nothing: the elements live in the message. */
         const unsigned long allocBefore = g_allocCount;
-        sofab::IStreamObject<FixedRowsMsg> in;
+        sofab::IStreamObject<FixedRowsMsg> in{kMaxSpan};
         auto r = in.feed(gapWire.data(), gapWire.size());
         CHECK(r.complete(), "MessageSeq<InlineVector<T,N>>: the id-gap wire decodes COMPLETE");
         CHECK((*in).rows.size() == 3, "MessageSeq<InlineVector<T,N>>: the id gap is filled, length 3");
@@ -4094,7 +4157,7 @@ static void messageSeqStorageProfiles()
     {
         /* §5.1/§7.4: a repeated element id continues the element already placed
          * at that index -- it does not append a second one. */
-        sofab::IStreamObject<DynRowsMsg> in;
+        sofab::IStreamObject<DynRowsMsg> in{kMaxSpan};
         auto w = fromHex("0e0600050706000907" "07");
         CHECK(in.feed(w.data(), w.size()).complete(), "a repeated element id decodes COMPLETE");
         CHECK((*in).rows.size() == 1, "a repeated element id replaces, it does not append");
@@ -4119,7 +4182,7 @@ static void messageSeqStorageProfiles()
     }
     {
         /* id == cap - 1 is the last legal index, and it grows the array to N. */
-        sofab::IStreamObject<FixedRowsMsg> in;
+        sofab::IStreamObject<FixedRowsMsg> in{kMaxSpan};
         auto w = fromHex("0e" "1600090707");
         CHECK(in.feed(w.data(), w.size()).complete(), "an element at id N-1 decodes COMPLETE");
         CHECK((*in).rows.size() == 3, "an element at id N-1 grows the array to exactly N");
@@ -4130,7 +4193,7 @@ static void messageSeqStorageProfiles()
         /* id == capacity is one past it: §6.3's third tier (the destination is
          * too short; the schema declared nothing and no cap was configured),
          * decided from the id alone, with nothing placed and nothing grown. */
-        sofab::IStreamObject<FixedRowsMsg> in;
+        sofab::IStreamObject<FixedRowsMsg> in{kMaxSpan};
         auto w = fromHex("0e" "1e00090707");
         auto r = in.feed(w.data(), w.size());
         CHECK(r.invalidArgument() && !r.invalid() && !r.limitExceeded(),
@@ -4140,7 +4203,7 @@ static void messageSeqStorageProfiles()
     {
         /* the same reject on growable storage, where `cap` is the schema
          * `count: 3` rather than the container. */
-        sofab::IStreamObject<DynRowsMsg> in;
+        sofab::IStreamObject<DynRowsMsg> in{kMaxSpan};
         auto w = fromHex("0e" "1e00090707");
         /* Counted from HERE, not from the top of the block: constructing the
          * decoder and the wire vector allocates, and folding that in would make
@@ -4154,7 +4217,7 @@ static void messageSeqStorageProfiles()
     /* --- native-scalar rows, whose length is an announced count: unauthenticated
      *     input until the ceilings have run. --- */
     {
-        sofab::IStreamObject<FixedRowsMsg> in;
+        sofab::IStreamObject<FixedRowsMsg> in{kMaxSpan};
         auto w = fromHex("26" "03" "02" "0102" "07");   /* field 4, row 0 = [1, 2] */
         CHECK(in.feed(w.data(), w.size()).complete(), "a heap-free row at its capacity decodes COMPLETE");
         CHECK((*in).matrix.size() == 1 && (*in).matrix[0].size() == 2 &&
@@ -4165,7 +4228,7 @@ static void messageSeqStorageProfiles()
         /* §3: a row count past what the row can hold is refused, never truncated
          * into it -- and INVALID rather than LimitExceeded, because a heap-free
          * row's capacity IS the schema `count` it was generated for. */
-        sofab::IStreamObject<FixedRowsMsg> in;
+        sofab::IStreamObject<FixedRowsMsg> in{kMaxSpan};
         auto w = fromHex("26" "03" "03" "010203" "07");
         CHECK(in.feed(w.data(), w.size()).invalid(),
               "a row count past the row's capacity is INVALID, not a silent truncation");
@@ -4175,7 +4238,7 @@ static void messageSeqStorageProfiles()
          * The count must not become an allocation -- the row grows only as far as
          * the bytes in hand could ever fill. */
         const unsigned long bytesBefore = g_allocBytes;
-        sofab::IStreamObject<DynRowsMsg> in;
+        sofab::IStreamObject<DynRowsMsg> in{kMaxSpan};
         auto w = fromHex("26" "03" "8080808008" "010203" "07");
         auto r = in.feed(w.data(), w.size());
         CHECK(!r.complete(), "a row whose announced count outruns its payload is not COMPLETE");
@@ -4187,7 +4250,7 @@ static void messageSeqStorageProfiles()
 static void overIndexSkipOrdering()
 {
     auto feed = [](const char *hex) {
-        sofab::IStreamObject<F41Msg> in;
+        sofab::IStreamObject<F41Msg> in{kMaxSpan};
         auto w = fromHex(hex);
         auto r = in.feed(w.data(), w.size());
         return std::pair<sofab::IStreamImpl::Result, F41Msg>{r, *in};
@@ -4338,7 +4401,7 @@ static void overIndexSkipOrdering()
      *      itself (the shape generated code uses). ---- */
     {
         auto genFeed = [](const char *hex) {
-            sofab::IStreamObject<F41GenMsg> in;
+            sofab::IStreamObject<F41GenMsg> in{kMaxSpan};
             auto w = fromHex(hex);
             auto r = in.feed(w.data(), w.size());
             return std::pair<sofab::IStreamImpl::Result, F41GenMsg>{r, *in};
@@ -4379,7 +4442,7 @@ static void overIndexSkipOrdering()
 static void skippedSubtreeSuspendsBound()
 {
     auto feed = [](const char *hex) {
-        sofab::IStreamObject<F41Msg> in;
+        sofab::IStreamObject<F41Msg> in{kMaxSpan};
         auto w = fromHex(hex);
         auto r = in.feed(w.data(), w.size());
         return std::pair<sofab::IStreamImpl::Result, F41Msg>{r, *in};
@@ -4518,7 +4581,7 @@ struct F56Msg : sofab::IStreamMessage
 static void truncatedNestedFieldIsNotDeclined()
 {
     auto feed = [](const char *hex) {
-        sofab::IStreamObject<F56Msg> in;
+        sofab::IStreamObject<F56Msg> in{kMaxSpan};
         auto w = fromHex(hex);
         auto r = in.feed(w.data(), w.size());
         return std::pair<sofab::IStreamImpl::Result, F56Msg>{r, *in};
@@ -4575,7 +4638,7 @@ static void truncatedNestedFieldIsNotDeclined()
     /* ---- INCOMPLETE means resumable: the buffered field is delivered again and
      *      the message completes when the missing bytes arrive. ---- */
     {
-        sofab::IStreamObject<F56Msg> in;
+        sofab::IStreamObject<F56Msg> in{kMaxSpan};
         auto head = fromHex("a606 56 05 03 20 ffffffff ffffffff ffffffff 04 24 07 07");
         /* 34 more single-byte elements finish the 36-element skipped array */
         std::vector<uint8_t> tail(34, 0x01);
@@ -4591,7 +4654,7 @@ static void truncatedNestedFieldIsNotDeclined()
 
     /* ---- and byte at a time, which drives the resume path on every boundary. ---- */
     {
-        sofab::IStreamObject<F56Msg> in;
+        sofab::IStreamObject<F56Msg> in{kMaxSpan};
         auto w = fromHex("a606 56 05 03 20 0000803f 00000040 00004040 04 02 0101 0707");
         bool sawInvalid = false;
         sofab::DecodeStatus last = sofab::DecodeStatus::Incomplete;
@@ -4660,8 +4723,8 @@ struct DynStoreMsg : sofab::Message
             case 1: sofab::readString(is, name, 8); break;
             case 2: sofab::readBlob(is, sig, 4); break;
             case 3: sofab::readArray(is, nums, 4); break;
-            case 4: { sofab::StringSeq c{tags, 3, 2};  sofab::read(is, c); break; }
-            case 5: { sofab::BlobSeq   c{parts, 3, 2}; sofab::read(is, c); break; }
+            case 4: { sofab::StringSeq c{tags, 3, 2, -1, -1};  sofab::read(is, c); break; }
+            case 5: { sofab::BlobSeq   c{parts, 3, 2, -1, -1}; sofab::read(is, c); break; }
         }
     }
 };
@@ -4673,7 +4736,7 @@ struct TinyBlobMsg : sofab::IStreamMessage
     sofab::FixedBytes<8> b;
     void deserialize(sofab::IStreamImpl &is, sofab::id id, size_t, size_t) noexcept override
     {
-        if (id == 1) sofab::readBlob(is, b);
+        if (id == 1) sofab::readBlobCapped(is, b, kAnyLen);
     }
 };
 
@@ -4709,8 +4772,8 @@ struct FixedStoreMsg : sofab::Message
             case 1: sofab::readString(is, name, 8); break;
             case 2: sofab::readBlob(is, sig, 4); break;
             case 3: sofab::readArray(is, nums, 4); break;
-            case 4: { sofab::StringSeq c{tags, 3, 2};  sofab::read(is, c); break; }
-            case 5: { sofab::BlobSeq   c{parts, 3, 2}; sofab::read(is, c); break; }
+            case 4: { sofab::StringSeq c{tags, 3, 2, -1, -1};  sofab::read(is, c); break; }
+            case 5: { sofab::BlobSeq   c{parts, 3, 2, -1, -1}; sofab::read(is, c); break; }
         }
     }
 };
@@ -4808,7 +4871,7 @@ static void allocationMeasurement()
 
     /* --- decode, complete, one-shot. --- */
     {
-        auto is = std::make_unique<sofab::IStreamObject<FixedStoreMsg>>();
+        auto is = std::make_unique<sofab::IStreamObject<FixedStoreMsg>>(kMaxSpan);
         const unsigned long before = g_allocCount;
         CHECK(is->feed(wire.data(), wire.size()).complete(), "measure: the one-shot decode completes");
         CHECK(g_allocCount == before,
@@ -4829,7 +4892,7 @@ static void allocationMeasurement()
      * `== before` is the assertion §6.6.4 asks for, not a ceiling: "Where the
      * runtime does not box the codec's values it MUST be zero." --- */
     {
-        auto is = std::make_unique<sofab::IStreamObject<FixedStoreMsg>>();
+        auto is = std::make_unique<sofab::IStreamObject<FixedStoreMsg>>(kMaxSpan);
         const unsigned long before = g_allocCount;
         sofab::Error last = sofab::Error::None;
         for (size_t i = 0; i < wire.size(); ++i) last = is->feed(wire.data() + i, 1).code();
@@ -4843,7 +4906,7 @@ static void allocationMeasurement()
          * allocation hiding at it. */
         for (size_t step = 1; step <= wire.size(); ++step)
         {
-            auto is = std::make_unique<sofab::IStreamObject<FixedStoreMsg>>();
+            auto is = std::make_unique<sofab::IStreamObject<FixedStoreMsg>>(kMaxSpan);
             const unsigned long before = g_allocCount;
             sofab::Error last = sofab::Error::Incomplete;
             for (size_t i = 0; i < wire.size(); i += step)
@@ -4876,7 +4939,7 @@ static void allocationMeasurement()
             break;
         }
         big.resize(big.size() + 65536, 0x41);
-        auto is = std::make_unique<sofab::IStreamObject<TinyBlobMsg>>();
+        auto is = std::make_unique<sofab::IStreamObject<TinyBlobMsg>>(kMaxSpan);
         const unsigned long before = g_allocCount;
         const unsigned long bytesBefore = g_allocBytes;
         auto r1 = is->feed(big.data(), 8);
@@ -4918,7 +4981,7 @@ static void heapFreeStorage()
     FixedStoreMsg in;
     const unsigned long before = g_allocCount;
     {
-        sofab::IStreamObject<FixedStoreMsg> is;
+        sofab::IStreamObject<FixedStoreMsg> is{kMaxSpan};
         CHECK(is.feed(fb, fos.bytesUsed()).complete(), "heapfree: decode completes");
         CHECK((*is).name == std::string_view{"abcdefgh"}, "heapfree: FixedString value");
         CHECK((*is).sig.size() == 4 && (*is).sig[0] == 0xde && (*is).sig[3] == 0xef,
@@ -4952,14 +5015,14 @@ static void heapFreeStorage()
             sofab::FixedString<8> name;
             void deserialize(sofab::IStreamImpl &is, sofab::id id, size_t, size_t) noexcept override
             {
-                if (id == 1) sofab::readString(is, name); /* no declared maxlen */
+                if (id == 1) sofab::readStringCapped(is, name, kAnyLen); /* no declared maxlen */
             }
         };
         checkStreamReuse<NoBoundMsg>("heapFreeStorage/NoBoundMsg");
         uint8_t buf[64];
         sofab::OStreamView os{buf, sizeof(buf)};
         (void)os.write(1, std::string_view{"123456789"}); /* 9 > capacity 8 */
-        sofab::IStreamObject<NoBoundMsg> is;
+        sofab::IStreamObject<NoBoundMsg> is{kMaxSpan};
         const auto rNoBound = is.feed(buf, os.bytesUsed());
         CHECK(rNoBound.invalidArgument() && !rNoBound.invalid() && !rNoBound.limitExceeded(),
               "heapfree: payload past FixedString capacity is InvalidArgument, not truncated");
@@ -4983,7 +5046,7 @@ static void heapFreeStorage()
         uint8_t buf[64];
         sofab::OStreamView os{buf, sizeof(buf)};
         (void)os.write(1, static_cast<uint64_t>(7)); /* unsigned, not a string */
-        sofab::IStreamObject<TypedMsg> is;
+        sofab::IStreamObject<TypedMsg> is{kMaxSpan};
         CHECK(is.feed(buf, os.bytesUsed()).complete(),
               "heapfree: a wire-type mismatch is a skip, not an error");
         CHECK((*is).name == std::string_view{"keep"},
@@ -5006,7 +5069,7 @@ static void heapFreeStorage()
          * (InvalidArgument, checked in strictUtf8()), so the wire has to come
          * from stringFieldWire, exactly as the growable-destination case does. */
         auto w = stringFieldWire("\xC0\x80", sofab::detail::Fix::String); /* overlong NUL */
-        sofab::IStreamObject<Utf8Msg> is;
+        sofab::IStreamObject<Utf8Msg> is{kMaxSpan};
         CHECK(is.feed(w.data(), w.size()).invalid(),
               "heapfree: invalid UTF-8 into a FixedString is INVALID");
         CHECK((*is).s.empty(), "heapfree: the rejected UTF-8 payload is not stored");
@@ -5029,7 +5092,7 @@ static void heapFreeStorage()
             sofab::InlineVector<uint32_t, 4> v;
             void deserialize(sofab::IStreamImpl &is, sofab::id id, size_t, size_t) noexcept override
             {
-                if (id == 1) sofab::readArray(is, v); /* no declared count */
+                if (id == 1) sofab::readArrayCapped(is, v, kAnyCount); /* no declared count */
             }
         };
         checkStreamReuse<UnboundedArrayMsg>("heapFreeStorage/UnboundedArrayMsg");
@@ -5047,7 +5110,7 @@ static void heapFreeStorage()
             std::vector<uint32_t> v;
             void deserialize(sofab::IStreamImpl &is, sofab::id id, size_t, size_t) noexcept override
             {
-                if (id == 1) sofab::readArray(is, v);
+                if (id == 1) sofab::readArrayCapped(is, v, kAnyCount);
             }
         };
         checkStreamReuse<GrowableArrayMsg>("heapFreeStorage/GrowableArrayMsg");
@@ -5059,7 +5122,7 @@ static void heapFreeStorage()
         CHECK(os.ok(), "heapfree: the ten-element array encodes");
 
         {
-            sofab::IStreamObject<UnboundedArrayMsg> is;
+            sofab::IStreamObject<UnboundedArrayMsg> is{kMaxSpan};
             auto r = is.feed(buf, os.bytesUsed());
             CHECK(r.invalidArgument() && !r.complete() && !r.invalid() && !r.incomplete() &&
                       !r.limitExceeded(),
@@ -5070,7 +5133,7 @@ static void heapFreeStorage()
                   "heapfree: the rejected array leaves the destination untouched, not truncated");
         }
         {
-            sofab::IStreamObject<BoundedArrayMsg> is;
+            sofab::IStreamObject<BoundedArrayMsg> is{kMaxSpan};
             auto r = is.feed(buf, os.bytesUsed());
             CHECK(r.invalid() && !r.complete() && !r.limitExceeded(),
                   "heapfree: a count past the declared bound stays INVALID (§7.1)");
@@ -5079,7 +5142,7 @@ static void heapFreeStorage()
         {
             /* Control: the growable destination materializes all ten, so the
              * rejection above is about capacity and nothing else. */
-            sofab::IStreamObject<GrowableArrayMsg> is;
+            sofab::IStreamObject<GrowableArrayMsg> is{kMaxSpan};
             auto r = is.feed(buf, os.bytesUsed());
             CHECK(r.complete(), "heapfree: the growable destination decodes the same bytes COMPLETE");
             CHECK((*is).v.size() == 10 && (*is).v[9] == 10,
@@ -5093,7 +5156,7 @@ static void heapFreeStorage()
                 sofab::InlineVector<float, 4> v;
                 void deserialize(sofab::IStreamImpl &is, sofab::id id, size_t, size_t) noexcept override
                 {
-                    if (id == 2) sofab::readArray(is, v);
+                    if (id == 2) sofab::readArrayCapped(is, v, kAnyCount);
                 }
             };
             checkStreamReuse<FloatArrayMsg>("heapFreeStorage/FloatArrayMsg");
@@ -5101,7 +5164,7 @@ static void heapFreeStorage()
             uint8_t fbuf[64];
             sofab::OStreamView fos{fbuf, sizeof(fbuf)};
             (void)fos.write(2, std::span<const float>{six, 6});
-            sofab::IStreamObject<FloatArrayMsg> is;
+            sofab::IStreamObject<FloatArrayMsg> is{kMaxSpan};
             auto r = is.feed(fbuf, fos.bytesUsed());
             CHECK(r.invalidArgument() && !r.complete(),
                   "heapfree: an over-capacity fp32 array is rejected, not memcpy-truncated");
@@ -5112,7 +5175,7 @@ static void heapFreeStorage()
             uint8_t small[32];
             sofab::OStreamView sos{small, sizeof(small)};
             (void)sos.write(1, std::span<const uint32_t>{ten, 4});
-            sofab::IStreamObject<UnboundedArrayMsg> is;
+            sofab::IStreamObject<UnboundedArrayMsg> is{kMaxSpan};
             CHECK(is.feed(small, sos.bytesUsed()).complete(),
                   "heapfree: a count at the capacity still decodes COMPLETE");
             CHECK((*is).v.size() == 4 && (*is).v[3] == 4,
@@ -5139,7 +5202,7 @@ static void destinationReuse()
     /* --- reset() is the supported path: message B decodes on a clean slate,
      *     so an absent array field reads as the empty array §2 requires. --- */
     {
-        sofab::IStreamObject<SeqMsg> in;
+        sofab::IStreamObject<SeqMsg> in{kMaxSpan};
         in.feed(msgA_tags.data(), msgA_tags.size());
         CHECK((*in).tags.size() == 2, "reuse: message A decodes tags = [x, y]");
         in.reset();
@@ -5149,7 +5212,7 @@ static void destinationReuse()
         CHECK((*in).other == 1, "reset(): message B's own field is decoded");
     }
     {
-        sofab::IStreamObject<SeqMsg> in;
+        sofab::IStreamObject<SeqMsg> in{kMaxSpan};
         in.feed(msgA_rows.data(), msgA_rows.size());
         CHECK((*in).rows.size() == 2, "reuse: message A decodes 2 rows");
         in.reset();
@@ -5158,7 +5221,7 @@ static void destinationReuse()
     }
     {
         /* reset() also clears a scalar the second message does not carry... */
-        sofab::IStreamObject<SeqMsg> in;
+        sofab::IStreamObject<SeqMsg> in{kMaxSpan};
         auto scalar = fromHex("4809");
         in.feed(scalar.data(), scalar.size());
         CHECK((*in).other == 9, "reuse: message A decodes the scalar");
@@ -5171,7 +5234,7 @@ static void destinationReuse()
     {
         /* ...and the decoder's own state: a truncated message A leaves a partial
          * field buffered, which must not bleed into message B. */
-        sofab::IStreamObject<SeqMsg> in;
+        sofab::IStreamObject<SeqMsg> in{kMaxSpan};
         auto truncated = fromHex("0e020a78" "0a0a"); /* element 1's payload missing */
         auto r = in.feed(truncated.data(), truncated.size());
         CHECK(r.incomplete(), "reuse: a truncated message A is INCOMPLETE");
@@ -5188,7 +5251,7 @@ static void destinationReuse()
      *     the day this changes, it changes deliberately -- and documented as the
      *     reason reset() exists (README "One message per destination"). --- */
     {
-        sofab::IStreamObject<SeqMsg> in;
+        sofab::IStreamObject<SeqMsg> in{kMaxSpan};
         in.feed(msgA_tags.data(), msgA_tags.size());
         in.feed(msgB.data(), msgB.size());
         CHECK((*in).tags.size() == 2,
@@ -5198,7 +5261,7 @@ static void destinationReuse()
     {
         /* the same continuation semantics is what makes chunked decoding work at
          * all: a field boundary is not a message boundary. */
-        sofab::IStreamObject<SeqMsg> in;
+        sofab::IStreamObject<SeqMsg> in{kMaxSpan};
         auto whole = fromHex("0e020a780a0a7907" "4801");
         in.feed(whole.data(), 8);
         in.feed(whole.data() + 8, whole.size() - 8);
@@ -5210,7 +5273,7 @@ static void destinationReuse()
      * destinations are its business (there is no destination to reset here). */
     {
         int calls = 0;
-        sofab::IStreamInline in([&](sofab::id, size_t, size_t) { ++calls; });
+        sofab::IStreamInline in([&](sofab::id, size_t, size_t) { ++calls; }, kMaxSpan);
         auto truncated = fromHex("0e020a78" "0a0a");
         CHECK(in.feed(truncated.data(), truncated.size()).incomplete(),
               "IStreamInline: truncated input is INCOMPLETE");
@@ -5310,7 +5373,7 @@ static void varintWidthSweep()
               std::equal(want.begin(), want.end(), got.begin()),
           "varint sweep: every unsigned width is byte-exact vs the reference");
 
-    sofab::IStreamObject<SweepU> inu;
+    sofab::IStreamObject<SweepU> inu{kMaxSpan};
     CHECK(inu.feed(got.data(), os.bytesUsed()).complete(), "varint sweep: unsigned array decodes COMPLETE");
     CHECK((*inu).v == vals, "varint sweep: every unsigned width round-trips");
 
@@ -5330,7 +5393,7 @@ static void varintWidthSweep()
               std::equal(swant.begin(), swant.end(), sgot.begin()),
           "varint sweep: every signed width is byte-exact vs the reference");
 
-    sofab::IStreamObject<SweepI> ini;
+    sofab::IStreamObject<SweepI> ini{kMaxSpan};
     CHECK(ini.feed(sgot.data(), sos.bytesUsed()).complete(), "varint sweep: signed array decodes COMPLETE");
     CHECK((*ini).v == svals, "varint sweep: every signed width round-trips");
 
@@ -5344,7 +5407,7 @@ static void varintWidthSweep()
 
     /* One byte at a time: the decoder never sees a full varint window, so every
      * element goes through the short-tail loop and the reassembly path. */
-    sofab::IStreamObject<SweepU> inc;
+    sofab::IStreamObject<SweepU> inc{kMaxSpan};
     sofab::DecodeStatus last = sofab::DecodeStatus::Incomplete;
     for (size_t i = 0; i < tight.size(); ++i)
         last = inc.feed(tight.data() + i, 1).status();
@@ -5423,7 +5486,7 @@ static void trailingDefaultsStayOnTheWire()
     std::vector<uint32_t> u{1, 2, 3, 0, 0};
     std::vector<float> f{1.0f, 0.0f, 0.0f};
     os.write(0, u).write(1, f);
-    sofab::IStreamObject<TrailMsg> in;
+    sofab::IStreamObject<TrailMsg> in{kMaxSpan};
     CHECK(in.feed(os.data(), os.bytesUsed()).complete(),
           "trailing defaults: the message decodes COMPLETE");
     CHECK((*in).u == u, "trailing defaults: the unsigned array keeps its length");
@@ -5446,7 +5509,7 @@ static void nestedArrayCountCeiling()
     };
     checkStreamReuse<Nested>("nestedArrayCountCeiling/Nested");
     auto outcome = [](const std::vector<uint8_t> &b) {
-        sofab::IStreamObject<Nested> in;
+        sofab::IStreamObject<Nested> in{kMaxSpan};
         return in.feed(b.data(), b.size()).code();
     };
 
@@ -5514,11 +5577,234 @@ static void nestedArrayCountCeiling()
  *     checks. That is what a dead third parser, unreachable but ready to be wired
  *     up, trips on (issue #88). --- */
 
+/* The probes above have to be dependent to be answerable: a requires-expression
+ * whose failure is not a substitution failure is a hard error, not `false`. */
+namespace CapOmittable
+{
+    template <typename Is, typename V> concept readString  = requires(Is &is, V &v) { is.readString(v); };
+    template <typename Is, typename V> concept readBlob    = requires(Is &is, V &v) { is.readBlob(v); };
+    template <typename Is, typename V> concept readArray   = requires(Is &is, V &v) { is.readArray(v); };
+    template <typename Is>             concept acceptsString = requires(Is &is) { is.acceptsString(); };
+    template <typename Is>             concept acceptsBlob   = requires(Is &is) { is.acceptsBlob(); };
+    template <typename Is, typename V> concept freeReadString = requires(Is &is, V &v) { sofab::readString(is, v); };
+    template <typename Is, typename V> concept freeReadBlob   = requires(Is &is, V &v) { sofab::readBlob(is, v); };
+    template <typename Is, typename V> concept freeReadArray  = requires(Is &is, V &v) { sofab::readArray(is, v); };
+    template <typename Is, typename V> concept readStringCapped =
+        requires(Is &is, V &v) { is.readStringCapped(v, 8L); };
+    template <typename Is, typename V> concept freeReadArrayCapped =
+        requires(Is &is, V &v) { sofab::readArrayCapped(is, v, 8L); };
+    template <typename Is, typename V> concept gatedString =
+        requires(Is &is, V &v) { is.readStringGated(v, -1L, -1L); };
+    template <typename Is, typename V> concept gatedArray =
+        requires(Is &is, V &v) { is.readArrayGated(v, -1L, -1L, sofab::ElemBound{}); };
+} // namespace CapOmittable
+
+/* --- §6.2.1: the codec holds NO limit, and none can be left out ------------
+ *
+ * Two audit findings, one rule. §6.2.1: a codec "MUST NOT hold a limit of its
+ * own, MUST NOT supply a default for one it was not given, MUST NOT read an
+ * omitted argument as *unlimited*, and MUST NOT clamp to one", and "A format
+ * ceiling reached because no cap was stated is the FORMAT's bound, not a
+ * receiver cap, and a port MUST NOT present it as one."
+ *
+ *  1. `Limits::max_buffered_field` was a fourth receiver cap the codec held: a
+ *     `= SIZE_MAX` DEFAULT in the struct, a member seeded with it, a
+ *     `maxBufferedField_ != SIZE_MAX` UNLIMITED MODE, and a breach reported in
+ *     §6.2.1's own `LimitExceeded` category. It is a receiver cap -- configured
+ *     by the deployment, exclusive with the schema bound, a policy rejection on
+ *     well-formed bytes -- so the category is right and the other three are not.
+ *     It is now a required constructor argument with no default and no mode.
+ *
+ *  2. Every per-read cap defaulted to `-1` and every guard read `dynCap >= 0`,
+ *     so `is.readString(s)` on a schema-unbounded field compiled, ran, and was
+ *     bounded by nothing. The header ASSERTED that "a negative dynCap means no
+ *     cap was supplied, not unlimited" -- and no branch acted on it. The capped
+ *     reads now have their own entry points, take a required number, and refuse
+ *     a negative one.
+ *
+ * Both halves are structural, so both are checked structurally: a defaulted
+ * argument that nobody passes reads identically to a required one in a diff, and
+ * a decode that happens not to exceed an absent cap passes either way. --- */
+static void receiverCapsAreNeitherHeldNorOmittable()
+{
+    /* --- 1. no default, anywhere on the way in. ---------------------------- */
+    static_assert(!std::is_default_constructible_v<sofab::Limits>,
+                  "§6.2.1: Limits must not default a receiver cap");
+    static_assert(!std::is_default_constructible_v<sofab::IStreamObject<ScalarMsg>>,
+                  "§6.2.1: a stream must not come into existence with a cap it invented");
+    static_assert(!std::is_default_constructible_v<sofab::IStreamInline>,
+                  "§6.2.1: a stream must not come into existence with a cap it invented");
+    static_assert(!std::is_constructible_v<sofab::IStreamInline, sofab::IStreamInline::fieldCallback>,
+                  "§6.2.1: the field-span cap must not be an argument the caller may omit");
+    static_assert(std::is_constructible_v<sofab::IStreamObject<ScalarMsg>, sofab::Limits>,
+                  "the stated cap is still how a stream is built");
+
+    /* --- 2. a cap-bearing read cannot be spelled without its number. ------- */
+    using S = std::string;
+    using B = std::vector<uint8_t>;
+    using A = std::vector<uint32_t>;
+    static_assert(!CapOmittable::readString<sofab::IStreamImpl, S>,
+                  "§6.2.1: readString must not decode with no bound and no cap");
+    static_assert(!CapOmittable::readBlob<sofab::IStreamImpl, B>,
+                  "§6.2.1: readBlob must not decode with no bound and no cap");
+    static_assert(!CapOmittable::readArray<sofab::IStreamImpl, A>,
+                  "§6.2.1: readArray must not decode with no bound and no cap");
+    static_assert(!CapOmittable::acceptsString<sofab::IStreamImpl>,
+                  "§6.2.1: acceptsString must not admit a field with no bound and no cap");
+    static_assert(!CapOmittable::acceptsBlob<sofab::IStreamImpl>,
+                  "§6.2.1: acceptsBlob must not admit a field with no bound and no cap");
+    static_assert(!CapOmittable::freeReadString<sofab::IStreamImpl, S>,
+                  "§6.2.1: the helper layer must not size a destination with no number stated");
+    static_assert(!CapOmittable::freeReadBlob<sofab::IStreamImpl, B>,
+                  "§6.2.1: the helper layer must not size a destination with no number stated");
+    static_assert(!CapOmittable::freeReadArray<sofab::IStreamImpl, A>,
+                  "§6.2.1: the helper layer must not size a destination with no number stated");
+    /* And the capped forms ARE reachable, so the asserts above pin the omission
+     * rather than a typo. */
+    static_assert(CapOmittable::readStringCapped<sofab::IStreamImpl, S>,
+                  "the capped read is how a schema-unbounded string is read");
+    static_assert(CapOmittable::freeReadArrayCapped<sofab::IStreamImpl, A>,
+                  "the capped read is how a schema-unbounded array is read");
+    /* The shared bodies that DO take both numbers are not reachable from
+     * outside: a `(-1, -1)` call is the fail-open shape, and there must be no
+     * way to spell it. */
+    static_assert(!CapOmittable::gatedString<sofab::IStreamImpl, S>,
+                  "§6.2.1: the unchecked shared body must not be a public entry point");
+    static_assert(!CapOmittable::gatedArray<sofab::IStreamImpl, A>,
+                  "§6.2.1: the unchecked shared body must not be a public entry point");
+    /* A collector cannot leave its index cap out either: both are constructor
+     * arguments with no defaults. */
+    static_assert(!std::is_constructible_v<sofab::StringSeq<std::vector<std::string>>,
+                                           std::vector<std::string> &, long, long>,
+                  "§6.2.1: a wrapper-array collector must not default its receiver caps");
+    static_assert(std::is_constructible_v<sofab::StringSeq<std::vector<std::string>>,
+                                          std::vector<std::string> &, long, long, long, long>,
+                  "the stated caps are still how a collector is built");
+
+    /* --- 3. the two entry points do not answer differently, and the §7.3 skip
+     *        still wins over both. A field the decoder must skip is never
+     *        capped (§6.2.1), which is the whole reason the cap rides INSIDE the
+     *        read rather than in front of it. --- */
+    struct SplitMsg : sofab::IStreamMessage
+    {
+        std::string bounded, unbounded;
+        void deserialize(sofab::IStreamImpl &is, sofab::id id, size_t, size_t) noexcept override
+        {
+            if (id == 1) (void)sofab::readString(is, bounded, 8);            /* maxlen: 8 */
+            if (id == 2) (void)sofab::readStringCapped(is, unbounded, 8);    /* cap: 8    */
+        }
+    };
+    auto strField = [](sofab::id id, size_t len) {
+        std::vector<uint8_t> w;
+        appendVarint(w, (static_cast<uint64_t>(id) << 3) | 2u);
+        appendVarint(w, (static_cast<uint64_t>(len) << 3) | 2u);
+        w.insert(w.end(), len, 'q');
+        return w;
+    };
+    auto blobField = [](sofab::id id, size_t len) {
+        std::vector<uint8_t> w;
+        appendVarint(w, (static_cast<uint64_t>(id) << 3) | 2u);
+        appendVarint(w, (static_cast<uint64_t>(len) << 3) | 3u); /* Fix::Blob */
+        w.insert(w.end(), len, 'q');
+        return w;
+    };
+    {
+        const auto w = strField(1, 9);
+        sofab::IStreamObject<SplitMsg> in{kMaxSpan};
+        auto r = in.feed(w.data(), w.size());
+        CHECK(r.invalid() && !r.limitExceeded(),
+              "split reads: past the declared maxlen is INVALID (§7.1)");
+    }
+    {
+        const auto w = strField(2, 9);
+        sofab::IStreamObject<SplitMsg> in{kMaxSpan};
+        auto r = in.feed(w.data(), w.size());
+        CHECK(r.limitExceeded() && !r.invalid() && !r.invalidArgument(),
+              "split reads: past the receiver cap is LimitExceeded (§6.2.1), not INVALID");
+        CHECK((*in).unbounded.empty(), "split reads: and nothing was materialised for it");
+    }
+    {
+        const auto w = strField(2, 8);
+        sofab::IStreamObject<SplitMsg> in{kMaxSpan};
+        CHECK(in.feed(w.data(), w.size()).complete() && (*in).unbounded.size() == 8,
+              "split reads: a value AT the cap decodes in full -- a cap rejects, never truncates");
+    }
+    {   /* an over-cap BLOB at the `string` id: §7.3 says skip, and a skipped
+         * field is never capped. */
+        const auto w = blobField(2, 64);
+        sofab::IStreamObject<SplitMsg> in{kMaxSpan};
+        auto r = in.feed(w.data(), w.size());
+        CHECK(r.complete() && !r.limitExceeded() && !r.invalidArgument(),
+              "split reads: a §7.3-mistyped over-cap field is skipped, not capped");
+        CHECK((*in).unbounded.empty(), "split reads: and the destination is untouched");
+    }
+
+    /* --- 4. the structural half: the shapes the audit found must not come
+     *        back. A defaulted argument nobody passes and a required one read
+     *        the same in a diff, so this reads the header itself -- the same
+     *        method headerParsersEnforceCeilings uses, and for the same reason:
+     *        a green decode is not evidence that the mode is gone. --- */
+#ifndef SOFAB_HEADER_SOURCE_PATH
+    std::printf("SKIP: receiver caps: structural check needs -DSOFAB_HEADER_SOURCE_PATH\n");
+#else
+    std::ifstream src(SOFAB_HEADER_SOURCE_PATH, std::ios::binary);
+    std::string text((std::istreambuf_iterator<char>(src)), std::istreambuf_iterator<char>());
+    CHECK(text.size() > 1024, "receiver caps: the header source is readable");
+
+    /* Finding 1: the held default and the unlimited mode. */
+    CHECK(text.find("max_buffered_field = ") == std::string::npos,
+          "receiver caps: Limits declares no default for the field-span cap");
+    CHECK(text.find("maxBufferedField_ = ") == std::string::npos,
+          "receiver caps: the stream seeds no field-span cap of its own");
+    CHECK(text.find("maxBufferedField_ != SIZE_MAX") == std::string::npos,
+          "receiver caps: there is no sentinel that switches the field-span check off");
+    CHECK(text.find("Limits limits = {}") == std::string::npos,
+          "receiver caps: no stream constructor defaults its Limits");
+
+    /* Finding 2: the defaulted per-read caps. Each of these substrings IS the
+     * defect -- an argument the caller may leave out on a call that bounds an
+     * allocation. */
+    static const char *const kNoDefault[] = {
+        "long bound = -1",       "long dynCap = -1",   "long maxlen = -1",
+        "long schemaCount = -1", "long indexCap = -1", "long elemLenCap = -1",
+        "long capacity = -1",    "long elemMax = -1",  "long elemDynCap = -1",
+    };
+    for (const char *frag : kNoDefault)
+    {
+        static char msg[192];
+        std::snprintf(msg, sizeof msg,
+                      "receiver caps: no cap-bearing PARAMETER defaults (`%s`)", frag);
+        /* Parameter position only: `, name = -1,` or `, name = -1)`. A MEMBER of
+         * the same name may still carry a sentinel where the type is an
+         * aggregate and a mandatory field is not expressible -- MessageSeq's
+         * `dynCap` is the one such case, and it is diagnosed at the first
+         * element instead (seqIndexAdmitted). What must not exist is an
+         * ARGUMENT the caller can leave out. */
+        bool found = false;
+        for (size_t at = text.find(frag); at != std::string::npos;
+             at = text.find(frag, at + 1))
+        {
+            const size_t after = at + std::strlen(frag);
+            if (after < text.size() && (text[after] == ',' || text[after] == ')'))
+            { found = true; break; }
+        }
+        CHECK(!found, msg);
+    }
+    /* The other half of the same rule: the collectors' caps are constructor
+     * arguments, so their MEMBERS carry no initialiser to fall back on either --
+     * except MessageSeq's, above. */
+    CHECK(text.find("long dynCap;") != std::string::npos,
+          "receiver caps: a collector's index cap is a member with no default");
+    CHECK(text.find("long elemDynCap;") != std::string::npos,
+          "receiver caps: a collector's element cap is a member with no default");
+#endif
+}
+
 static void headerParsersEnforceCeilings()
 {
     /* Half 1: the callback entry point rejects each ceiling violation. */
     auto viaCallback = [](const std::vector<uint8_t> &b) {
-        sofab::IStreamInline in([](sofab::id, size_t, size_t) noexcept {});
+        sofab::IStreamInline in([](sofab::id, size_t, size_t) noexcept {}, kMaxSpan);
         return in.feed(b.data(), b.size()).code();
     };
 
@@ -5550,7 +5836,7 @@ static void headerParsersEnforceCeilings()
         std::vector<uint8_t> b = {0x05, 0x02, (4u << 3) | 0u};
         b.insert(b.end(), 8, 0x00);
         size_t seen = 0;
-        sofab::IStreamInline in([&seen](sofab::id, size_t, size_t) noexcept { ++seen; });
+        sofab::IStreamInline in([&seen](sofab::id, size_t, size_t) noexcept { ++seen; }, kMaxSpan);
         CHECK(in.feed(b.data(), b.size()).code() == sofab::Error::None && seen == 1,
               "header parsers: callback path still decodes a legal fixlen array");
     }
@@ -5667,7 +5953,7 @@ static void toleranceInput()
         const std::vector<uint8_t> w = {0x88, 0x00, 0x2a};
         uint64_t got = 0;
         sofab::id gotId = 999;
-        sofab::IStreamInline is([&](sofab::id id, size_t, size_t) { gotId = id; sofab::read(is, got); });
+        sofab::IStreamInline is([&](sofab::id id, size_t, size_t) { gotId = id; sofab::read(is, got); }, kMaxSpan);
         auto r = is.feed(w.data(), w.size());
         CHECK(r.complete(), "tolerance: a non-minimal field header decodes COMPLETE, not INVALID");
         CHECK(gotId == 1 && got == 42, "tolerance: and denotes the same field and value");
@@ -5678,7 +5964,7 @@ static void toleranceInput()
     {
         const std::vector<uint8_t> w = {0x0a, 0x8a, 0x00, 'x'};
         std::string got;
-        sofab::IStreamInline is([&](sofab::id, size_t, size_t) { sofab::readString(is, got); });
+        sofab::IStreamInline is([&](sofab::id, size_t, size_t) { sofab::readStringCapped(is, got, kAnyLen); }, kMaxSpan);
         auto r = is.feed(w.data(), w.size());
         CHECK(r.complete(), "tolerance: a non-minimal fixlen_word decodes COMPLETE");
         CHECK(got == "x", "tolerance: and denotes the same payload length");
@@ -5689,7 +5975,7 @@ static void toleranceInput()
     {
         const std::vector<uint8_t> w = {0x0b, 0x82, 0x00, 0x01, 0x02};
         std::vector<uint32_t> got;
-        sofab::IStreamInline is([&](sofab::id, size_t, size_t) { sofab::readArray(is, got); });
+        sofab::IStreamInline is([&](sofab::id, size_t, size_t) { sofab::readArrayCapped(is, got, kAnyCount); }, kMaxSpan);
         auto r = is.feed(w.data(), w.size());
         CHECK(r.complete(), "tolerance: a non-minimal element count decodes COMPLETE");
         CHECK(got.size() == 2 && got[0] == 1 && got[1] == 2,
@@ -5702,7 +5988,7 @@ static void toleranceInput()
      *    `07`. This is the case a uniformly-too-strict family cannot catch. */
     {
         const std::vector<uint8_t> w = {0x0e, 0x00, 0x01, 0x2f};
-        sofab::IStreamObject<TolParent> in;
+        sofab::IStreamObject<TolParent> in{kMaxSpan};
         auto r = in.feed(w.data(), w.size());
         CHECK(r.complete(), "tolerance: a sequence-end header with id 5 decodes COMPLETE");
         CHECK((*in).c.a == 1, "tolerance: and the sequence's content survives it");
@@ -5715,7 +6001,7 @@ static void toleranceInput()
     {
         /* the canonical form of the same message decodes identically */
         const std::vector<uint8_t> w = {0x0e, 0x00, 0x01, 0x07};
-        sofab::IStreamObject<TolParent> in;
+        sofab::IStreamObject<TolParent> in{kMaxSpan};
         CHECK(in.feed(w.data(), w.size()).complete() && (*in).c.a == 1,
               "tolerance: the canonical sequence end decodes to the same value");
     }
@@ -5728,7 +6014,7 @@ static void toleranceInput()
     {
         std::vector<uint8_t> w = {0x0e, 0x00, 0x01};
         appendVarint(w, (uint64_t{1} << 31 << 3) | 7u); /* id 2^31 > ID_MAX */
-        sofab::IStreamObject<TolParent> in;
+        sofab::IStreamObject<TolParent> in{kMaxSpan};
         auto r = in.feed(w.data(), w.size());
         CHECK(r.invalid(), "tolerance: an oversized id on a sequence-end header is INVALID");
     }
@@ -5742,7 +6028,7 @@ static void toleranceInput()
     {
         const std::vector<uint8_t> w = {0x02, 0x84}; /* id 0 fixlen; word byte 0: subtype 4 */
         std::string got;
-        sofab::IStreamInline is([&](sofab::id, size_t, size_t) { sofab::readString(is, got); });
+        sofab::IStreamInline is([&](sofab::id, size_t, size_t) { sofab::readStringCapped(is, got, kAnyLen); }, kMaxSpan);
         auto r = is.feed(w.data(), w.size());
         CHECK(r.incomplete() && !r.invalid(),
               "tolerance: a fixlen_word cut after a reserved-subtype first byte is INCOMPLETE");
@@ -5769,9 +6055,9 @@ static void toleranceInput()
             uint64_t u = 0;
             sofab::IStreamInline is([&](sofab::id, size_t, size_t) {
                 sofab::read(is, u);
-                sofab::readString(is, sink);
-                sofab::readArray(is, arr);
-            });
+                sofab::readStringCapped(is, sink, kAnyLen);
+                sofab::readArrayCapped(is, arr, kAnyCount);
+            }, kMaxSpan);
             sofab::Error last = sofab::Error::None;
             for (uint8_t b : w) last = is.feed(&b, 1).code();
             if (last != sofab::Error::None) allComplete = false;
@@ -6460,9 +6746,9 @@ static void chunkLifetime()
         {
             switch (id)
             {
-                case 1: sofab::readString(is, s); break;
-                case 2: sofab::readBlob(is, b); break;
-                case 3: sofab::readArray(is, a); break;
+                case 1: sofab::readStringCapped(is, s, kAnyLen); break;
+                case 2: sofab::readBlobCapped(is, b, kAnyLen); break;
+                case 3: sofab::readArrayCapped(is, a, kAnyCount); break;
                 case 4: sofab::readString(is, fs, 32); break;
             }
         }
@@ -6487,7 +6773,7 @@ static void chunkLifetime()
 
     for (size_t chunk : {size_t{1}, size_t{3}, size_t{17}, msg.size()})
     {
-        sofab::IStreamObject<Payload> in;
+        sofab::IStreamObject<Payload> in{kMaxSpan};
         sofab::DecodeStatus last = sofab::DecodeStatus::Incomplete;
         for (size_t i = 0; i < msg.size(); i += chunk)
         {
@@ -6674,11 +6960,22 @@ struct SweepArrMsg : sofab::IStreamMessage
 {
     C v{};
     long count = -1;                 /**< declared `count: N` (§7.1)     */
-    long cap = -1;                   /**< configured decode limit (#102) */
+    /* The configured receiver cap (#102). Its default is the widest count the
+     * format can carry rather than "none": a schema-unbounded array is read
+     * through readArrayCapped, which takes a REQUIRED number (§6.2.1). A sweep
+     * row that is not about the cap therefore states one that never fires. */
+    long cap = kAnyCount;
     sofab::ElemBound bound{};        /**< declared element width (§7.1)  */
     void deserialize(sofab::IStreamImpl &is, sofab::id id, size_t, size_t) noexcept override
     {
-        if (id == 15) sofab::readArray(is, v, count, cap, bound);
+        /* Exactly one of the two numbers can apply (§6.2.1), and the entry
+         * point is what says which: the declared `count` where the schema
+         * stated one, the configured cap where it did not. */
+        if (id == 15)
+        {
+            if (count >= 0) sofab::readArray(is, v, count, bound);
+            else            sofab::readArrayCapped(is, v, cap, bound);
+        }
     }
 };
 
@@ -6756,7 +7053,7 @@ static void sweepIntArray(const char *name)
     for (bool armed : {false, true})
     {
         const auto w = intArrayWire(sign, raws);
-        sofab::IStreamObject<SweepArrMsg<C>> in;
+        sofab::IStreamObject<SweepArrMsg<C>> in{kMaxSpan};
         (*in).bound = armed ? bound : sofab::ElemBound{};
         CHECK(in.feed(w.data(), w.size()).code() == sofab::Error::None,
               say(armed ? "an in-width array decodes COMPLETE (bounded)"
@@ -6769,7 +7066,7 @@ static void sweepIntArray(const char *name)
 
         /* ...and byte by byte, which is the same message through the checked
          * loops instead of the windowed ones. */
-        sofab::IStreamObject<SweepArrMsg<C>> drip;
+        sofab::IStreamObject<SweepArrMsg<C>> drip{kMaxSpan};
         (*drip).bound = armed ? bound : sofab::ElemBound{};
         CHECK(dripFeed(drip, w) == sofab::Error::None,
               say("the same array fed one byte at a time is COMPLETE too"));
@@ -6791,13 +7088,13 @@ static void sweepIntArray(const char *name)
         auto bad = raws;
         bad[pos] = overWide;
         const auto w = intArrayWire(sign, bad);
-        sofab::IStreamObject<SweepArrMsg<C>> in;
+        sofab::IStreamObject<SweepArrMsg<C>> in{kMaxSpan};
         (*in).bound = bound;
         CHECK(in.feed(w.data(), w.size()).code() == sofab::Error::InvalidMessage,
               say("an over-width element is INVALID (§7.1)"));
         /* the identical bytes with no declared width decode unchanged: the bound
          * is opt-in, so a caller that has no schema keeps the decode it had. */
-        sofab::IStreamObject<SweepArrMsg<C>> loose;
+        sofab::IStreamObject<SweepArrMsg<C>> loose{kMaxSpan};
         CHECK(loose.feed(w.data(), w.size()).code() == sofab::Error::None,
               say("the same element without a declared width decodes"));
     }
@@ -6816,7 +7113,7 @@ static void sweepIntArray(const char *name)
                 if (i == pos) w.insert(w.end(), tooWide.begin(), tooWide.end());
                 else          appendVarint(w, raws[i]);
             }
-            sofab::IStreamObject<SweepArrMsg<C>> in;
+            sofab::IStreamObject<SweepArrMsg<C>> in{kMaxSpan};
             (*in).bound = armed ? bound : sofab::ElemBound{};
             CHECK(in.feed(w.data(), w.size()).code() == sofab::Error::InvalidMessage,
                   say("a >64-bit array element is INVALID (§4.1)"));
@@ -6829,7 +7126,7 @@ static void sweepIntArray(const char *name)
     {
         auto cut = intArrayWire(sign, raws);
         cut.resize(cut.size() - 6);
-        sofab::IStreamObject<SweepArrMsg<C>> in;
+        sofab::IStreamObject<SweepArrMsg<C>> in{kMaxSpan};
         (*in).bound = armed ? bound : sofab::ElemBound{};
         CHECK(in.feed(cut.data(), cut.size()).code() == sofab::Error::Incomplete,
               say("a cut array payload is INCOMPLETE (§7)"));
@@ -6837,7 +7134,7 @@ static void sweepIntArray(const char *name)
          * to tell "ran dry" (INCOMPLETE) from "over-long" (INVALID). */
         auto mid = intArrayWire(sign, raws);
         mid.back() = 0x80; /* a continuation byte with nothing after it */
-        sofab::IStreamObject<SweepArrMsg<C>> half;
+        sofab::IStreamObject<SweepArrMsg<C>> half{kMaxSpan};
         (*half).bound = armed ? bound : sofab::ElemBound{};
         CHECK(half.feed(mid.data(), mid.size()).code() == sofab::Error::Incomplete,
               say("a cut inside an element's varint is INCOMPLETE, not over-long"));
@@ -6846,7 +7143,7 @@ static void sweepIntArray(const char *name)
     /* --- the ceilings, in the order §7 fixes them. --- */
     {   /* 2. the declared `count` -- a schema fact, so INVALID. */
         const auto w = intArrayWire(sign, raws);
-        sofab::IStreamObject<SweepArrMsg<C>> in;
+        sofab::IStreamObject<SweepArrMsg<C>> in{kMaxSpan};
         (*in).count = static_cast<long>(n) - 1;
         CHECK(in.feed(w.data(), w.size()).code() == sofab::Error::InvalidMessage,
               say("a wire count past the declared `count` is INVALID (§7.1)"));
@@ -6855,7 +7152,7 @@ static void sweepIntArray(const char *name)
          *    (§6.2.1) and never folded into INVALID: the bytes are well-formed
          *    and decode elsewhere. */
         const auto w = intArrayWire(sign, raws);
-        sofab::IStreamObject<SweepArrMsg<C>> in;
+        sofab::IStreamObject<SweepArrMsg<C>> in{kMaxSpan};
         (*in).cap = static_cast<long>(n) - 1;
         auto r = in.feed(w.data(), w.size());
         CHECK(r.code() == sofab::Error::LimitExceeded && !r.invalid(),
@@ -6865,7 +7162,7 @@ static void sweepIntArray(const char *name)
          *    at the same id is not this field's value at all (§7.3), so neither
          *    ceiling nor the width bound is ever applied to it. */
         const auto w = intArrayWire(!sign, raws);
-        sofab::IStreamObject<SweepArrMsg<C>> in;
+        sofab::IStreamObject<SweepArrMsg<C>> in{kMaxSpan};
         (*in).count = 1;
         (*in).cap = 1;
         (*in).bound = bound;
@@ -6921,7 +7218,7 @@ static void sweepFloatArray(const char *name)
 
     {
         const auto w = wire(n, n);
-        sofab::IStreamObject<SweepArrMsg<C>> in;
+        sofab::IStreamObject<SweepArrMsg<C>> in{kMaxSpan};
         CHECK(in.feed(w.data(), w.size()).code() == sofab::Error::None,
               say("a full fixlen array decodes COMPLETE"));
         bool values = true;
@@ -6932,7 +7229,7 @@ static void sweepFloatArray(const char *name)
     {   /* §7: the payload stops short. INCOMPLETE, and the destination is not
          *    grown for a count the readable bytes cannot back. */
         const auto w = wire(n, n - 1);
-        sofab::IStreamObject<SweepArrMsg<C>> in;
+        sofab::IStreamObject<SweepArrMsg<C>> in{kMaxSpan};
         CHECK(in.feed(w.data(), w.size()).code() == sofab::Error::Incomplete,
               say("a cut fixlen payload is INCOMPLETE"));
     }
@@ -6940,7 +7237,7 @@ static void sweepFloatArray(const char *name)
          *    type, so it is skipped like an unknown id -- and its count, which is
          *    past both ceilings below, is never measured. */
         const auto w = intArrayWire(false, {1, 2, 3, 4, 5, 6, 7, 8});
-        sofab::IStreamObject<SweepArrMsg<C>> in;
+        sofab::IStreamObject<SweepArrMsg<C>> in{kMaxSpan};
         (*in).count = 1;
         (*in).cap = 1;
         auto r = in.feed(w.data(), w.size());
@@ -6949,11 +7246,11 @@ static void sweepFloatArray(const char *name)
     }
     {   /* §7.1 then §6.2.1 -- the same two ceilings, the same split verdict. */
         const auto w = wire(n, n);
-        sofab::IStreamObject<SweepArrMsg<C>> in;
+        sofab::IStreamObject<SweepArrMsg<C>> in{kMaxSpan};
         (*in).count = static_cast<long>(n) - 1;
         CHECK(in.feed(w.data(), w.size()).code() == sofab::Error::InvalidMessage,
               say("a wire count past the declared `count` is INVALID"));
-        sofab::IStreamObject<SweepArrMsg<C>> capped;
+        sofab::IStreamObject<SweepArrMsg<C>> capped{kMaxSpan};
         (*capped).cap = static_cast<long>(n) - 1;
         auto r = capped.feed(w.data(), w.size());
         CHECK(r.code() == sofab::Error::LimitExceeded && !r.invalid(),
@@ -6961,7 +7258,7 @@ static void sweepFloatArray(const char *name)
     }
     {   /* one byte at a time: same verdict, same values (§7.2 item 4). */
         const auto w = wire(n, n);
-        sofab::IStreamObject<SweepArrMsg<C>> in;
+        sofab::IStreamObject<SweepArrMsg<C>> in{kMaxSpan};
         CHECK(dripFeed(in, w) == sofab::Error::None,
               say("the same array fed one byte at a time is COMPLETE"));
         CHECK((*in).v[n - 1] == static_cast<E>(n - 1) + E{0.5},
@@ -6973,11 +7270,11 @@ static void sweepFloatArray(const char *name)
          * neither malformation nor a configured limit, because the same bytes
          * decode into a growable destination and no cap was ever set. */
         const auto w = wire(n + 1, n + 1);
-        sofab::IStreamObject<SweepArrMsg<C>> in;
+        sofab::IStreamObject<SweepArrMsg<C>> in{kMaxSpan};
         auto r = in.feed(w.data(), w.size());
         CHECK(r.code() == sofab::Error::InvalidArgument && !r.invalid() && !r.limitExceeded(),
               say("an over-capacity count is InvalidArgument, never truncated in"));
-        sofab::IStreamObject<SweepArrMsg<C>> declared;
+        sofab::IStreamObject<SweepArrMsg<C>> declared{kMaxSpan};
         (*declared).count = static_cast<long>(n);
         CHECK(declared.feed(w.data(), w.size()).code() == sofab::Error::InvalidMessage,
               say("under a declared `count` the same overflow is INVALID (§7.1)"));
@@ -7012,7 +7309,7 @@ static void sweepCappedDestination(const char *name)
 
     {
         const auto w = intArrayWire(false, fits);
-        sofab::IStreamObject<SweepArrMsg<C>> in;
+        sofab::IStreamObject<SweepArrMsg<C>> in{kMaxSpan};
         (*in).bound = sofab::ElemBound::of<E>();
         CHECK(in.feed(w.data(), w.size()).code() == sofab::Error::None,
               say("a count the destination can hold decodes"));
@@ -7021,14 +7318,14 @@ static void sweepCappedDestination(const char *name)
     }
     {
         const auto w = intArrayWire(false, over);
-        sofab::IStreamObject<SweepArrMsg<C>> in;
+        sofab::IStreamObject<SweepArrMsg<C>> in{kMaxSpan};
         auto r = in.feed(w.data(), w.size());
         CHECK(r.code() == sofab::Error::InvalidArgument && !r.invalid() && !r.limitExceeded(),
               say("an over-capacity count with no declared `count` is InvalidArgument"));
     }
     {
         const auto w = intArrayWire(false, over);
-        sofab::IStreamObject<SweepArrMsg<C>> in;
+        sofab::IStreamObject<SweepArrMsg<C>> in{kMaxSpan};
         (*in).count = static_cast<long>(cap);
         CHECK(in.feed(w.data(), w.size()).code() == sofab::Error::InvalidMessage,
               say("under a declared `count` the same overflow is INVALID (§7.1)"));
@@ -7111,13 +7408,13 @@ static void checkUtf8AtEverySplit(const char *name, const std::vector<uint8_t> &
     };
 
     {
-        sofab::IStreamObject<M> in;
+        sofab::IStreamObject<M> in{kMaxSpan};
         CHECK(in.feed(w.data(), w.size()).code() == want,
               say("the whole message in one feed"));
     }
     for (size_t k = 1; k < w.size(); ++k)
     {
-        sofab::IStreamObject<M> in;
+        sofab::IStreamObject<M> in{kMaxSpan};
         auto r1 = in.feed(w.data(), k);
         /* The field is unfinished, so nothing is decided yet: a prefix must be
          * INCOMPLETE. Judging the truncated payload here would report INVALID
@@ -7128,7 +7425,7 @@ static void checkUtf8AtEverySplit(const char *name, const std::vector<uint8_t> &
         CHECK(r2.code() == want, say("the completing chunk decides, at every split"));
     }
     {   /* one byte at a time: the pathological chunking, same verdict. */
-        sofab::IStreamObject<M> in;
+        sofab::IStreamObject<M> in{kMaxSpan};
         sofab::Error last = sofab::Error::Incomplete;
         for (uint8_t b : w) last = in.feed(&b, 1).code();
         CHECK(last == want, say("one byte at a time reaches the same verdict"));
@@ -7208,14 +7505,14 @@ static void checkEverySplit(const char *name, const std::vector<uint8_t> &w, Che
     };
 
     {
-        sofab::IStreamObject<M> in;
+        sofab::IStreamObject<M> in{kMaxSpan};
         CHECK(in.feed(w.data(), w.size()).code() == sofab::Error::None,
               say("the whole message decodes COMPLETE"));
         CHECK(check(*in), say("the whole message decodes to the expected values"));
     }
     for (size_t k = 1; k < w.size(); ++k)
     {
-        sofab::IStreamObject<M> in;
+        sofab::IStreamObject<M> in{kMaxSpan};
         const auto r1 = in.feed(w.data(), k);
         CHECK(r1.code() == sofab::Error::Incomplete || r1.code() == sofab::Error::None,
               say("a prefix is INCOMPLETE or COMPLETE, never INVALID"));
@@ -7225,7 +7522,7 @@ static void checkEverySplit(const char *name, const std::vector<uint8_t> &w, Che
     }
     {   /* one byte at a time, which restarts every field as many times as it is
          * long. */
-        sofab::IStreamObject<M> in;
+        sofab::IStreamObject<M> in{kMaxSpan};
         sofab::Error last = sofab::Error::Incomplete;
         for (uint8_t b : w) last = in.feed(&b, 1).code();
         CHECK(last == sofab::Error::None, say("one byte at a time is COMPLETE"));
@@ -7309,7 +7606,7 @@ static void resumesInsteadOfBuffering()
         bool allOk = true;
         for (size_t k = 1; k < w.size() && allOk; ++k)
         {
-            sofab::IStreamObject<WatchMsg> in;
+            sofab::IStreamObject<WatchMsg> in{kMaxSpan};
             const auto r1 = in.feed(w.data(), k);
             const auto r2 = in.feed(w.data() + k, w.size() - k);
             allOk = r1.code() != sofab::Error::InvalidMessage &&
@@ -7319,7 +7616,7 @@ static void resumesInsteadOfBuffering()
 
         /* Byte at a time: every piece lands in the caller's destination as it
          * arrives, so the field is delivered many times and `progress` walks up. */
-        sofab::IStreamObject<WatchMsg> drip;
+        sofab::IStreamObject<WatchMsg> drip{kMaxSpan};
         sofab::Error last = sofab::Error::Incomplete;
         for (uint8_t b : w) last = drip.feed(&b, 1).code();
         CHECK(last == sofab::Error::None, "resume: and one byte at a time is COMPLETE");
@@ -7354,7 +7651,7 @@ static void resumesInsteadOfBuffering()
                    m.c.c.c.nums == std::vector<uint32_t>{1, 2, 300, 40000} && m.tail == 7;
         };
         {
-            sofab::IStreamObject<DeepMsg> in;
+            sofab::IStreamObject<DeepMsg> in{kMaxSpan};
             CHECK(in.feed(w.data(), w.size()).code() == sofab::Error::None && good(*in),
                   "resume: the deep message decodes in one piece");
         }
@@ -7362,7 +7659,7 @@ static void resumesInsteadOfBuffering()
         size_t firstBad = 0;
         for (size_t k = 1; k < w.size(); ++k)
         {
-            sofab::IStreamObject<DeepMsg> in;
+            sofab::IStreamObject<DeepMsg> in{kMaxSpan};
             (void)in.feed(w.data(), k);
             const auto r2 = in.feed(w.data() + k, w.size() - k);
             if (r2.code() != sofab::Error::None || !good(*in)) { allOk = false; firstBad = k; break; }
@@ -7370,7 +7667,7 @@ static void resumesInsteadOfBuffering()
         CHECK(allOk, "resume: four open levels are re-entered correctly at every split point");
         (void)firstBad;
 
-        sofab::IStreamObject<DeepMsg> drip;
+        sofab::IStreamObject<DeepMsg> drip{kMaxSpan};
         sofab::Error last = sofab::Error::Incomplete;
         for (uint8_t b : w) last = drip.feed(&b, 1).code();
         CHECK(last == sofab::Error::None && good(*drip),
@@ -7399,7 +7696,7 @@ static void resumesInsteadOfBuffering()
         sofab::OStreamInline<64> os;
         os.sequenceBeginLazy(3).write(0, std::string_view{"inside"}).sequenceEnd();
         const std::vector<uint8_t> w(os.data(), os.data() + os.bytesUsed());
-        sofab::IStreamObject<SeqWatch> in;
+        sofab::IStreamObject<SeqWatch> in{kMaxSpan};
         sofab::Error last = sofab::Error::Incomplete;
         for (uint8_t b : w) last = in.feed(&b, 1).code();
         CHECK(last == sofab::Error::None && (*in).leaf == "inside",
@@ -7544,6 +7841,7 @@ int main()
     varintWidthSweep();
     trailingDefaultsStayOnTheWire();
     nestedArrayCountCeiling();
+    receiverCapsAreNeitherHeldNorOmittable();
     headerParsersEnforceCeilings();
     minOutputBuffer();
     toleranceInput();

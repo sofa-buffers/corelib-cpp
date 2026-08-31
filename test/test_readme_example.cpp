@@ -33,7 +33,8 @@ struct Point : sofab::OStreamMessage, sofab::IStreamMessage {
         return {os.data(), os.data() + os.bytesUsed()};
     }
     static Point decode(const uint8_t* data, size_t len) {
-        sofab::IStreamObject<Point> in; in.feed(data, len); return *in;
+        sofab::IStreamObject<Point> in{sofab::Limits{_maxSize}};   // this receiver's field-span budget
+        in.feed(data, len); return *in;
     }
 };
 
@@ -63,7 +64,7 @@ static void theExampleRunsAndRoundTrips()
     os.flush();
     check(streamed == wire, "a one-byte window produces the one-shot bytes");
 
-    sofab::IStreamObject<Point> in;
+    sofab::IStreamObject<Point> in{sofab::Limits{Point::_maxSize}};
     auto r = in.feed(wire.data(), 1);                       // first byte…
     for (size_t i = 1; i < wire.size(); ++i)
         r = in.feed(wire.data() + i, 1);                    // …then the rest

@@ -199,12 +199,12 @@ Each `feed()` returns a three-valued decode outcome. There is **no** separate
 | `incomplete()`          | `Error::Incomplete`      | `DecodeStatus::Incomplete`    | the bytes end **inside** a field (a partial varint, a short fixlen/array payload) or with an open sequence; the decoder keeps its place for the next `feed()` |
 | `invalid()`             | `Error::InvalidMessage`  | `DecodeStatus::Invalid`       | the bytes are malformed **regardless of what follows** (varint over 64 bits, bad subtype/length, count/id over max, nesting past `MAX_DEPTH`, dangling sequence-end, …) |
 | `limitExceeded()`       | `Error::LimitExceeded`   | `DecodeStatus::LimitExceeded` | a configured receiver cap was exceeded on a field the schema leaves unbounded; the bytes are well-formed and decode under a looser cap |
-| `invalidArgument()`     | `Error::InvalidArgument` | `DecodeStatus::InvalidArgument` | the value broke no schema bound and no configured cap, but does not fit the destination this caller passed |
+| `invalidArgument()`     | `Error::InvalidArgument` | `DecodeStatus::InvalidArgument` | a mistake in the **call**: the value broke no schema bound and no configured cap but does not fit the destination this caller passed — or no bound and no cap were stated for it at all |
 
 The last two are not wire outcomes and are never folded into `Invalid`: a limit
 rejection means *raise my limit or the sender must send less*, `Invalid` means
-*these bytes are broken*, and `InvalidArgument` means *pass a bigger
-destination*.
+*these bytes are broken*, and `InvalidArgument` means *fix the call* — pass a
+bigger destination, or state the bound you never stated.
 
 `Incomplete` is not an error — it means "the message may continue". A streaming
 caller reads it as "feed me more bytes"; a caller that has delivered all its
@@ -226,23 +226,35 @@ The latch is what keeps the outcome chunk-independent: the same bytes fed whole,
 in odd-sized chunks or one at a time end on the same verdict, and a sender cannot
 prefix garbage to a valid message and still have the receiver report `Complete`.
 
-#### Field-size limit (opt-in)
+#### Field-size limit (required)
 
-A field may claim up to `FIXLEN_MAX` ≈ 2 GB, and a receiver that does not want to
-spend that long on one field can say so. Pass a `sofab::Limits` to cap it:
+A field may claim up to `FIXLEN_MAX` ≈ 2 GB, and a receiver has to say how much
+of that it is willing to spend on one field. Every decoder takes a
+`sofab::Limits`; there is no default constructor:
 
 ```cpp
-sofab::IStreamObject<Sensor> in{ sofab::Limits{ .max_buffered_field = 64 * 1024 } };
+sofab::IStreamObject<Sensor> in{ sofab::Limits{ 64 * 1024 } };
 ```
 
-`sofab::Limits` carries two receiver-side caps. `max_buffered_field` bounds how
-many bytes a *single* top-level field may span. A field whose declared size
-exceeds it fails `feed()` with `Error::LimitExceeded` the moment the size is
-known, before a byte of payload is read — so an oversized header is rejected even
-if its bytes never arrive, whether fed whole or byte by byte. This is a receiver-side **policy** code, kept
-distinct from `Error::InvalidMessage`: a local limit is not wire malformation.
-The default is no cap (`SIZE_MAX`). Bytes are never clamped or truncated; the
-`feed()` simply fails.
+`max_buffered_field` bounds how many bytes a *single* top-level field may span.
+A field whose declared size exceeds it fails `feed()` with
+`Error::LimitExceeded` the moment the size is known, before a byte of payload is
+read — so an oversized header is rejected even if its bytes never arrive, whether
+fed whole or byte by byte. This is a receiver-side **policy** code, kept distinct
+from `Error::InvalidMessage`: a local limit is not wire malformation. Bytes are
+never clamped or truncated; the `feed()` simply fails.
+
+**It is a §6.2.1 receiver cap, and is treated as one.** It is configured by the
+deployment, it binds only a field the schema leaves unbounded, and its breach is
+a policy rejection on well-formed bytes — the same message decodes under a looser
+number. So every rule §6.2.1 states applies to it: this library **holds no number
+of its own, supplies no default, and offers no unlimited mode**. `sofab::Limits`
+has no default member and cannot be default-constructed; the stream constructors
+do not default it. A receiver whose budget really is the platform's ceiling
+states `sofab::Limits{SIZE_MAX}` — that is a number *the caller* chose, and the
+check still runs on every field and simply never fires. It is not a mode this
+library offers, and no §6.2 format ceiling is ever reported as
+`Error::LimitExceeded` in its place.
 
 **A schema bound outranks the cap.** A declared length past a `maxlen`, or a
 count past a `count:`, is `Error::InvalidMessage` whatever the cap is set to
@@ -261,28 +273,39 @@ fields of `Limits` and are not held anywhere in this library. Each is a paramete
 on the call that reads the field it bounds, supplied per call by the layer that
 knows the schema and the target:
 
+Exactly one of the two numbers can ever apply to a field — a receiver limit
+"**MUST NOT** be applied to a field the schema already bounds" — so the choice is
+in the call's **name**, not in a pair of arguments either of which may be left
+out:
+
 ```cpp
-sofab::readString(is, name,  -1, SOFAB_MAX_DYN_STRING_LEN);   // schema declares no maxlen
-sofab::readBlob  (is, sig,   -1, SOFAB_MAX_DYN_BLOB_LEN);
-sofab::readArray (is, nums,  -1, SOFAB_MAX_DYN_ARRAY_COUNT);
-sofab::StringSeq tags{out, /*count*/ -1, /*elemMax*/ -1, SOFAB_MAX_DYN_ARRAY_COUNT};
+sofab::readString      (is, label, 32);                        // maxlen: 32
+sofab::readStringCapped(is, name,  SOFAB_MAX_DYN_STRING_LEN);  // schema declares no maxlen
+sofab::readBlobCapped  (is, sig,   SOFAB_MAX_DYN_BLOB_LEN);
+sofab::readArrayCapped (is, nums,  SOFAB_MAX_DYN_ARRAY_COUNT);
+sofab::StringSeq tags{out, /*count*/ -1, /*elemMax*/ -1,
+                      SOFAB_MAX_DYN_ARRAY_COUNT, SOFAB_MAX_DYN_STRING_LEN};
 ```
 
-The third argument is always the **schema** bound (`-1` where the schema declares
-none) and the fourth is the receiver cap; the cap is consulted only where the
-third is `-1`. §6.2.1 puts the numbers in generated code and leaves this library
-"the report and the category", so a codec "**MUST NOT** hold a limit of its own,
-**MUST NOT** supply a default for one it was not given, **MUST NOT** read an
-omitted argument as *unlimited*, and **MUST NOT** clamp to one."
+`readString` / `readBlob` / `readArray` take the **schema** bound;
+`readStringCapped` / `readBlobCapped` / `readArrayCapped` take the **receiver
+cap**. The same split runs through `acceptsString` / `acceptsStringCapped` and
+their `blob` twins. §6.2.1 puts the numbers in generated code and leaves this
+library "the report and the category", so a codec "**MUST NOT** hold a limit of
+its own, **MUST NOT** supply a default for one it was not given, **MUST NOT**
+read an omitted argument as *unlimited*, and **MUST NOT** clamp to one."
 
-**A negative cap means no cap was supplied — not "unlimited".** There is no
-stream-wide fallback to inherit and no ceiling this library will present as a
-receiver limit in one's place. Reading a schema-unbounded `string`, `blob` or
-array into a *growable* destination without passing a cap lets the sender decide
-how much this process holds; that is a defect in the **call**, not a mode on
-offer. A destination with static room (`FixedString`, `FixedBytes`,
-`InlineVector`) needs no cap to be safe — it already holds all it can ever hold,
-and refuses the rest under `Error::InvalidArgument`.
+**No number has a default, and a negative one is refused, not obeyed.** None of
+these parameters is optional, so a schema-unbounded read with no cap does not
+compile. Where the shape of the type makes a mandatory argument impossible — a
+`MessageSeq` is an aggregate, filled field by field — the omission is
+**diagnosed** instead: an array with no schema `count`, no `dynCap` and no
+fixed-capacity destination is refused at its first element with
+`Error::InvalidArgument`, §6.3's "a mistake in the call" tier. Either way,
+"no cap was stated" is never read as "unlimited". A destination with static room
+(`FixedString`, `FixedBytes`, `InlineVector`) is the one case that needs no cap
+to be safe — it already holds all it can ever hold, and refuses the rest under
+`Error::InvalidArgument`.
 
 **Why the cap is passed in rather than checked in front of the call.** The check
 has to run at the count/length header, *behind* the MESSAGE_SPEC §7.3 tag test: a
@@ -348,7 +371,8 @@ struct Point : sofab::OStreamMessage, sofab::IStreamMessage {
         return {os.data(), os.data() + os.bytesUsed()};
     }
     static Point decode(const uint8_t* data, size_t len) {
-        sofab::IStreamObject<Point> in; in.feed(data, len); return *in;
+        sofab::IStreamObject<Point> in{sofab::Limits{_maxSize}};   // this receiver's field-span budget
+        in.feed(data, len); return *in;
     }
 };
 
@@ -472,14 +496,16 @@ the bytes arrive, whole or one byte at a time.
   and `IStreamImpl::resumed()` (this delivery re-enters an open sequence). The
   **destination must stay put** for the duration: a member of the message object
   does, a local in the handler does not.
-- **Receiver caps.** `Limits::max_buffered_field` bounds how many bytes one
-  top-level field may span. The §6.2.1 caps —  `max_dyn_string_len`,
-  `max_dyn_blob_len`, `max_dyn_array_count` — are **arguments**, not settings:
-  `readString` / `readBlob` / `readArray` take one, and the `StringSeq` /
-  `BlobSeq` / `MessageSeq` collectors take one as `dynCap` for the element index
-  of a wrapper array. None has a default: the numbers belong to generated code,
-  which knows the schema and the target, and an omitted one is no cap rather than
-  an unlimited one. Breaching one is `Error::LimitExceeded`, never
+- **Receiver caps.** Every one of them is a number the caller states, and none
+  can be left out. `Limits::max_buffered_field` bounds how many bytes one
+  top-level field may span and is a **required** constructor argument. The three
+  per-field caps — `max_dyn_string_len`, `max_dyn_blob_len`,
+  `max_dyn_array_count` — are **arguments**, not settings: the `…Capped` reads
+  take one, and the `StringSeq` / `BlobSeq` / `MessageSeq` collectors take one as
+  `dynCap` for the element index of a wrapper array. Nothing defaults: the
+  numbers belong to generated code, which knows the schema and the target, and an
+  omitted one is a compile error or an `Error::InvalidArgument`, never "no cap"
+  and never "unlimited". Breaching one is `Error::LimitExceeded`, never
   `InvalidMessage`.
 
 `read()` pulls the value out immediately: no input buffer has to outlive the call
@@ -589,8 +615,9 @@ tiers, in that order:
 | ceiling that was passed | outcome |
 |---|---|
 | a declared `maxlen` / `count` | `InvalidMessage` (`DecodeStatus::Invalid`) |
-| a configured receiver cap (`Limits::max_buffered_field`, `readArray`'s `dynCap`) on a field the schema does not bound | `LimitExceeded` (`DecodeStatus::LimitExceeded`) |
+| a configured receiver cap (`Limits::max_buffered_field`, `readArrayCapped`'s `dynCap`) on a field the schema does not bound | `LimitExceeded` (`DecodeStatus::LimitExceeded`) |
 | neither of the above, and the destination this caller passed is too short | `InvalidArgument` (`DecodeStatus::InvalidArgument`) |
+| **no ceiling was passed at all** on a schema-unbounded field, where the shape of the call allowed the omission | `InvalidArgument` (`DecodeStatus::InvalidArgument`) |
 
 A decode into fully bounded fields performs no allocation at all, at any chunk
 size; `test_roundtrip.cpp`'s `heapFreeStorage()` and `allocationMeasurement()`

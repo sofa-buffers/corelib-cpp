@@ -162,7 +162,8 @@ struct CompLevel1 : sofab::IStreamMessage /* { 1: { … }, 2: signed -1 } */
  * element, the element id is the array index. Declared count 64, element maxlen
  * 16 — the schema facts a generated reader would pass, and what sizes the
  * heap-free destination above. */
-sofab::StringSeq<decltype(CompOut::items)> compItems{C.items, 64, 16};
+sofab::StringSeq<decltype(CompOut::items)> compItems{C.items, 64, 16,
+                                                     /*indexCap*/ -1, /*elemLenCap*/ -1};
 
 /* The `blob 1MB` decode row is fed in chunks, so its stream lives across the
  * calls that make up one op — and across ops, deliberately. `reset()` is the
@@ -394,7 +395,7 @@ extern "C" __attribute__((noinline, flatten)) void run_decode_composite()
         switch (id)
         {
             case 1:   sofab::read(is, compItems); break;
-            case 2:   sofab::readString(is, C.text); break;
+            case 2:   sofab::readString(is, C.text, 384); break;
             case 3:   sofab::read(is, compL1); break;
             case 130: sofab::read(is, C.big); break;
             default: break;
