@@ -279,6 +279,18 @@ subtree, exactly as the element-index bound is. Capping a skipped field is not a
 defence but a forward-compatibility break: nothing was going to be allocated, and
 the receiver would reject a message over a field it does not even read.
 
+**One level down, the same rule and the same answer.** A sequence this receiver
+*does* read accrues field by field, so that many small children cannot slip past a
+per-payload check — and among those children may be one it does *not* read: an
+unknown id, or one §7.3 declines. Those bytes are walked like any other skip, so
+they are **discounted** from the field's span rather than charged to it, header
+and payload alike. Otherwise the next LIVE field — the sequence's own end marker
+included, and with it everything after — was refused `LimitExceeded` over a child
+the decode never touched, and a peer adding a field at an id this schema does not
+declare could not talk to this one at all. The discount is per skipped subtree and
+carries across chunks, so the verdict is the same whether the subtree arrived in
+one `feed()` or ten.
+
 #### The §6.2.1 receiver caps are arguments, not settings
 
 `max_dyn_string_len`, `max_dyn_blob_len` and `max_dyn_array_count` are **not**
@@ -331,6 +343,23 @@ A wrapper array — an array of `string`, `blob`, `struct` or nested rows — ca
 no count header: its length is *highest present id + 1*, so the element **index**
 is what the cap binds, and it is checked before the container is extended. The
 `StringSeq` / `BlobSeq` / `MessageSeq` collectors take it as their `dynCap`.
+
+**A nested row has a second axis, and it states its own pair.** In
+`array<array<u32>>` the outer array's length is the row **index**, bounded by
+`cap` / `dynCap` as above; each row is itself a native array announcing a real
+**count** header, and that count is bounded by `MessageSeq::rowCap` (the inner
+schema `count:` → `InvalidMessage`, §7.1) and `MessageSeq::rowDynCap` (the
+receiver cap → `LimitExceeded`, §6.2.1). The row axis follows exactly the rules
+the id axis does: `rowCap` wins where the schema states it, `rowDynCap` is
+consulted only where it does not, and both left at `-1` is a mistake in the call
+(`Error::InvalidArgument`), never "unlimited".
+
+```cpp
+// array<array<u32>>: outer count 2, inner count 3
+sofab::MessageSeq<std::vector<std::vector<uint32_t>>> c;
+c.out = &numrows; c.cap = 2; c.rowCap = 3;
+sofab::read(is, c);
+```
 
 #### Strict UTF-8 validation (`SOFAB_STRICT_UTF8`, default ON)
 
@@ -515,7 +544,8 @@ the bytes arrive, whole or one byte at a time.
   per-field caps — `max_dyn_string_len`, `max_dyn_blob_len`,
   `max_dyn_array_count` — are **arguments**, not settings: the `…Capped` reads
   take one, and the `StringSeq` / `BlobSeq` / `MessageSeq` collectors take one as
-  `dynCap` for the element index of a wrapper array. Nothing defaults: the
+  `dynCap` for the element index of a wrapper array — and, on `MessageSeq`, as
+  `rowDynCap` for the element count of a native nested row. Nothing defaults: the
   numbers belong to generated code, which knows the schema and the target, and an
   omitted one is a compile error or an `Error::InvalidArgument`, never "no cap"
   and never "unlimited". Breaching one is `Error::LimitExceeded`, never

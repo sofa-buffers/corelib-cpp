@@ -2496,6 +2496,152 @@ static void bufferLimits()
     }
 }
 
+/* --- a SKIPPED CHILD inside a LIVE sequence is not capped either (§6.2.1,
+ *     corelib-cpp#129 one level down).
+ *
+ * bufferLimits() above pins the two ends of the rule: a live sequence's own bulk
+ * accrues field by field and is capped (#26), and a sequence §7.3-skips WHOLE is
+ * walked and never capped (#129). Between them sits the case neither image
+ * reaches: a sequence this receiver DOES read, carrying a child field it does
+ * NOT — an unknown id, or one §7.3 declines. That child is walked exactly like
+ * the skipped sequence is, materialises nothing, and §6.2.1 is explicit about
+ * what must follow: "a decode that steps over an over-cap field it was never
+ * going to read stays COMPLETE".
+ *
+ * It did not. The accrual arm of the cap (@ref IStreamImpl::beginField) measured
+ * `spanned()`, the raw byte span of the enclosing top-level field, so a skipped
+ * child's bytes counted against the budget and the NEXT live field — here the
+ * sequence end, and with it everything after — was refused LimitExceeded. The
+ * declared neighbour `tail` was lost to a field the decode never read.
+ *
+ * The asserts are therefore on VALUES, not on a verdict: `keep`/`tail` surviving
+ * is the whole point, and a test that only checked the status would pass on a
+ * decode that dropped them. The allocation count beside them is the other half
+ * of §6.2.1's reasoning — "a field the handler skips allocates nothing" — so the
+ * cap is shown to be bounding nothing real in the cases it was firing on. --- */
+
+static void skippedChildInLiveSequenceIsNotCapped()
+{
+    /* `Parent` reads id 1 as a sequence and, inside it, ids 0 and 2 into
+     * `child`. Ids 9 and 3 are its unknown children. */
+    auto image = [](sofab::id childId, uint8_t wire, size_t payload) {
+        std::vector<uint8_t> w;
+        w.push_back(0x00); appendVarint(w, 42);              /* id 0 unsigned = 42 (top)  */
+        w.push_back(0x0e);                                   /* id 1 sequence-start       */
+        w.push_back(0x00); appendVarint(w, 42);              /* child id 0 unsigned = 42  */
+        appendVarint(w, (uint64_t(childId) << 3) | wire);    /* the child to be skipped   */
+        if (wire == 2u)                                      /* fixlen: subtype+len word  */
+            appendVarint(w, (uint64_t(payload) << 3) | 3u);  /* 3 = blob                  */
+        for (size_t i = 0; i < payload; ++i) w.push_back(0x41);
+        w.push_back(0x11); appendVarint(w, 83);              /* child id 2 signed = -42   */
+        w.push_back(0x07);                                   /* sequence-end              */
+        w.push_back(0x11); appendVarint(w, 83);              /* id 2 signed = -42 (tail)  */
+        return w;
+    };
+
+    /* One decode of one image, under `cap`, fed whole and then byte by byte. */
+    auto run = [](const std::vector<uint8_t> &w, size_t cap, const char *what) {
+        for (int chunked = 0; chunked < 2; ++chunked)
+        {
+            static char buf[192];
+            std::snprintf(buf, sizeof buf, "%s (%s)", what, chunked ? "1-byte chunks" : "one feed");
+            sofab::IStreamObject<Parent> in(sofab::Limits{cap});
+            const unsigned long before = g_allocCount;
+            sofab::Error last = sofab::Error::None;
+            if (!chunked) last = in.feed(w.data(), w.size()).code();
+            else
+                for (size_t i = 0; i < w.size(); ++i)
+                {
+                    last = in.feed(w.data() + i, 1).code();
+                    if (last != sofab::Error::Incomplete && last != sofab::Error::None) break;
+                }
+            const unsigned long allocs = g_allocCount - before;
+            CHECK(last == sofab::Error::None, buf);
+            CHECK((*in).top == 42u && (*in).child.x == 42u && (*in).child.y == -42 &&
+                      (*in).tail == -42,
+                  (std::snprintf(buf, sizeof buf, "%s: every declared field survives%s", what,
+                                 chunked ? " (1-byte chunks)" : ""), buf));
+            CHECK(allocs == 0,
+                  (std::snprintf(buf, sizeof buf, "%s: the skipped child allocates nothing%s",
+                                 what, chunked ? " (1-byte chunks)" : ""), buf));
+        }
+    };
+
+    /* An UNKNOWN id-9 child, as a blob whose payload dwarfs the cap. Whatever its
+     * size, the sequence is 12 bytes of content this receiver actually reads. */
+    for (size_t n : {size_t(0), size_t(10), size_t(15), size_t(64), size_t(100000)})
+        run(image(9, 2u, n), 23, "skipped child: unknown id");
+
+    /* A §7.3-DECLINED child: id 0 IS declared, as an unsigned, and arrives as a
+     * fixlen blob. `read` refuses the tag and the field is skipped exactly as an
+     * unknown id is — §7.4, "an occurrence skipped under §7.3 is not an
+     * occurrence" — so the same rule governs its bytes.
+     *
+     * The id-0 occurrence already delivered stays delivered, which is the other
+     * half of the same sentence and is what `child.x == 42` asserts here. */
+    for (size_t n : {size_t(0), size_t(15), size_t(64), size_t(100000)})
+        run(image(0, 2u, n), 23, "skipped child: §7.3-declined blob");
+
+    /* A skipped child that is itself a SEQUENCE of many small fields — the
+     * many-small-fields shape #26 was built for, in the one place §6.2.1 exempts
+     * it. Fed in 1-byte chunks it also drives the resume path: the subtree is
+     * re-entered by `descendResume`, which walks the rest of it in a later window
+     * and has to discount that too, or the verdict would depend on the chunking
+     * §7.2 item 4 forbids it to depend on. */
+    {
+        std::vector<uint8_t> w;
+        w.push_back(0x00); appendVarint(w, 42);              /* id 0 unsigned = 42 (top)  */
+        w.push_back(0x0e);                                   /* id 1 sequence-start       */
+        w.push_back(0x00); appendVarint(w, 42);              /* child id 0 unsigned = 42  */
+        w.push_back(0x4e);                                   /* child id 9 sequence-start */
+        for (int i = 0; i < 400; ++i) { w.push_back(0x00); w.push_back(0x00); }
+        w.push_back(0x07);                                   /* child id 9 sequence-end   */
+        w.push_back(0x11); appendVarint(w, 83);              /* child id 2 signed = -42   */
+        w.push_back(0x07);                                   /* sequence-end              */
+        w.push_back(0x11); appendVarint(w, 83);              /* id 2 signed = -42 (tail)  */
+        run(w, 23, "skipped child: unknown sub-sequence");
+    }
+
+    /* And the control the pair exists for: the same sequence with the same child
+     * id DECLARED by the destination is capped, because those bytes ARE
+     * materialised. Without this the fix above would read as "the cap no longer
+     * applies to sequences at all". */
+    {
+        struct WideChild : sofab::IStreamMessage
+        {
+            uint64_t x = 0; std::vector<uint8_t> big; int64_t y = 0;
+            void deserialize(sofab::IStreamImpl &is, sofab::id id, size_t, size_t) noexcept override
+            {
+                switch (id)
+                {
+                    case 0: sofab::read(is, x); break;
+                    case 9: sofab::readBlobCapped(is, big, 1u << 20); break;
+                    case 2: sofab::read(is, y); break;
+                }
+            }
+        };
+        struct WideParent : sofab::IStreamMessage
+        {
+            uint64_t top = 0; WideChild child; int64_t tail = 0;
+            void deserialize(sofab::IStreamImpl &is, sofab::id id, size_t, size_t) noexcept override
+            {
+                switch (id)
+                {
+                    case 0: sofab::read(is, top); break;
+                    case 1: sofab::read(is, child); break;
+                    case 2: sofab::read(is, tail); break;
+                }
+            }
+        };
+        const auto w = image(9, 2u, 64);
+        sofab::IStreamObject<WideParent> in(sofab::Limits{23});
+        auto r = in.feed(w.data(), w.size());
+        CHECK(r.code() == sofab::Error::LimitExceeded,
+              "skipped child control: the same child, DECLARED, is still capped");
+    }
+}
+
+
 /* --- a schema bound outranks the reassembly cap (issue #86, CORELIB_PLAN
  *     §6.2.1/§6.3). A receiver-side limit "MUST NOT be applied to a field the
  *     schema already bounds", and LimitExceeded is "never raised for a field
@@ -3534,7 +3680,8 @@ struct SeqMsg : sofab::IStreamMessage
             case 1: { sofab::StringSeq c{tags, -1, -1, kAnyCount, kAnyLen};  sofab::read(is, c); break; }
             case 2: { sofab::MessageSeq<SeqRow> c; c.out = &rows; c.dynCap = kAnyCount; sofab::read(is, c); break; }
             case 3: { sofab::BlobSeq c{blobs, -1, -1, kAnyCount, kAnyLen};   sofab::read(is, c); break; }
-            case 4: { sofab::MessageSeq<std::vector<uint32_t>> c; c.out = &matrix; c.dynCap = kAnyCount; sofab::read(is, c); break; }
+            case 4: { sofab::MessageSeq<std::vector<uint32_t>> c; c.out = &matrix; c.dynCap = kAnyCount;
+                      c.rowDynCap = kAnyCount; sofab::read(is, c); break; }
             case 5: { sofab::MessageSeq<NestRow> c; c.out = &nested; c.dynCap = kAnyCount; sofab::read(is, c); break; }
             case 9: sofab::read(is, other); break;
         }
@@ -3611,7 +3758,7 @@ struct DynRowsMsg : sofab::IStreamMessage
         switch (id)
         {
             case 1: { sofab::MessageSeq<std::vector<SeqRow>> c; c.out = &rows; c.cap = 3; sofab::read(is, c); break; }
-            case 4: { sofab::MessageSeq<std::vector<std::vector<uint32_t>>> c; c.out = &matrix; c.dynCap = kAnyCount; sofab::read(is, c); break; }
+            case 4: { sofab::MessageSeq<std::vector<std::vector<uint32_t>>> c; c.out = &matrix; c.dynCap = kAnyCount; c.rowDynCap = kAnyCount; sofab::read(is, c); break; }
         }
     }
 };
@@ -4422,6 +4569,173 @@ static void messageSeqStorageProfiles()
               "an announced row count near 2^31 allocates for the bytes in hand, not for the count");
     }
 }
+
+/* --- a NATIVE nested row carries TWO bounds, not one (corelib-cpp#124, §7.1 /
+ *     §6.2.1 / §6.3).
+ *
+ * `array<array<u32>>` has two axes and each needs its own pair. The outer one
+ * always had it: `cap` is the schema `count` (over-index → InvalidMessage, §7.1)
+ * and `dynCap` is the receiver's (over-index → LimitExceeded, §6.2.1). The ROW
+ * had neither — it borrowed `dynCap`, the outer array's receiver cap — and the
+ * borrowing was wrong in both directions:
+ *
+ *   - `count: 2` on the OUTER array. §9.5 says a receiver cap governs only what
+ *     the schema left unbounded, so generated code correctly states no `dynCap`
+ *     at all; the row was then read under `dynCap == -1` and every row was
+ *     refused `InvalidArgument` — a message could not round-trip its own output.
+ *     That is the corpus's own `nested_rows.yaml` `numrows`, which until now was
+ *     only ever compiled, never decoded.
+ *   - outer array UNBOUNDED. Then `dynCap` exists, and a row longer than the
+ *     inner `count:` was accepted under it: a §7.1 INVALID silently decoded, and
+ *     if it had been refused it would have carried the wrong category.
+ *
+ * So `rowCap` (the row's schema `count`) and `rowDynCap` (the row's receiver
+ * cap) join `cap`/`dynCap`, and the row is read through the same two entry
+ * points a top-level array is: @ref sofab::readArray for a stated `count`,
+ * @ref sofab::readArrayCapped for a cap. Same rule, same categories, one axis
+ * down. --- */
+
+struct MatrixMsg : sofab::IStreamMessage
+{
+    std::vector<std::vector<uint32_t>> bounded;   /* id 4: outer count 2, inner count 3 */
+    std::vector<std::vector<uint32_t>> capped;    /* id 5: outer count 2, inner unbounded */
+    void deserialize(sofab::IStreamImpl &is, sofab::id id, size_t, size_t) noexcept override
+    {
+        switch (id)
+        {
+            case 4: { sofab::MessageSeq<std::vector<std::vector<uint32_t>>> c;
+                      c.out = &bounded; c.cap = 2; c.rowCap = 3; sofab::read(is, c); break; }
+            case 5: { sofab::MessageSeq<std::vector<std::vector<uint32_t>>> c;
+                      c.out = &capped; c.cap = 2; c.rowDynCap = 4; sofab::read(is, c); break; }
+        }
+    }
+};
+
+static void nestedNativeRowBounds()
+{
+    auto feed = [](const char *hex) {
+        sofab::IStreamObject<MatrixMsg> in{kMaxSpan};
+        auto w = fromHex(hex);
+        auto r = in.feed(w.data(), w.size());
+        return std::pair<sofab::IStreamImpl::Result, MatrixMsg>{r, *in};
+    };
+
+    /* The round trip the corpus never ran: `numrows = [[1,2,3],[4,5,6]]`, the
+     * exact bytes `NestedRows` encodes for it. The asserts are on the VALUES —
+     * the old behaviour produced `rows == 1, first_row_len == 0` alongside its
+     * refusal, so anything checking only the status would have passed on it. */
+    {
+        auto [r, m] = feed("26" "03 03 010203" "0b 03 040506" "07");
+        CHECK(r.complete(), "nested rows: a schema-bounded matrix decodes COMPLETE");
+        CHECK(m.bounded.size() == 2, "nested rows: both rows are placed");
+        if (m.bounded.size() == 2)
+        {
+            CHECK(m.bounded[0] == std::vector<uint32_t>({1, 2, 3}) &&
+                      m.bounded[1] == std::vector<uint32_t>({4, 5, 6}),
+                  "nested rows: every element round-trips at its own index");
+        }
+    }
+
+    /* §5.1: a row is PLACED at its element id, so an id gap leaves an empty row
+     * and the matrix's length is highest present id + 1. */
+    {
+        auto [r, m] = feed("26" "0b 03 040506" "07");
+        CHECK(r.complete() && m.bounded.size() == 2, "nested rows: a row id gap is filled");
+        if (m.bounded.size() == 2)
+            CHECK(m.bounded[0].empty() && m.bounded[1] == std::vector<uint32_t>({4, 5, 6}),
+                  "nested rows: the absent row 0 stays at the element default");
+    }
+
+    /* §7.1: the row's own `count: 3` governs its length, and 4 breaks it. That is
+     * a statement about VALIDITY — InvalidMessage, and never the policy category,
+     * because the schema bounds this axis (§6.2.1, §6.3). */
+    {
+        auto [r, m] = feed("26" "03 04 01020304" "07");
+        CHECK(r.invalid() && !r.limitExceeded() && !r.invalidArgument(),
+              "nested rows: a row past its schema count is INVALID");
+        /* §6.2.1 "rejected, never clamped": the row slot exists — the gap fill
+         * runs at the element id, which passed — but not one element of the
+         * over-long row is taken into it. Silently keeping `count` of them is the
+         * data corruption that rule is about. */
+        CHECK(m.bounded.size() == 1 && m.bounded[0].empty(),
+              "nested rows: the rejected row takes no elements, and none are clamped in");
+    }
+
+    /* ...and the outer `count: 2` still governs the row ID, unchanged. */
+    {
+        auto [r, m] = feed("26" "13 03 010203" "07");
+        CHECK(r.invalid(), "nested rows: a row id past the outer schema count is INVALID");
+        CHECK(m.bounded.empty(), "nested rows: the rejected row id grows nothing");
+    }
+
+    /* The row axis left unbounded by the schema: `rowDynCap` governs it and its
+     * breach is the POLICY category — the same bytes decode for a receiver
+     * configured with a larger cap (§6.2.1). */
+    {
+        auto [r, m] = feed("2e" "03 04 01020304" "07");
+        CHECK(r.complete() && m.capped.size() == 1, "nested rows: a row at the receiver cap decodes");
+        if (m.capped.size() == 1)
+            CHECK(m.capped[0] == std::vector<uint32_t>({1, 2, 3, 4}),
+                  "nested rows: the capped row keeps its elements");
+    }
+    {
+        auto [r, m] = feed("2e" "03 05 0102030405" "07");
+        CHECK(r.limitExceeded() && !r.invalid(),
+              "nested rows: a row past the receiver cap is LimitExceeded, not INVALID");
+        CHECK(m.capped.size() == 1 && m.capped[0].empty(),
+              "nested rows: the over-cap row takes no elements either");
+    }
+
+    /* The two axes are independent: the outer bound is the schema's, the row's is
+     * the receiver's, and neither is read off the other. */
+    {
+        auto [r, m] = feed("2e" "13 03 010203" "07");
+        CHECK(r.invalid(), "nested rows: capped rows still answer to the outer schema count");
+        CHECK(m.capped.empty(), "nested rows: and nothing is placed for the rejected id");
+    }
+
+    /* §6.2.1's "no unset state and no unlimited mode", one axis down: a row with
+     * neither a `rowCap` nor a `rowDynCap` is a mistake in the CALL, refused with
+     * InvalidArgument rather than letting the wire count decide the row's length.
+     * This is the verdict the bug produced for every schema-bounded matrix. */
+    {
+        struct Unstated : sofab::IStreamMessage
+        {
+            std::vector<std::vector<uint32_t>> rows;
+            void deserialize(sofab::IStreamImpl &is, sofab::id id, size_t, size_t) noexcept override
+            {
+                if (id != 4) return;
+                sofab::MessageSeq<std::vector<std::vector<uint32_t>>> c;
+                c.out = &rows; c.cap = 2; sofab::read(is, c);
+            }
+        };
+        sofab::IStreamObject<Unstated> in{kMaxSpan};
+        auto w = fromHex("26" "03 03 010203" "07");
+        auto r = in.feed(w.data(), w.size());
+        CHECK(r.invalidArgument() && !r.limitExceeded() && !r.invalid(),
+              "nested rows: a row with no bound stated at all is InvalidArgument");
+    }
+
+    /* Defaults, read off the collector: neither row bound is invented here. */
+    {
+        sofab::MessageSeq<std::vector<std::vector<uint32_t>>> c;
+        CHECK(c.rowCap == -1 && c.rowDynCap == -1,
+              "nested rows: MessageSeq invents neither row bound (§6.2.1)");
+    }
+
+    /* Adversarial: a row announcing a count near 2^31 with three payload bytes.
+     * The row's own bound refuses it before the container is grown, so a ~10-byte
+     * field never becomes an allocation. */
+    {
+        const unsigned long bytesBefore = g_allocBytes;
+        auto [r, m] = feed("26" "03 8080808008 010203" "07");
+        CHECK(r.invalid() && !r.complete(),
+              "nested rows: an announced row count past the schema count is refused");
+        CHECK(m.bounded.empty() && g_allocBytes - bytesBefore < 4096,
+              "nested rows: the refused count never becomes an allocation");
+    }
+}
+
 
 static void overIndexSkipOrdering()
 {
@@ -8029,6 +8343,7 @@ int main()
     sequenceDepthBookkeeping();
     maxDepth();
     bufferLimits();
+    skippedChildInLiveSequenceIsNotCapped();
     schemaBoundOutranksCap();
     refusalTiers();
     destinationIsNeverGrown();
@@ -8039,6 +8354,7 @@ int main()
     wrapperArrayCollectors();
     wrapperArrayIndexCaps();
     messageSeqStorageProfiles();
+    nestedNativeRowBounds();
     overIndexSkipOrdering();
     skippedSubtreeSuspendsBound();
     truncatedNestedFieldIsNotDeclined();
