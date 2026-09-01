@@ -5,7 +5,10 @@
  * Loads assets/test_vectors.json (via the vendored JSON reader) and, for every
  * vector, drives the C++20 sofab::OStream / sofab::IStream through encode,
  * decode, roundtrip and chunked scenarios — the same conformance suite the C
- * library runs, but exercising the native C++ implementation.
+ * library runs, but exercising the native C++ implementation. A vector carrying
+ * `skip_ids` additionally runs the skip scenario (CORELIB_PLAN §7.2 item 7):
+ * those ids are left unread at every nesting level so the decoder auto-skips
+ * them, whole and again one byte at a time.
  *
  * The asserted column is `serialized`, plus `serialized_sparse` for the vectors
  * whose sparse form is pure sequence omission (§2) — the rest of the sparse
@@ -30,6 +33,7 @@
 static constexpr sofab::Limits kMaxSpan{SIZE_MAX};
 #include "sofab_test_json.h"
 
+#include <algorithm>
 #include <bit>
 #include <cstdint>
 #include <cstdio>
@@ -127,6 +131,7 @@ struct Op
 struct Vector
 {
     std::string name;
+    std::string group;            // the vector file's own grouping, e.g. "skip/matrix"
     std::vector<Op> ops;
     std::vector<uint8_t> bytes;
     std::vector<uint32_t> skip;   // field ids a receiver is expected to skip (skip_ids)
@@ -356,6 +361,8 @@ bool loadVectors(const sofab_json_t *root, std::vector<Vector> &out, std::string
         Vector v;
         size_t nl; const char *nm = sofab_json_string(sofab_json_get(vj, "name"), &nl);
         v.name.assign(nm ? nm : "", nm ? nl : 0);
+        size_t gl; const char *gp = sofab_json_string(sofab_json_get(vj, "group"), &gl);
+        v.group.assign(gp ? gp : "", gp ? gl : 0);
         const sofab_json_t *fields = sofab_json_get(vj, "fields");
         size_t nf = sofab_json_array_size(fields);
         for (size_t k = 0; k < nf; k++)
@@ -364,6 +371,13 @@ bool loadVectors(const sofab_json_t *root, std::vector<Vector> &out, std::string
             if (!loadOp(sofab_json_array_at(fields, k), op)) { err = v.name + ": bad field"; return false; }
             v.ops.push_back(std::move(op));
         }
+        /* NO FIXED BOUND ANYWHERE ON THIS PATH. The C harness upstream carried a
+         * fixed MAXSKIP that silently TRUNCATED an over-long skip_ids list: the
+         * ids past the cap were read instead of skipped, so the vector still
+         * passed while testing less than it claimed (corelib-c-cpp#160). Every
+         * list here grows (std::vector) and every id is a full uint32_t, and the
+         * "loader-truncation witnesses" block in main() measures that back off
+         * the loaded structures so the property cannot rot unnoticed. */
         const sofab_json_t *skip = sofab_json_get(vj, "skip_ids");
         size_t nsk = sofab_json_array_size(skip);
         for (size_t k = 0; k < nsk; k++)
@@ -1004,11 +1018,27 @@ int main()
     int skipped = 0;
     int sparseByOmission = 0;   // vectors whose sparse form is pure sequence omission
 
+    /* How much of the skip scenario (CORELIB_PLAN §7.2 item 7) actually ran.
+     * A vector carrying `skip_ids` either runs it — twice, whole and one byte at
+     * a time — or is gated out by `requires`; counting both halves is what lets
+     * the summary state which of the two happened to each of them. Without the
+     * accounting a matrix that quietly stopped running (a `requires` tag this
+     * port stopped reporting, an upstream rename) would read as a green run of
+     * nothing, exactly the failure the envelope guards below exist for. */
+    int skipVectors = 0, skipRan = 0, skipGated = 0;
+    int skipMatrixVectors = 0, skipAxisVectors = 0;
+    for (const Vector &v : vectors)
+    {
+        if (!v.skip.empty()) ++skipVectors;
+        if (v.group == "skip/matrix") ++skipMatrixVectors;
+        else if (v.group == "skip") ++skipAxisVectors;
+    }
+
     const size_t tinies[] = {1, 3, 7};
     for (const Vector &v : vectors)
     {
         /* skip vectors needing a feature this build was compiled without */
-        if (v.req & ~caps) { ++skipped; continue; }
+        if (v.req & ~caps) { ++skipped; if (!v.skip.empty()) ++skipGated; continue; }
 
         std::string d;
         run(encode(v, 0, d), v, "encode", d);
@@ -1017,6 +1047,7 @@ int main()
         std::string d3; run(decode(v, true, d3), v, "chunked-decode", d3);
         if (!v.skip.empty())
         {
+            ++skipRan;
             std::string s1; run(decode(v, false, s1, &v.skip), v, "skip-ids", s1);
             std::string s2; run(decode(v, true,  s2, &v.skip), v, "skip-ids-chunked", s2);
         }
@@ -1041,6 +1072,84 @@ int main()
      * framed unconditionally. */
     run(sparseByOmission == 4, named("(all)"), "sparse-by-omission-count",
         "expected 4 vectors whose sparse form is pure sequence omission, saw " + std::to_string(sparseByOmission));
+
+    /* --- the skip scenario is not vacuous (CORELIB_PLAN §7.2 item 7) ---------
+     *
+     * The skip cases are the one scenario whose SIZE is data: a vector runs it
+     * only because it carries `skip_ids`, so a file, a loader or a `requires`
+     * gate that stops producing them makes the scenario disappear without a
+     * single check turning red. The counts below are what upstream's
+     * regenerated file (corelib-c-cpp@f2b3d72) carries — a full cross product of
+     * the ten skippable constructs plus the axes beside it — and they are lower
+     * bounds, so upstream adding cases stays green while losing them does not.
+     *
+     * Every vector with `skip_ids` must be ACCOUNTED for: either it ran the
+     * scenario (dense and one-byte-chunked) or its `requires` named a capability
+     * this build lacks. Only the two together sum to the total. */
+    run(skipRan + skipGated == skipVectors, named("(all)"), "skip-vectors-accounted",
+        "of " + std::to_string(skipVectors) + " vectors carrying skip_ids, " +
+            std::to_string(skipRan) + " ran and " + std::to_string(skipGated) +
+            " were gated out by requires");
+    run(skipVectors >= 58, named("(all)"), "skip-vectors-present",
+        "expected at least 58 vectors carrying skip_ids, saw " + std::to_string(skipVectors));
+    run(skipMatrixVectors >= 36, named("(all)"), "skip-matrix-present",
+        "expected at least 36 \"skip/matrix\" vectors (the (read, skipped) cross "
+        "product), saw " + std::to_string(skipMatrixVectors));
+    run(skipAxisVectors >= 16, named("(all)"), "skip-axes-present",
+        "expected at least 16 \"skip\" vectors (empty/long payloads, fp64 element "
+        "length, wide ids, message edges), saw " + std::to_string(skipAxisVectors));
+
+    /* --- loader-truncation witnesses ----------------------------------------
+     *
+     * "No fixed-size cap silently truncates" is a property of code that is not
+     * there, and those rot without a sound: upstream's harness held a fixed
+     * MAXSKIP that dropped the ids past it, and the vectors kept passing while
+     * skipping fewer fields than they named (corelib-c-cpp#160). Nothing on this
+     * loader's path is fixed-size, so the check has to come from the other end —
+     * measure the largest thing that survived the load and compare it against
+     * the sizes the current file actually needs. A cap creeping into loadOp() or
+     * loadVectors() lowers one of these and fails loudly, which is the behaviour
+     * §7.1 asks of a statically bounded profile too: refuse, never test less. */
+    {
+        size_t maxSkipIds = 0, maxArrayElems = 0, maxPayload = 0;
+        uint32_t maxFieldId = 0, maxSkipId = 0;
+        int skippedFp64Arrays = 0;
+        for (const Vector &v : vectors)
+        {
+            maxSkipIds = std::max(maxSkipIds, v.skip.size());
+            for (uint32_t id : v.skip) maxSkipId = std::max(maxSkipId, id);
+            for (const Op &op : v.ops)
+            {
+                maxFieldId = std::max(maxFieldId, op.id);
+                if (op.kind == K::Str)  maxPayload = std::max(maxPayload, op.str.size());
+                if (op.kind == K::Blob) maxPayload = std::max(maxPayload, op.blob.size());
+                if (op.kind == K::Arr)
+                {
+                    maxArrayElems = std::max({maxArrayElems, op.au.size(), op.ai.size(), op.af.size()});
+                    if (op.elem == E::F64 &&
+                        std::find(v.skip.begin(), v.skip.end(), op.id) != v.skip.end())
+                        ++skippedFp64Arrays;
+                }
+            }
+        }
+        const struct { const char *label; bool ok; std::string detail; } witnesses[] = {
+            {"loader-keeps-long-skip-lists", maxSkipIds >= 9,
+             "longest skip_ids list loaded: " + std::to_string(maxSkipIds) + ", expected >= 9"},
+            {"loader-keeps-wide-skip-ids", maxSkipId >= 100000,
+             "largest skipped id loaded: " + std::to_string(maxSkipId) + ", expected >= 100000"},
+            {"loader-keeps-wide-field-ids", maxFieldId >= 100001,
+             "largest field id loaded: " + std::to_string(maxFieldId) + ", expected >= 100001"},
+            {"loader-keeps-long-arrays", maxArrayElems >= 130,
+             "longest array loaded: " + std::to_string(maxArrayElems) + " elements, expected >= 130"},
+            {"loader-keeps-long-payloads", maxPayload >= 130,
+             "longest string/blob payload loaded: " + std::to_string(maxPayload) +
+                 " bytes, expected >= 130"},
+            {"loader-keeps-skipped-fp64-arrays", skippedFp64Arrays >= 1,
+             "no skipped fp64 array survived the load; the element length read from "
+             "the fixlen_word (8, not 4) would go untested"},
+        };
+        for (const auto &w : witnesses) run(w.ok, named("(all)"), w.label, w.detail);
+    }
 
     /* Negative UTF-8 group (top-level "invalid_utf8"). Under a strict build each
      * serialized_hex must decode to INVALID and each string_hex must be refused
@@ -1238,6 +1347,9 @@ int main()
 
     std::printf("%zu vectors, %d run, %d skipped, %d checks, %d failures\n",
                 vectors.size(), static_cast<int>(vectors.size()) - skipped, skipped, checks, failures);
+    std::printf("%d vectors carry skip_ids (%d skip/matrix, %d skip), %d ran the skip "
+                "scenario whole and byte-at-a-time, %d gated out by requires\n",
+                skipVectors, skipMatrixVectors, skipAxisVectors, skipRan, skipGated);
     std::printf("%zu invalid_utf8 vectors, %d run, %d skipped\n", negs.size(), negRun, negSkipped);
     std::printf("%zu sequence_growth cases, %d run, %d skipped (cap %ld)\n",
                 growth.size(), growthRun, growthSkipped, kGrowthCap);

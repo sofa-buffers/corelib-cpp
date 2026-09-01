@@ -23,6 +23,16 @@ re-pinning its row turns red instead of drifting silently.
 load the shared conformance vectors so `test/test_vectors.cpp` can replay them
 through this repo's pure-C++20 `sofab::OStream` / `sofab::IStream`.
 
+A vector may also carry `skip_ids`: the ids a receiver leaves unread, at every
+nesting level, so the decoder skips the field whatever its wire type — and the
+whole sub-sequence when the id names one. `test_vectors.cpp` runs that scenario
+for every such vector, whole and one byte at a time (a resync bug across a chunk
+boundary is invisible to a single-buffer feed), and then asserts the remaining
+fields still decode to their exact values. Nothing on the load path is
+fixed-size, and main() measures the largest loaded skip list, id, array and
+payload against the sizes the current file needs, so a cap that truncated one
+would fail loudly rather than quietly test less.
+
 The file carries three top-level groups and this repo runs all three: `vectors`
 (the wire-format ground truth), `invalid_utf8` (negative `string` payloads) and
 `sequence_growth` (CORELIB_PLAN §7.2 item 8 — a wrapper array's container growth,
@@ -35,7 +45,7 @@ The vectors it loads are **also vendored**, from the same upstream:
 
 | File | Upstream source | Pinned at | `md5` |
 |------|-----------------|-----------|-------|
-| `../../assets/test_vectors.json` | [`sofa-buffers/corelib-c-cpp`](https://github.com/sofa-buffers/corelib-c-cpp) → `assets/test_vectors.json` | commit `bf29d26fe041` (2026-08-24) | `1ed3e93b7104299aa964a2ef44f14af6` |
+| `../../assets/test_vectors.json` | [`sofa-buffers/corelib-c-cpp`](https://github.com/sofa-buffers/corelib-c-cpp) → `assets/test_vectors.json` | commit `f2b3d729b16a` (2026-09-01) | `5942b90a81a93536ed02ffa726ca3f64` |
 
 `test_vectors.json` is the cross-language source of truth for the wire format and
 is copied verbatim into every SofaBuffers corelib. We track the copy vendored in
