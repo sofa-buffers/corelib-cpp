@@ -2964,6 +2964,17 @@ namespace sofab
         size_t spanCarry_ = 0;
         /** @brief Where that field's span continues in the window being parsed (#26). */
         const uint8_t *spanBase_ = nullptr;
+        /**
+         * @brief Is the parse currently inside a **skipped** sequence subtree
+         *        (§6.2.1, #129)?
+         *
+         * The accruing arm of the field-span cap (@ref beginField) is off while it
+         * is set. A skipped subtree is walked, never materialized, so no receiver
+         * limit governs it — the same reason @ref skipSequence suspends the
+         * element-index bound, and set and restored in the same place, for the
+         * same subtree.
+         */
+        bool spanSkip_ = false;
 
         /* cursor + current-field metadata, valid during a deliver callback */
         const uint8_t *p_ = nullptr;   /**< Read cursor. */
@@ -3627,8 +3638,12 @@ namespace sofab
         {
             /* #26: a sequence's own bulk accrues field by field — bound it as it
              * grows, catching many-small-fields that no single payload check
-             * would trip. */
-            if (spanBase_ && exceedsBuffer(spanned(), 0))
+             * would trip. Not inside a skipped subtree: §6.2.1's "a skipped field
+             * is never capped" is not about how the field's size is learnt, and a
+             * sequence nobody asked for is the case the rule most obviously
+             * protects — a peer adding a nested message at an id this schema does
+             * not declare (#129). */
+            if (spanBase_ && !spanSkip_ && exceedsBuffer(spanned(), 0))
             { exceedLimit(); return Field::Stop; }
             const uint8_t *const fieldStart = p_;
             if (!parseFieldTag())
@@ -4020,8 +4035,10 @@ namespace sofab
             const long outerBound = elemBound_, outerSchema = elemSchema_;
             const long outerDyn = elemDyn_, outerDest = elemDest_;
             const int outerElemWire = elemWire_, outerElemFix = elemFix_;
+            const bool outerSpanSkip = spanSkip_;
             elemBound_ = elemSchema_ = elemDyn_ = elemDest_ = -1;
             elemWire_ = elemFix_ = -1;
+            spanSkip_ = true;
             ++seqDepth_;
             dispatchLevel([](sofab::id, size_t, size_t) noexcept {}, /*stopAtEnd*/ true);
             --seqDepth_;
@@ -4031,6 +4048,7 @@ namespace sofab
             elemDest_ = outerDest;
             elemWire_ = outerElemWire;
             elemFix_ = outerElemFix;
+            spanSkip_ = outerSpanSkip;
         }
 
     public:
@@ -4207,6 +4225,7 @@ namespace sofab
             utf8State_ = 0;
             spanCarry_ = 0;
             spanBase_ = nullptr;
+            spanSkip_ = false;
             p_ = end_ = nullptr;
             type_ = Wire{};
             fixType_ = Fix{};
@@ -4433,21 +4452,46 @@ namespace sofab
                      * field the schema already bounds" — there the schema governs
                      * and an over-bound claim is INVALID, which is why §6.3 says
                      * LimitExceeded is "never raised for a field the schema bounds"
-                     * (#86). Only the callback knows the declared maxlen/count, so
-                     * the field is offered to it first with its payload WITHHELD:
-                     * end_ sits at the payload's first byte, so a typed read still
-                     * settles the tag (§7.3) and the bound (§7.1) — both decided
-                     * before a byte is copied — and then reports INCOMPLETE instead
-                     * of materialising anything. Nothing is copied and nothing is
-                     * allocated; the only verdict that can come out of it is the
-                     * INVALID the same bytes get on an uncapped stream. */
+                     * (#86) — and, by the same section's closing rule, it MUST NOT
+                     * be applied to a field the handler SKIPS: "a field the handler
+                     * skips allocates nothing — it is walked, not materialized", so
+                     * "a decode that steps over an over-cap field it was never going
+                     * to read stays COMPLETE" (#129).
+                     *
+                     * Both facts are the callback's, not this codec's: only it knows
+                     * the declared maxlen/count, and only it knows whether this id
+                     * and this wire type are a field it reads at all. So the field is
+                     * offered to it first with its payload WITHHELD: end_ sits at the
+                     * payload's first byte, so a typed read still settles the tag
+                     * (§7.3) and the bound (§7.1) — both decided before a byte is
+                     * copied — and then reports INCOMPLETE instead of materialising
+                     * anything. Nothing is copied and nothing is allocated; the only
+                     * verdict that can come out of it is the INVALID the same bytes
+                     * get on an uncapped stream.
+                     *
+                     * What the offer answers, then, is which of three the field is:
+                     * refused by the schema (return the INVALID), read (the cap is
+                     * this field's and fires), or declined (walk it, and the cap
+                     * never applied). */
                     if (schemaBoundsHeader(type_))
                     {
                         consumed_ = false;
+                        const uint8_t *const withheld = p_;
                         const uint8_t *held = end_;
                         end_ = p_;
                         topCallback_(fieldId_, fixLen_, count_);
                         end_ = held;
+                        /* The one question a withheld offer exists to answer: did the
+                         * callback ENGAGE with this field? A typed read against the
+                         * withheld payload reaches no bytes and reports INCOMPLETE
+                         * (or refuses the destination, or consumes an empty
+                         * payload); a callback that declines — an id it does not
+                         * declare, or a §7.3 wire-type contradiction, which
+                         * `tagMatches` answers before anything else — touches none
+                         * of the three. That is the same test the ordinary delivery
+                         * below makes, on the same two flags, so a field cannot be
+                         * "skipped" on one path and "read" on the other. */
+                        const bool engaged = incomplete_ || consumed_ || error_;
                         incomplete_ = false;
                         pendDone_ = 0;
                         /* The schema bound spoke first — and so does a receiver cap
@@ -4457,6 +4501,21 @@ namespace sofab
                         if (error_ && !argError_) return;
                         error_ = false;
                         argError_ = false;
+                        if (!engaged)
+                        {
+                            /* Walked, not materialized. The cap is not consulted
+                             * again on the way through — neither here nor on a
+                             * resume, where `deliverPending` re-enters the skip
+                             * directly — so a field that spans more than the cap is
+                             * stepped over at any chunk size, exactly as it is on an
+                             * uncapped stream. */
+                            p_ = withheld;
+                            declined = true;
+                            skipPayload();
+                            if (error_) return;
+                            if (incomplete_) { suspendHere(fieldId, declined); return; }
+                            continue;
+                        }
                     }
                     exceedLimit();
                     return;

@@ -266,6 +266,19 @@ with its **payload withheld**: `readString`/`readArray`/… settle the wire type
 materialising anything. Only a field the schema leaves unbounded ends in
 `LimitExceeded`.
 
+**And a field the decode SKIPS is never capped.** "A limit bounds an allocation,
+and a field the handler skips allocates nothing — it is walked, not materialized"
+(§6.2.1), so a decode that steps over an over-cap field it was never going to read
+stays `Complete`. Whether a field is read is the callback's answer, not this
+library's, which is why the withheld offer above serves two questions at once: a
+callback that reads reports `Incomplete` and the cap is this field's, while one
+that declines — an id it does not declare, or a `§7.3` wire-type contradiction —
+touches nothing, and the field is walked with the cap out of it. The same holds
+for a **skipped sequence**: the accruing arm of the cap is suspended for the whole
+subtree, exactly as the element-index bound is. Capping a skipped field is not a
+defence but a forward-compatibility break: nothing was going to be allocated, and
+the receiver would reject a message over a field it does not even read.
+
 #### The §6.2.1 receiver caps are arguments, not settings
 
 `max_dyn_string_len`, `max_dyn_blob_len` and `max_dyn_array_count` are **not**
