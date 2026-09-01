@@ -2401,13 +2401,22 @@ static void bufferLimits()
 
     /* Many small fields inside one sequence: no single declared payload crosses
      * the cap, yet their running total does. Fed in small chunks, feed() reports
-     * LimitExceeded once the buffered sequence outgrows the cap. */
+     * LimitExceeded once the buffered sequence outgrows the cap.
+     *
+     * The destination is `Parent`, which DECLARES id 1 as a nested sequence and
+     * reads every one of the inner id-0 fields into `child.x`. That is what makes
+     * the cap apply at all: it bounds what this receiver materialises. Written
+     * against `ScalarMsg` — whose id 1 is an unsigned scalar, so the sequence is a
+     * §7.3 mismatch and SKIPPED whole — the same bytes exercised the opposite
+     * rule while asserting this one, and the accrual arm capped a subtree §6.2.1
+     * says is never capped (#129). The declined twin is below, on the same bytes,
+     * and the pair is the point: one image cannot tell them apart. */
     {
         const size_t smallCap = 128;
         std::vector<uint8_t> seq = {0x0e};                                    /* id 1, sequence-start */
         for (int i = 0; i < 200; ++i) { seq.push_back(0x00); seq.push_back(0x00); } /* id 0 unsigned = 0 */
         seq.push_back(0x07);                                                  /* sequence-end */
-        sofab::IStreamObject<ScalarMsg> in(sofab::Limits{smallCap});
+        sofab::IStreamObject<Parent> in(sofab::Limits{smallCap});
         sofab::Error last = sofab::Error::None;
         for (size_t i = 0; i < seq.size(); i += 8)
         {
@@ -2417,6 +2426,21 @@ static void bufferLimits()
             if (r.code() == sofab::Error::LimitExceeded) break;
         }
         CHECK(last == sofab::Error::LimitExceeded, "limit: oversized sequence of small fields is capped");
+
+        /* The declined twin: byte for byte the same sequence, delivered to a
+         * message whose id 1 is an unsigned scalar. §7.3 skips it whole, so it is
+         * walked and never materialised — COMPLETE, and the cap never speaks. */
+        sofab::IStreamObject<ScalarMsg> skipped(sofab::Limits{smallCap});
+        sofab::Error lastSkip = sofab::Error::None;
+        for (size_t i = 0; i < seq.size(); i += 8)
+        {
+            size_t n = seq.size() - i < 8 ? seq.size() - i : 8;
+            lastSkip = skipped.feed(seq.data() + i, n).code();
+            if (lastSkip != sofab::Error::Incomplete && lastSkip != sofab::Error::None) break;
+        }
+        CHECK(lastSkip == sofab::Error::None,
+              "limit: the same oversized sequence, §7.3-skipped, is not capped");
+        CHECK((*skipped).a == 0u, "limit: the skipped sequence left id 1 at its default");
     }
 
     /* No-limit pass-through (opt-in): the identical oversize header, with NO cap,
@@ -2574,6 +2598,158 @@ static void schemaBoundOutranksCap()
         CHECK(g_allocCount == before,
               "bound-vs-cap: the rejected array count allocates nothing");
         CHECK((*in).v.empty(), "bound-vs-cap: no elements are materialised for it");
+    }
+
+    /* --- ...and it does NOT govern a field the decode SKIPS (§6.2.1's closing
+     *     rule: "A skipped field is never capped. A limit bounds an allocation,
+     *     and a field the handler skips allocates nothing -- it is walked, not
+     *     materialized. A max_dyn_* limit MUST NOT be applied to it, so a decode
+     *     that steps over an over-cap field it was never going to read stays
+     *     COMPLETE.")
+     *
+     * Two ways a handler declines a field, and the cap must be inert for both:
+     * an id the schema does not declare, and MESSAGE_SPEC §7.3's wire-type
+     * mismatch. Neither reaches a destination, so no cap governs either -- and
+     * capping them is an interop break, not a defence: the receiver rejects a
+     * message a peer may legitimately send, over a field it does not even read.
+     *
+     * Each image puts the skipped field and a READ field in ONE message, because
+     * the defect this pins is invisible in an image that holds only the skipped
+     * one: "the decode failed" and "the field kept its default" both pass with
+     * the bug present. The neighbour's VALUE is the assertion, and it pins the
+     * framing of the skip at the same time. The allocation counter is the other
+     * half: it proves the skipped field costs nothing, which is *why* no cap
+     * governs it. --- */
+    {
+        /* id 9 is undeclared: a 100-byte string, over the 8-byte cap, then the
+         * declared id 1 = "abcd" after it. */
+        std::vector<uint8_t> img = {0x4a};                 /* id9, fixlen      */
+        appendVarint(img, (static_cast<uint64_t>(100) << 3) | 2u); /* string, 100 */
+        img.insert(img.end(), 100, 'z');
+        const std::vector<uint8_t> tail = {0x0a, 0x22, 'a', 'b', 'c', 'd'}; /* id1, len 4 */
+        img.insert(img.end(), tail.begin(), tail.end());
+
+        sofab::IStreamObject<BoundedMsg> in(sofab::Limits{cap});
+        const unsigned long before = g_allocCount;
+        auto r = in.feed(img.data(), img.size());
+        CHECK(r.code() == sofab::Error::None,
+              "skip-vs-cap: an over-cap field at an UNDECLARED id stays COMPLETE");
+        CHECK((*in).s == "abcd",
+              "skip-vs-cap: the field after the skipped one still decodes");
+        CHECK(g_allocCount == before,
+              "skip-vs-cap: the skipped over-cap field allocates nothing");
+    }
+    {
+        /* The same message dribbled a byte at a time: the skip resumes across
+         * chunk boundaries and buffers none of the walked payload. */
+        std::vector<uint8_t> img = {0x4a};
+        appendVarint(img, (static_cast<uint64_t>(100) << 3) | 2u);
+        img.insert(img.end(), 100, 'z');
+        const std::vector<uint8_t> tail = {0x0a, 0x22, 'a', 'b', 'c', 'd'};
+        img.insert(img.end(), tail.begin(), tail.end());
+
+        sofab::IStreamObject<BoundedMsg> in(sofab::Limits{cap});
+        const unsigned long before = g_allocCount;
+        sofab::Error last = sofab::Error::None;
+        for (size_t i = 0; i < img.size(); ++i)
+        {
+            last = in.feed(img.data() + i, 1).code();
+            if (last != sofab::Error::Incomplete && last != sofab::Error::None) break;
+        }
+        CHECK(last == sofab::Error::None,
+              "skip-vs-cap: the dribbled skip of an over-cap field stays COMPLETE");
+        CHECK((*in).s == "abcd", "skip-vs-cap: dribbled, the next field still decodes");
+        CHECK(g_allocCount == before,
+              "skip-vs-cap: dribbled, the skipped field still allocates nothing");
+    }
+    {
+        /* §7.3: id 3 IS declared -- as an unbounded string -- but arrives as an
+         * integer array of 100 elements. The declared type contradicts the wire
+         * type, so the field is skipped whole and the cap must not see it; the
+         * neighbour proves the 100 elements were walked, not eaten. */
+        std::vector<uint8_t> img = {0x1b};   /* id3, array-unsigned */
+        appendVarint(img, 100);
+        img.insert(img.end(), 100, 0x01);
+        const std::vector<uint8_t> tail = {0x0a, 0x22, 'a', 'b', 'c', 'd'};
+        img.insert(img.end(), tail.begin(), tail.end());
+
+        sofab::IStreamObject<BoundedMsg> in(sofab::Limits{cap});
+        const unsigned long before = g_allocCount;
+        auto r = in.feed(img.data(), img.size());
+        CHECK(r.code() == sofab::Error::None,
+              "skip-vs-cap: an over-cap §7.3-mismatched field stays COMPLETE");
+        CHECK((*in).u.empty(), "skip-vs-cap: the mismatched field keeps its default");
+        CHECK((*in).s == "abcd",
+              "skip-vs-cap: the field after the mismatched one still decodes");
+        CHECK(g_allocCount == before,
+              "skip-vs-cap: the skipped mismatched field allocates nothing");
+    }
+
+    {
+        /* The forward-compatibility case the rule exists for: a peer added a
+         * nested message at an id this schema does not declare. A skipped
+         * SEQUENCE is walked field by field, so it is bounded by the accruing
+         * arm of the cap rather than by a header -- and §6.2.1 does not
+         * distinguish: the subtree is not this message's value, nothing in it is
+         * materialised, and stepping over it must stay COMPLETE however long it
+         * is. */
+        std::vector<uint8_t> img = {0x4e};              /* id9, sequence start */
+        for (unsigned k = 0; k < 40; ++k)               /* 40 inner varint fields */
+        {
+            img.push_back(0x08);                        /* inner id1, unsigned  */
+            img.push_back(0x7f);
+        }
+        img.push_back(0x07);                            /* sequence end         */
+        const std::vector<uint8_t> tail = {0x0a, 0x22, 'a', 'b', 'c', 'd'};
+        img.insert(img.end(), tail.begin(), tail.end());
+
+        sofab::IStreamObject<BoundedMsg> in(sofab::Limits{cap});
+        const unsigned long before = g_allocCount;
+        auto r = in.feed(img.data(), img.size());
+        CHECK(r.code() == sofab::Error::None,
+              "skip-vs-cap: a skipped sequence longer than the cap stays COMPLETE");
+        CHECK((*in).s == "abcd",
+              "skip-vs-cap: the field after the skipped sequence still decodes");
+        CHECK(g_allocCount == before,
+              "skip-vs-cap: the skipped sequence allocates nothing");
+    }
+    {
+        /* The same subtree dribbled: the skip descent is re-entered across every
+         * boundary and the cap stays out of it on the resume path too. */
+        std::vector<uint8_t> img = {0x4e};
+        for (unsigned k = 0; k < 40; ++k) { img.push_back(0x08); img.push_back(0x7f); }
+        img.push_back(0x07);
+        const std::vector<uint8_t> tail = {0x0a, 0x22, 'a', 'b', 'c', 'd'};
+        img.insert(img.end(), tail.begin(), tail.end());
+
+        sofab::IStreamObject<BoundedMsg> in(sofab::Limits{cap});
+        sofab::Error last = sofab::Error::None;
+        for (size_t i = 0; i < img.size(); ++i)
+        {
+            last = in.feed(img.data() + i, 1).code();
+            if (last != sofab::Error::Incomplete && last != sofab::Error::None) break;
+        }
+        CHECK(last == sofab::Error::None,
+              "skip-vs-cap: the dribbled skipped sequence stays COMPLETE");
+        CHECK((*in).s == "abcd",
+              "skip-vs-cap: dribbled, the field after the skipped sequence decodes");
+    }
+    {
+        /* ...and the cap is NOT switched off by a skip that happened earlier: a
+         * READ field over the cap after one is still LimitExceeded. This is the
+         * assertion that keeps the fix from being "stop enforcing the cap". */
+        std::vector<uint8_t> img = {0x4a};                 /* id9, undeclared   */
+        appendVarint(img, (static_cast<uint64_t>(100) << 3) | 2u);
+        img.insert(img.end(), 100, 'z');
+        img.push_back(0x1a);                               /* id3, unbounded    */
+        appendVarint(img, (static_cast<uint64_t>(100) << 3) | 2u);
+        img.insert(img.end(), 100, 'y');
+
+        sofab::IStreamObject<BoundedMsg> in(sofab::Limits{cap});
+        auto r = in.feed(img.data(), img.size());
+        CHECK(r.code() == sofab::Error::LimitExceeded,
+              "skip-vs-cap: a READ over-cap field after a skipped one is still LimitExceeded");
+        CHECK((*in).u.empty(), "skip-vs-cap: the capped field still delivers nothing");
     }
 
     /* A legal bounded field under the cap is untouched by any of this. */
@@ -5737,6 +5913,37 @@ static void receiverCapsAreNeitherHeldNorOmittable()
         CHECK(r.complete() && !r.limitExceeded() && !r.invalidArgument(),
               "split reads: a §7.3-mistyped over-cap field is skipped, not capped");
         CHECK((*in).unbounded.empty(), "split reads: and the destination is untouched");
+    }
+    /* The SAME rule, against the OTHER receiver cap. Every case above states its
+     * stream as `kMaxSpan`, which is `Limits{SIZE_MAX}` -- a number that makes
+     * the field-span cap's check run and never fire. So the rule was pinned for
+     * `readStringCapped`'s per-read `dynCap` and left unpinned for
+     * `Limits::max_buffered_field`, and the second is the one that was applying
+     * itself to skipped fields (#129). Both are §6.2.1 receiver caps and neither
+     * may touch a field the handler declines, so both are stated here, and a
+     * READ field over the same cap is stated beside them so the pair cannot pass
+     * by the check simply being off. */
+    {
+        const auto w = blobField(2, 64);       /* §7.3-mistyped at a declared id */
+        sofab::IStreamObject<SplitMsg> in(sofab::Limits{16});
+        auto r = in.feed(w.data(), w.size());
+        CHECK(r.complete() && !r.limitExceeded(),
+              "split reads: the §7.3 skip beats the field-span cap too");
+        CHECK((*in).unbounded.empty(), "split reads: the mistyped field materialises nothing");
+    }
+    {
+        const auto w = strField(7, 64);        /* an id SplitMsg does not declare */
+        sofab::IStreamObject<SplitMsg> in(sofab::Limits{16});
+        auto r = in.feed(w.data(), w.size());
+        CHECK(r.complete() && !r.limitExceeded(),
+              "split reads: an unknown id over the field-span cap is skipped, not capped");
+    }
+    {
+        const auto w = strField(2, 64);        /* the id IS read: the cap applies */
+        sofab::IStreamObject<SplitMsg> in(sofab::Limits{16});
+        auto r = in.feed(w.data(), w.size());
+        CHECK(r.limitExceeded() && !r.invalid(),
+              "split reads: a READ field over the field-span cap is still LimitExceeded");
     }
 
     /* --- 4. the structural half: the shapes the audit found must not come
