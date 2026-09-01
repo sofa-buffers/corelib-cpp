@@ -697,9 +697,10 @@ Six suites run under CTest:
 - **`test_roundtrip`** — encode/decode/nested/chunked/skip, the three-valued
   outcome, malformed input, the terminal latch, and §2 sequence framing.
 - **`test_vectors`** — replays the shared `assets/test_vectors.json` for encode,
-  decode and byte-at-a-time streaming: the `vectors`, `invalid_utf8` and
-  `sequence_growth` groups, plus a guard that fails when the file's envelope
-  drifts.
+  decode, byte-at-a-time streaming and field skipping (every vector carrying
+  `skip_ids`, whole and one byte at a time): the `vectors`, `invalid_utf8` and
+  `sequence_growth` groups, plus guards that fail when the file's envelope
+  drifts or the loader stops carrying the sizes the vectors need.
 - **`test_bench_tools`** — holds the benchmark tooling to BENCH_SPEC: the
   workload list, both output tables, and the cross-port parity sizes.
 - **`test_ci_workflows`** — reads `.github/workflows/` and requires both build
