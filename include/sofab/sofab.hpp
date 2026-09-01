@@ -2975,6 +2975,24 @@ namespace sofab
          * same subtree.
          */
         bool spanSkip_ = false;
+        /**
+         * @brief Bytes of the current top-level field spent on SKIPPED subtrees
+         *        (§6.2.1, #129 one level down).
+         *
+         * @ref spanned counts the field's raw byte span, which is what the
+         * accruing arm of the field-span cap used to measure. Inside a sequence
+         * this receiver DOES read, that span also contains every child it does
+         * NOT — an unknown id, or one §7.3 declines — and those bytes are walked,
+         * never materialized. §6.2.1: "a field the handler skips allocates
+         * nothing", so "a decode that steps over an over-cap field it was never
+         * going to read stays COMPLETE". @ref spanSkip_ suppresses the check
+         * *inside* such a subtree; this discounts what the subtree cost, so the
+         * live field AFTER it — the sequence end included — is measured against
+         * the bulk this receiver actually took on and not against the sender's
+         * padding. Reset with @ref spanCarry_, and carried across chunks for the
+         * same reason it is.
+         */
+        size_t spanSkipped_ = 0;
 
         /* cursor + current-field metadata, valid during a deliver callback */
         const uint8_t *p_ = nullptr;   /**< Read cursor. */
@@ -3600,7 +3618,13 @@ namespace sofab
                 /* Everything before the delivery is the same code in every
                  * instantiation, and it is where §7.3's element test, §5.1's index
                  * bound and §4.6/§4.8's metadata rules all live, so it is written
-                 * once (@ref beginField) rather than copied into each. */
+                 * once (@ref beginField) rather than copied into each.
+                 *
+                 * @c fieldStart is taken first because it is the field's FIRST
+                 * byte, not its payload's: a child this level SKIPS is discounted
+                 * from the field-span cap whole, header and all, exactly as a
+                 * declined top-level field is (§6.2.1, @ref finishField). */
+                const uint8_t *const fieldStart = p_;
                 const Field f = beginField(stopAtEnd);
                 if (f == Field::Stop) return;
                 const sofab::id fieldId = fieldId_;
@@ -3608,7 +3632,7 @@ namespace sofab
                 /* a §7.3-skipped element is never delivered; leaving it unconsumed
                  * runs it through the same skip as an unknown id. */
                 if (f != Field::SkipElem) cb(fieldId, fixLen_, count_);
-                if (!finishField(payload, fieldId)) return;
+                if (!finishField(fieldStart, payload, fieldId)) return;
             }
             closeLevel(stopAtEnd);
         }
@@ -3643,7 +3667,7 @@ namespace sofab
              * sequence nobody asked for is the case the rule most obviously
              * protects — a peer adding a nested message at an id this schema does
              * not declare (#129). */
-            if (spanBase_ && !spanSkip_ && exceedsBuffer(spanned(), 0))
+            if (spanBase_ && !spanSkip_ && exceedsBuffer(spannedLive(), 0))
             { exceedLimit(); return Field::Stop; }
             const uint8_t *const fieldStart = p_;
             if (!parseFieldTag())
@@ -3738,11 +3762,20 @@ namespace sofab
          * under the metadata of whatever innermost field the descent left behind,
          * reporting INVALID for a truncation (Crucible F-0056, corelib-cpp#71).
          *
+         * §6.2.1: what the skip walks past is discounted from the field-span cap
+         * — from @p fieldStart, so the skipped child's own header goes with it.
+         * A skip that SUSPENDS discounts what this window walked and the resume
+         * (@ref deliverPending) discounts the rest, which is what keeps the
+         * verdict independent of the caller's chunking (§7.2 item 4).
+         *
+         * @param fieldStart The field's first header byte.
          * @param payload The field's first payload byte.
          * @param fieldId Its id, for the path entry a suspension records.
          * @return `false` when the level must return.
          */
-        [[gnu::always_inline]] inline bool finishField(const uint8_t *payload, sofab::id fieldId) noexcept
+        [[gnu::always_inline]] inline bool finishField(const uint8_t *fieldStart,
+                                                       const uint8_t *payload,
+                                                       sofab::id fieldId) noexcept
         {
             bool declined = false;
             if (!incomplete_ && !consumed_)
@@ -3750,6 +3783,7 @@ namespace sofab
                 declined = true;
                 p_ = payload;
                 skipPayload();
+                discountSkipped(fieldStart);
             }
             if (incomplete_)
             {
@@ -3856,13 +3890,15 @@ namespace sofab
              * level would have to record is taken before the delivery. */
             const sofab::id id = fieldId_;
             consumed_ = false;
-            if (declined) skipPayload();
+            const uint8_t *const from = p_;
+            if (declined) { skipPayload(); discountSkipped(from); }
             else          cb(id, fixLen_, count_);
             if (error_) return false;
             if (!incomplete_ && !consumed_ && !declined)
             {
                 declined = true;
                 skipPayload();
+                discountSkipped(from);
                 if (error_) return false;
             }
             if (incomplete_)
@@ -3902,7 +3938,13 @@ namespace sofab
             if (declined)
             {
                 if (seqDepth_ >= MAX_DEPTH) { error_ = true; return false; }
+                /* §6.2.1, as in @ref finishField: the rest of a skipped subtree,
+                 * arriving in a later chunk, is still walked and not materialized.
+                 * Discounting it here is what makes the cap's verdict the same
+                 * whether the subtree arrived in one window or ten. */
+                const uint8_t *const from = p_;
                 skipSequence();
+                discountSkipped(from);
             }
             else
             {
@@ -4226,6 +4268,7 @@ namespace sofab
             spanCarry_ = 0;
             spanBase_ = nullptr;
             spanSkip_ = false;
+            spanSkipped_ = 0;
             p_ = end_ = nullptr;
             type_ = Wire{};
             fixType_ = Fix{};
@@ -4351,6 +4394,27 @@ namespace sofab
             return spanCarry_ + static_cast<size_t>(p_ - spanBase_);
         }
 
+        /**
+         * @brief @ref spanned less what this field spent on skipped subtrees —
+         *        the number the field-span cap is measured against (§6.2.1).
+         *
+         * The cap bounds what the receiver materializes, and @ref spanSkipped_ is
+         * exactly what it did not. Saturating rather than wrapping: the two
+         * counters are updated in different places, and a cap that ran backwards
+         * would be a cap that never fires.
+         */
+        [[nodiscard]] size_t spannedLive() const noexcept
+        {
+            const size_t s = spanned();
+            return s > spanSkipped_ ? s - spanSkipped_ : 0;
+        }
+
+        /** @brief Discount a skipped field's bytes from the live span (§6.2.1). */
+        void discountSkipped(const uint8_t *from) noexcept
+        {
+            if (p_ > from) spanSkipped_ += static_cast<size_t>(p_ - from);
+        }
+
         /** @brief Latch the refusal this feed produced, in §6.3's order of tiers. */
         Result latchTerminal() noexcept
         {
@@ -4433,6 +4497,7 @@ namespace sofab
                 const uint8_t *fieldStart = p_;
                 spanCarry_ = 0;
                 spanBase_ = p_;
+                spanSkipped_ = 0;
                 incomplete_ = false;
                 declined = false;
                 if (!parseFieldHeader())
@@ -6647,6 +6712,43 @@ namespace sofab
          *       "unlimited" (§6.2.1).
          */
         long dynCap = -1;
+        /**
+         * @brief The ROW's schema `count` N, or -1 — the second axis of a native
+         *        nested row (`array<array<u32>>`), and the inner array's own §7.1
+         *        bound (corelib-cpp#124).
+         *
+         * A matrix has two axes and each needs its own pair of numbers. @ref cap /
+         * @ref dynCap bound the row **id**, which is the outer array's length
+         * (§5.1). These two bound the row's **element count**, which the row
+         * announces as a real count header because a row IS a native array — and
+         * that header is the enforcement point §6.2.1 names, "before the
+         * allocation it is meant to prevent".
+         *
+         * Reusing @ref dynCap for the row was wrong in both directions. Where the
+         * OUTER array carries a schema `count`, ARCHITECTURE §9.5 has generated
+         * code state no receiver cap at all — caps govern only what the schema
+         * left unbounded — so the row was read under `-1` and every row was
+         * refused @ref Error::InvalidArgument. Where the outer array was
+         * unbounded, a row past the inner `count:` was accepted under the OUTER
+         * array's element cap, which is a §7.1 `INVALID` gone missing and, had it
+         * fired, the wrong category for it.
+         *
+         * Set it when the schema declares the inner `count`; leave it -1 and set
+         * @ref rowDynCap when it does not. Both -1 is refused, not obeyed, exactly
+         * as on the id axis.
+         */
+        long rowCap = -1;
+        /**
+         * @brief The ROW's receiver cap (`max_dyn_array_count`), or -1 — the
+         *        row-axis twin of @ref dynCap.
+         *
+         * Consulted only where @ref rowCap is absent, and its breach is
+         * @ref Error::LimitExceeded: the bytes are well-formed and the same row
+         * decodes for a receiver configured with a larger cap (§6.2.1, §6.3). A
+         * row the schema bounds answers to @ref rowCap alone — §6.2.1 forbids
+         * applying a receiver cap to a field the schema already bounds.
+         */
+        long rowDynCap = -1;
         /** @copydoc StringSeq::elemDestCap */
         static constexpr long elemDestCap = detail::destCapacity<Container>();
 
@@ -6730,17 +6832,23 @@ namespace sofab
                  * INVALID of §7.1 rather than a receiver-side LimitExceeded. */
                 if constexpr (detail::destCapacity<Elem>() >= 0)
                     (void)sofab::readArray(is, row, detail::destCapacity<Elem>());
-                else
+                else if (rowCap >= 0)
                     /* A GROWABLE row has no capacity of its own to be bounded by,
-                     * and the schema `count` of the inner array never reaches this
-                     * collector (corelib-cpp#124). What is left is the receiver's
-                     * own `max_dyn_array_count` -- @ref dynCap -- which is the
-                     * right number for a row the schema left unbounded and the
-                     * only one this collector holds. It is required, like every
-                     * other cap here: a row read with none answers
-                     * @ref Error::InvalidArgument rather than letting the wire
-                     * count decide how long the row is. */
-                    (void)sofab::readArrayCapped(is, row, dynCap);
+                     * so the row axis states its own bounds (@ref rowCap /
+                     * @ref rowDynCap, corelib-cpp#124). The schema `count` first:
+                     * a row past it contradicts the schema both peers agreed on,
+                     * which is §7.1's `INVALID`, and §6.2.1 forbids a receiver cap
+                     * on an axis the schema already bounds -- so @ref rowDynCap is
+                     * not consulted here even when it is set. */
+                    (void)sofab::readArray(is, row, rowCap);
+                else
+                    /* Row unbounded by the schema: the receiver's own
+                     * `max_dyn_array_count`, whose breach is the POLICY category.
+                     * It is required, like every other cap here: a row read with
+                     * none answers @ref Error::InvalidArgument rather than letting
+                     * the wire count decide how long the row is (§6.2.1, "no unset
+                     * state and no unlimited mode"). */
+                    (void)sofab::readArrayCapped(is, row, rowDynCap);
             }
             else
             {
