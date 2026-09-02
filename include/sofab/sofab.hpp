@@ -3105,7 +3105,13 @@ namespace sofab
          * @param overflow Set when the varint is wider than 64 bits (INVALID, §6.3).
          * @return `true` on success, `false` on a > 64-bit varint.
          */
-        static bool getVarintWindowed(const uint8_t *&p, uint64_t &out, bool *overflow) noexcept
+        /* Hot leaf of the decode loop. The §6.2.1/§7.3 work grew its callers past
+         * GCC's default inline budget, at which point this stopped being inlined and
+         * became an out-of-line call per varint — measured at +14.3%% on the
+         * generator's cpp-cpp decode row with the body byte-identical (#133). The
+         * attribute states the intent the budget can no longer be trusted to infer;
+         * `finishField` above already carries it for the same reason. */
+        [[gnu::always_inline]] static inline bool getVarintWindowed(const uint8_t *&p, uint64_t &out, bool *overflow) noexcept
         {
             /* Read the first eight bytes as one word and locate the terminator by
              * its clear continuation bit. Everything past it belongs to whatever
@@ -3195,7 +3201,13 @@ namespace sofab
          *         is set: that is INVALID regardless of what follows, and callers in
          *         callers must distinguish it from a merely-truncated tail.
          */
-        static bool getVarint(const uint8_t *&p, const uint8_t *end, uint64_t &out,
+        /* Hot leaf of the decode loop. The §6.2.1/§7.3 work grew its callers past
+         * GCC's default inline budget, at which point this stopped being inlined and
+         * became an out-of-line call per varint — measured at +14.3%% on the
+         * generator's cpp-cpp decode row with the body byte-identical (#133). The
+         * attribute states the intent the budget can no longer be trusted to infer;
+         * `finishField` above already carries it for the same reason. */
+        [[gnu::always_inline]] static inline bool getVarint(const uint8_t *&p, const uint8_t *end, uint64_t &out,
                               bool *overflow = nullptr) noexcept
         {
             /* One byte is the overwhelmingly common case away from array
@@ -4621,7 +4633,7 @@ namespace sofab
          *         On `false` either @ref error_ (a > 64-bit varint, or an id past
          *         @ref ID_MAX) or @ref incomplete_ (the word is cut short) is set.
          */
-        bool parseFieldTag() noexcept
+        [[gnu::always_inline]] inline bool parseFieldTag() noexcept
         {
             uint64_t header;
             bool ovf = false;
@@ -4655,7 +4667,7 @@ namespace sofab
          *         @ref fixLen_, @ref count_ and @ref fixType_ set. On `false`
          *         either @ref error_ or @ref incomplete_ is set.
          */
-        bool parseFieldMeta() noexcept
+        [[gnu::always_inline]] inline bool parseFieldMeta() noexcept
         {
             fixLen_ = 0; count_ = 0;
             bool ovf = false;
