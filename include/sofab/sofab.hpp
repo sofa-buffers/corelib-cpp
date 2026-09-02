@@ -4236,15 +4236,6 @@ namespace sofab
         }
 
         /**
-         * @return `true` when the decoder sits at a clean message boundary: nothing
-         *         carried, no open sequence, no half-delivered field (§5.2.4).
-         */
-        [[nodiscard]] bool atBoundary() const noexcept
-        {
-            return carryLen_ == 0 && suspendDepth_ < 0;
-        }
-
-        /**
          * @brief Drop every byte of decoder state, so the next @ref feed starts a
          *        brand-new message.
          *
@@ -4389,6 +4380,29 @@ namespace sofab
             else                                        rejectDestination();
         }
 
+
+    private:
+        /**
+         * @brief Does the decoder sit at a clean message boundary — nothing
+         *        carried, no open sequence, no half-delivered field (§5.2.4)?
+         *
+         * **Internal, deliberately not public.** This is one *ingredient* of the
+         * outcome, not the outcome: it knows the parse position and nothing about
+         * a latched refusal, so on bytes @ref feed already rejected it still answers
+         * `true`. Published as an accessor it was a second way to ask "where do I
+         * stand?" that disagreed with the first — a dangling `0x07` returns
+         * `INVALID` from @ref feed while this predicate reports a clean boundary.
+         * CORELIB_PLAN §5.3.1 names the cost: "Every additional surface is a second
+         * implementation of every rule in this document." The one answer is the
+         * @ref Result that @ref feed returns (§5.2.4: "The status `feed`/`decode`
+         * returns *is* the answer"); this helper only supplies the
+         * `COMPLETE`-vs-`INCOMPLETE` half of it to the empty-feed path, after that
+         * path has already ruled out a latched terminal verdict.
+         */
+        [[nodiscard]] bool atBoundary() const noexcept
+        {
+            return carryLen_ == 0 && suspendDepth_ < 0;
+        }
 
     protected:
         /**
