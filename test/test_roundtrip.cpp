@@ -840,6 +840,25 @@ static void threeValuedOutcomes()
         CHECK(r.invalid() && !r.complete() && !r.incomplete(), "three-valued: invalid predicates");
     }
 
+    /* One surface, one answer (§5.2.4, §5.3.1): a dangling sequence-end is INVALID
+     * *and* leaves the parse sitting on a clean field boundary — nothing carried,
+     * no sequence open. That split is what a second, stream-side "where do I
+     * stand?" accessor got wrong: it read the parse position only and answered
+     * "complete" for bytes feed had already refused. The verdict travels on the
+     * feed call alone, so the end-of-input probe repeats INVALID rather than
+     * disagreeing with it. */
+    {
+        sofab::IStreamObject<ScalarMsg> in{kMaxSpan};
+        const uint8_t dangling[] = {0x07}; /* sequence-end with no open sequence (§4.9) */
+        auto r = in.feed(dangling, sizeof dangling);
+        CHECK(r.code() == sofab::Error::InvalidMessage,
+              "three-valued: a dangling sequence-end is INVALID");
+        CHECK(r.status() == sofab::DecodeStatus::Invalid && !r.complete(),
+              "three-valued: boundary-aligned INVALID is not COMPLETE");
+        CHECK(in.feed(dangling, 0).code() == sofab::Error::InvalidMessage,
+              "three-valued: the end-of-input probe repeats the refusal, never COMPLETE");
+    }
+
     /* Streaming: an INCOMPLETE prefix completes to COMPLETE once the rest arrives —
      * the split must never leak an error and must land exactly at COMPLETE. */
     {
