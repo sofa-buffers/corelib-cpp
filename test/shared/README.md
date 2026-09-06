@@ -33,19 +33,31 @@ fixed-size, and main() measures the largest loaded skip list, id, array and
 payload against the sizes the current file needs, so a cap that truncated one
 would fail loudly rather than quietly test less.
 
-The file carries three top-level groups and this repo runs all three: `vectors`
-(the wire-format ground truth), `invalid_utf8` (negative `string` payloads) and
+The file carries four top-level groups and this repo runs all four: `vectors`
+(the wire-format ground truth), `invalid_utf8` (negative `string` payloads),
 `sequence_growth` (CORELIB_PLAN §7.2 item 8 — a wrapper array's container growth,
 keyed by a delivery sequence of element ids rather than by bytes, with indices
-relative to the port's own configured `max_dyn_array_count`). The growth block is
-gated by a `dynamic_arrays` capability tag: a statically bounded profile never
-grows and skips it. This corelib collects into `std::vector`, so it runs it.
+relative to the port's own configured `max_dyn_array_count`) and `header_limits`
+(§6.2.1/§6.3 — bytes that declare a length or count and then end, with no payload
+behind them). The growth block is gated by a `dynamic_arrays` capability tag: a
+statically bounded profile never grows and skips it. This corelib collects into
+`std::vector`, so it runs it.
+
+`header_limits` is gated by `receiver_caps`, a *profile* capability: a port
+declares it when its generated code carries §6.2.1 receiver caps distinct from
+schema bounds. This corelib's read API is exactly that pair — `readString` takes
+the declared `maxlen`, `readStringCapped` the receiver's `max_dyn_string_len`,
+and neither has a default — so it declares it and runs every case. In that block
+an unsatisfied `requires` tag means **skip**, for every tag, and not the
+reduced-build rejection a *vector* gets: the cases assert a rejection with a
+specific category, so a build that cannot represent the construct would reject
+it for an unrelated reason and appear to pass while testing nothing.
 
 The vectors it loads are **also vendored**, from the same upstream:
 
 | File | Upstream source | Pinned at | `md5` |
 |------|-----------------|-----------|-------|
-| `../../assets/test_vectors.json` | [`sofa-buffers/corelib-c-cpp`](https://github.com/sofa-buffers/corelib-c-cpp) → `assets/test_vectors.json` | commit `f2b3d729b16a` (2026-09-01) | `5942b90a81a93536ed02ffa726ca3f64` |
+| `../../assets/test_vectors.json` | [`sofa-buffers/corelib-c-cpp`](https://github.com/sofa-buffers/corelib-c-cpp) → `assets/test_vectors.json` | commit `3aa34353be0a` (2026-09-03) | `793040a0f844116ccd20b1f9edd53a7d` |
 
 `test_vectors.json` is the cross-language source of truth for the wire format and
 is copied verbatim into every SofaBuffers corelib. We track the copy vendored in
@@ -86,7 +98,8 @@ happens:
    authoritative format description.
 
    The **envelope** — the file's top-level keys — is upstream's too, and it has
-   grown a key twice (`invalid_utf8`, then `sequence_growth`). `test/test_vectors.cpp` reads and parses
+   grown a key three times (`invalid_utf8`, then `sequence_growth`, then
+   `header_limits`). `test/test_vectors.cpp` reads and parses
    the file exactly once and walks every group off that single parse; each walker
    demands its own top-level key and fails the run when it is absent, renamed or
    empty. A re-sync that reshapes the envelope therefore shows up as a red
