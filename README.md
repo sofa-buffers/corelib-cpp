@@ -380,7 +380,7 @@ shortcut: it rejects overlong forms (including `C0 80`), surrogates
 
 Define `SOFAB_STRICT_UTF8=0` before including `<sofab/sofab.hpp>` for a
 documented non-strict build: the validation code folds away entirely and payloads
-are stored verbatim — raw, never lossy. It is a validation policy, never a
+are stored verbatim — raw, never lossy. A daily CI job (`.github/workflows/shared-vectors.yml`) compares the sha256 of this copy against that file on `corelib-c-cpp@main`, so a copy left behind by an upstream change shows up here rather than going unnoticed. It is a validation policy, never a
 wire-format switch, so peers with different settings interoperate on all valid
 data; conformance and the shared vectors run with it ON.
 
