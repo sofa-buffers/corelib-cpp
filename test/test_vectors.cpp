@@ -76,6 +76,17 @@ enum Cap : uint32_t
      * no_std) never runs it. This corelib collects into std::vector, so it
      * does. */
     CAP_DYN_ARR  = 1u << 5,
+    /* The `header_limits` block's gate, and a PROFILE capability like
+     * CAP_DYN_ARR rather than a wire construct: a port declares it when its
+     * generated code carries §6.2.1 receiver caps DISTINCT from schema bounds.
+     * This corelib's read API is split into exactly that pair — readString
+     * takes the declared `maxlen`, readStringCapped the receiver's
+     * `max_dyn_string_len`, and neither has a default — so it does. */
+    CAP_RECV_CAP = 1u << 6,
+    /* Never set by buildCaps(): the bit hdrReqMask() raises for a tag this
+     * reader does not know, so an unrecognised `requires` entry in the
+     * `header_limits` block SKIPS the case instead of running it. */
+    CAP_UNKNOWN  = 1u << 31,
 };
 
 constexpr uint32_t buildCaps()
@@ -98,6 +109,7 @@ constexpr uint32_t buildCaps()
     c |= CAP_INT64;
 #endif
     c |= CAP_DYN_ARR;
+    c |= CAP_RECV_CAP;
     return c;
 }
 
@@ -109,6 +121,7 @@ uint32_t capFromName(const char *s)
     if (!std::strcmp(s, "fp64"))     return CAP_FP64;
     if (!std::strcmp(s, "int64"))    return CAP_INT64;
     if (!std::strcmp(s, "dynamic_arrays")) return CAP_DYN_ARR;
+    if (!std::strcmp(s, "receiver_caps")) return CAP_RECV_CAP;
     return 0; /* unknown tag: ignore (forward-compatible) */
 }
 
@@ -643,9 +656,284 @@ std::vector<uint8_t> growthWire(const GrowthCase &c)
     return out;
 }
 
+/* --- header ceilings (top-level "header_limits"; CORELIB_PLAN §6.2.1 / §6.3,
+ *     landed upstream as corelib-c-cpp@3aa34353be0a) -------------------------
+ *
+ * Bytes that DECLARE a length or a count and then END, with not one payload
+ * byte behind them:
+ *
+ *     02 a2 06   then EOF
+ *     ^^ id 0, wire type 2 (fixlen)
+ *        ^^^^^ length word (100 << 3) | 2 -> a 100-byte STRING is declared
+ *
+ * The ceiling is decided AT THAT WORD, before the payload is asked for, so the
+ * answer is the ceiling's and it is TERMINAL. `INCOMPLETE` is not merely
+ * unhelpful here: §5.2.1 defines it as the outcome more bytes CAN change and
+ * §5.2.4 has a streaming caller read it as "feed me the next chunk", which is a
+ * false statement about the state once a ceiling has fired.
+ *
+ * WHICH ceiling speaks is the subject, and the two give opposite answers on the
+ * identical word — §6.2.1 forbids applying a receiver cap to a field the schema
+ * already bounds, so a case states one of them and never both:
+ *
+ *   "schema": { "maxlen": N }    -> readString / readBlob / readArray
+ *                                   -> InvalidMessage (MESSAGE_SPEC §7.1)
+ *   "limits": { "max_dyn_*": N } -> readStringCapped / readBlobCapped /
+ *                                   readArrayCapped -> LimitExceeded (§6.2.1)
+ *
+ * `header_string_schema_bounded` and `header_string_over_cap` carry IDENTICAL
+ * bytes and differ only in which ceiling the case configures; that pair is what
+ * keeps the two categories apart, and a port that routes both into one passes
+ * every other case in the block and fails exactly it.
+ *
+ * Unlike `sequence_growth`, the numbers here are ABSOLUTE rather than
+ * cap-relative: the declared length is baked into the varint, so the case has
+ * to TELL this port which ceiling to configure for its run instead of being
+ * rebuilt against the port's own. `limits`/`schema` are that instruction and
+ * nothing is retained past the case — this corelib holds no ceiling of its own
+ * (§6.2.1), every number below is passed into the one call that compares it.
+ *
+ * Every rejection in the block is paired with an IN-CAP CONTROL: the same shape
+ * at a length the ceiling admits, which must still answer `incomplete`. They
+ * are not filler — without them a port that rejected every short read would
+ * pass all six rejection cases and be badly broken. --- */
+
+enum class HKind { Str, Blob, Arr };
+enum class HCeil { Schema, Cap };
+enum class HOut { LimitExceeded, Invalid, Incomplete };
+
+struct HeaderCase
+{
+    std::string name;
+    uint32_t req = 0;
+    uint32_t fieldId = 0;
+    long declared = -1;                        // the length/count the header claims
+    HKind kind{};
+    HCeil ceiling{};
+    long bound = 0;                            // the ceiling's number
+    std::vector<uint8_t> bytes;                // `serialized`
+    std::vector<std::vector<uint8_t>> chunks;  // `chunks`, or empty: feed whole
+    HOut want{};
+    bool terminal = false;
+};
+
+/* A base-128 varint (§4.1); false when the bytes run out or it does not end. */
+bool hdrVarint(const std::vector<uint8_t> &b, size_t &at, uint64_t &out)
+{
+    out = 0;
+    unsigned shift = 0;
+    while (at < b.size())
+    {
+        const uint8_t byte = b[at++];
+        out |= static_cast<uint64_t>(byte & 0x7f) << shift;
+        if (!(byte & 0x80)) return true;
+        shift += 7;
+        if (shift >= 64) return false;
+    }
+    return false;
+}
+
+/* What the case's own bytes say: the field id, which read the destination needs
+ * and the length/count the header claims. Read off the wire rather than taken
+ * from the JSON on purpose — `field_id` and `declared` are then CHECKED against
+ * them in loadHeaderCases(), and a case whose bytes this reader misreads fails
+ * to load instead of dispatching the wrong read. That distinction matters here:
+ * a wrong read leaves the field for the decoder to skip (§7.3), and a skipped
+ * field is never capped (§6.2.1) — so the whole block would report a green
+ * `incomplete` while testing nothing. */
+bool hdrDecode(const std::vector<uint8_t> &b, uint32_t &id, HKind &kind, uint64_t &declared)
+{
+    size_t at = 0;
+    uint64_t head = 0;
+    if (!hdrVarint(b, at, head)) return false;
+    id = static_cast<uint32_t>(head >> 3);
+    switch (head & 7)
+    {
+        case 2:                       /* fixlen: the length word carries the subtype */
+        {
+            uint64_t word = 0;
+            if (!hdrVarint(b, at, word)) return false;
+            declared = word >> 3;
+            if ((word & 7) == 2)      kind = HKind::Str;
+            else if ((word & 7) == 3) kind = HKind::Blob;
+            else return false;        /* fp32/fp64 declare no length */
+            return true;
+        }
+        case 3: case 4: case 5:       /* count-prefixed array */
+            if (!hdrVarint(b, at, declared)) return false;
+            kind = HKind::Arr;
+            return true;
+        default:
+            return false;             /* nothing else carries a header ceiling */
+    }
+}
+
+/* The `header_limits` block's own gate. `requires` means SKIP there, for EVERY
+ * tag — not the reduced-build rejection a *vector* gets, where an unsatisfied
+ * wire-construct tag turns the vector into a negative case. These cases already
+ * assert a rejection WITH A SPECIFIC CATEGORY, so a build that cannot represent
+ * the construct would reject it for an unrelated reason and appear to pass
+ * while testing nothing. For the same reason an UNKNOWN tag skips rather than
+ * being ignored the way reqMask() ignores it for a vector: a tag this reader
+ * cannot evaluate is a tag it cannot claim to satisfy. */
+uint32_t hdrReqMask(const sofab_json_t *cj)
+{
+    uint32_t mask = 0;
+    const sofab_json_t *req = sofab_json_get(cj, "requires");
+    for (size_t k = 0, nr = sofab_json_array_size(req); k < nr; k++)
+    {
+        size_t tl; const char *tn = sofab_json_string(sofab_json_array_at(req, k), &tl);
+        const uint32_t bit = tn ? capFromName(tn) : 0;
+        mask |= bit ? bit : CAP_UNKNOWN;
+    }
+    return mask;
+}
+
+bool loadHeaderCases(const sofab_json_t *root, std::vector<HeaderCase> &out, std::string &err)
+{
+    const sofab_json_t *arr = group(root, "header_limits", err);
+    if (!arr) return false;
+    size_t n = sofab_json_array_size(arr);
+    for (size_t i = 0; i < n; i++)
+    {
+        const sofab_json_t *cj = sofab_json_array_at(arr, i);
+        HeaderCase c;
+        size_t nl; const char *nm = sofab_json_string(sofab_json_get(cj, "name"), &nl);
+        c.name.assign(nm ? nm : "", nm ? nl : 0);
+        c.req = hdrReqMask(cj);
+        c.fieldId = static_cast<uint32_t>(sofab_json_u64(sofab_json_get(cj, "field_id")));
+        const sofab_json_t *dec = sofab_json_get(cj, "declared");
+        c.declared = dec ? static_cast<long>(sofab_json_i64(dec)) : -1;
+
+        size_t sl; const char *sh = sofab_json_string(sofab_json_get(cj, "serialized"), &sl);
+        if (!sh || !hex2bin(sh, sl, c.bytes)) { err = c.name + ": bad serialized hex"; return false; }
+        if (c.bytes.empty()) { err = c.name + ": empty serialized"; return false; }
+
+        const sofab_json_t *ch = sofab_json_get(cj, "chunks");
+        std::vector<uint8_t> joined;
+        for (size_t k = 0, nk = sofab_json_array_size(ch); k < nk; k++)
+        {
+            size_t hl; const char *hx = sofab_json_string(sofab_json_array_at(ch, k), &hl);
+            std::vector<uint8_t> part;
+            if (!hx || !hex2bin(hx, hl, part)) { err = c.name + ": bad chunk hex"; return false; }
+            joined.insert(joined.end(), part.begin(), part.end());
+            c.chunks.push_back(std::move(part));
+        }
+        /* The chunked cases are about WHERE the feed boundaries fall, not about
+         * different bytes: a `chunks` list that does not reassemble into
+         * `serialized` would silently test some other message. */
+        if (!c.chunks.empty() && joined != c.bytes)
+        { err = c.name + ": chunks do not reassemble into serialized"; return false; }
+
+        /* §6.2.1: "a receiver limit MUST NOT be applied to a field the schema
+         * already bounds", so a case states exactly one of the two ceilings. */
+        const sofab_json_t *lim = sofab_json_get(cj, "limits");
+        const sofab_json_t *sch = sofab_json_get(cj, "schema");
+        if (lim && sch) { err = c.name + ": states both a receiver cap and a schema bound"; return false; }
+        HKind capKind = HKind::Str;
+        bool capKindKnown = false;
+        if (lim)
+        {
+            c.ceiling = HCeil::Cap;
+            static const struct { const char *key; HKind kind; } kCaps[] = {
+                {"max_dyn_string_len",  HKind::Str },
+                {"max_dyn_blob_len",    HKind::Blob},
+                {"max_dyn_array_count", HKind::Arr },
+            };
+            for (const auto &ck : kCaps)
+                if (const sofab_json_t *v = sofab_json_get(lim, ck.key))
+                {
+                    if (capKindKnown) { err = c.name + ": more than one receiver cap"; return false; }
+                    capKindKnown = true;
+                    capKind = ck.kind;
+                    c.bound = static_cast<long>(sofab_json_i64(v));
+                }
+            if (!capKindKnown) { err = c.name + ": \"limits\" names no cap this reader knows"; return false; }
+        }
+        else if (sch)
+        {
+            c.ceiling = HCeil::Schema;
+            const sofab_json_t *ml = sofab_json_get(sch, "maxlen");
+            const sofab_json_t *ct = sofab_json_get(sch, "count");
+            if (ml && ct) { err = c.name + ": \"schema\" states both maxlen and count"; return false; }
+            if (ml)      c.bound = static_cast<long>(sofab_json_i64(ml));
+            else if (ct) c.bound = static_cast<long>(sofab_json_i64(ct));
+            else { err = c.name + ": \"schema\" names no bound this reader knows"; return false; }
+        }
+        else { err = c.name + ": states neither \"limits\" nor \"schema\""; return false; }
+        if (c.bound < 0) { err = c.name + ": the ceiling is negative"; return false; }
+
+        uint32_t wireId = 0;
+        uint64_t wireDeclared = 0;
+        HKind wireKind{};
+        if (!hdrDecode(c.bytes, wireId, wireKind, wireDeclared))
+        { err = c.name + ": serialized is not a length/count header this reader knows"; return false; }
+        if (wireId != c.fieldId)
+        { err = c.name + ": the bytes declare id " + std::to_string(wireId) +
+                ", the case says field_id " + std::to_string(c.fieldId); return false; }
+        if (c.declared >= 0 && wireDeclared != static_cast<uint64_t>(c.declared))
+        { err = c.name + ": the header claims " + std::to_string(wireDeclared) +
+                ", the case says declared " + std::to_string(c.declared); return false; }
+        if (capKindKnown && wireKind != capKind)
+        { err = c.name + ": the receiver cap names a different kind than the bytes declare"; return false; }
+        c.kind = wireKind;
+
+        const sofab_json_t *ex = sofab_json_get(cj, "expect");
+        if (!ex) { err = c.name + ": no expect"; return false; }
+        size_t ol; const char *oc = sofab_json_string(sofab_json_get(ex, "outcome"), &ol);
+        if (!oc) { err = c.name + ": no expect.outcome"; return false; }
+        const std::string outcome(oc, ol);
+        if (outcome == "limit_exceeded") c.want = HOut::LimitExceeded;
+        else if (outcome == "invalid")   c.want = HOut::Invalid;
+        else if (outcome == "incomplete") c.want = HOut::Incomplete;
+        else { err = c.name + ": unknown outcome " + outcome; return false; }
+        if (const sofab_json_t *t = sofab_json_get(ex, "terminal")) c.terminal = sofab_json_bool(t) != 0;
+        /* §5.2.1/§5.2.4 again, from the block's side: `incomplete` IS the state
+         * more bytes lift, so it is never the terminal one. */
+        if (c.terminal && c.want == HOut::Incomplete)
+        { err = c.name + ": an incomplete outcome cannot be terminal"; return false; }
+        out.push_back(std::move(c));
+    }
+    return true;
+}
+
+/* The destination for one header case: the case's own field, read under the
+ * ceiling the case configures, plus a count of every OTHER field delivered —
+ * which is what turns "a further feed re-raises rather than CONSUMING" into an
+ * assertion instead of a re-check of the same code. */
+struct HeaderMsg : sofab::IStreamMessage
+{
+    const HeaderCase *hc = nullptr;
+    int others = 0;
+    std::string text;
+    std::vector<uint8_t> blob;
+    std::vector<uint64_t> nums;
+
+    void deserialize(sofab::IStreamImpl &is, sofab::id id, size_t, size_t) noexcept override
+    {
+        if (!hc || id != hc->fieldId) { ++others; return; }
+        const bool capped = hc->ceiling == HCeil::Cap;
+        switch (hc->kind)
+        {
+            case HKind::Str:
+                if (capped) (void)sofab::readStringCapped(is, text, hc->bound);
+                else        (void)sofab::readString(is, text, hc->bound);
+                break;
+            case HKind::Blob:
+                if (capped) (void)sofab::readBlobCapped(is, blob, hc->bound);
+                else        (void)sofab::readBlob(is, blob, hc->bound);
+                break;
+            case HKind::Arr:
+                if (capped) (void)sofab::readArrayCapped(is, nums, hc->bound);
+                else        (void)sofab::readArray(is, nums, hc->bound);
+                break;
+        }
+    }
+};
+
 /* --- envelope-drift guard (corelib-cpp#100) ---------------------------------
  *
- * Both group walkers now share ONE parse, and each demands its own top-level
+ * Every group walker now shares ONE parse, and each demands its own top-level
  * key. Feed them a doctored envelope in memory and report, per group, the
  * walker's VERDICT and how many vectors it produced — kept apart on purpose: a
  * key the walker no longer recognises must be REJECTED, not silently walked as
@@ -654,8 +942,8 @@ std::vector<uint8_t> growthWire(const GrowthCase &c)
 struct EnvelopeWalk
 {
     bool parsed = false;
-    bool vectorsOk = false, negOk = false, growthOk = false;
-    size_t nVectors = 0, nNeg = 0, nGrowth = 0;
+    bool vectorsOk = false, negOk = false, growthOk = false, headerOk = false;
+    size_t nVectors = 0, nNeg = 0, nGrowth = 0, nHeader = 0;
 };
 
 EnvelopeWalk walkEnvelope(const char *json)
@@ -668,13 +956,16 @@ EnvelopeWalk walkEnvelope(const char *json)
     std::vector<Vector> vs;
     std::vector<NegVec> ns;
     std::vector<GrowthCase> gs;
+    std::vector<HeaderCase> hs;
     std::string e;
     w.vectorsOk = loadVectors(root, vs, e);
     w.negOk = loadNegVectors(root, ns, e);
     w.growthOk = loadGrowthCases(root, gs, e);
+    w.headerOk = loadHeaderCases(root, hs, e);
     w.nVectors = vs.size();
     w.nNeg = ns.size();
     w.nGrowth = gs.size();
+    w.nHeader = hs.size();
     sofab_json_free(root);
     return w;
 }
@@ -1280,6 +1571,77 @@ int main()
         "sequence-growth-ran", "ran " + std::to_string(growthRun) + " of " +
                                    std::to_string(growth.size()) + " growth cases");
 
+    /* --- header ceilings (top-level "header_limits", §6.2.1/§6.3). Each case
+     *     is a fixed byte string that DECLARES a length or count and then ends,
+     *     fed under the ceiling the case itself names. --- */
+    std::vector<HeaderCase> headers;
+    if (!loadHeaderCases(vf.root, headers, err))
+    {
+        std::printf("header_limits load failed: %s\n", err.c_str());
+        return 2;
+    }
+    int headerRun = 0, headerSkipped = 0, headerRejects = 0;
+    for (const HeaderCase &c : headers)
+    {
+        if (c.req & ~caps) { ++headerSkipped; continue; }   /* SKIP, for every tag */
+        ++headerRun;
+        const auto label = named(c.name.c_str());
+        const sofab::Error want = c.want == HOut::LimitExceeded ? sofab::Error::LimitExceeded
+                                : c.want == HOut::Invalid       ? sofab::Error::InvalidMessage
+                                                                : sofab::Error::Incomplete;
+        const char *wantName = c.want == HOut::LimitExceeded ? "limit_exceeded"
+                             : c.want == HOut::Invalid       ? "invalid"
+                                                             : "incomplete";
+
+        sofab::IStreamObject<HeaderMsg> in{kMaxSpan};
+        (*in).hc = &c;
+        /* `chunks`, where the case carries one, divides the length varint
+         * itself: the verdict is a property of the BYTES, not of where the feed
+         * boundaries fell (§7.2 item 4), so it is read off the last feed. */
+        sofab::Error code = sofab::Error::None;
+        if (c.chunks.empty())
+            code = in.feed(c.bytes.data(), c.bytes.size()).code();
+        else
+            for (const std::vector<uint8_t> &part : c.chunks)
+                code = in.feed(part.data(), part.size()).code();
+        run(code == want, label, "header-outcome",
+            std::string("expected ") + wantName + ", got code " +
+                std::to_string(static_cast<int>(code)));
+
+        if (c.want == HOut::Incomplete) continue;
+        ++headerRejects;
+        /* ARCHITECTURE §9.5: "a claimed oversize fails fast even if the payload
+         * never arrives" — the ceiling answered at the word, before the
+         * destination was sized, so nothing was materialised for it. */
+        run((*in).text.empty() && (*in).blob.empty() && (*in).nums.empty(), label,
+            "header-nothing-materialised",
+            "the rejected header still left a value in the destination");
+        if (c.terminal)
+        {
+            static const uint8_t goodTail[] = {0x48, 0x2a};   /* id 9, unsigned = 42 */
+            const int othersBefore = (*in).others;
+            const sofab::Error after = in.feed(goodTail, sizeof goodTail).code();
+            run(after == want, label, "header-terminal",
+                "the rejection did not survive the next feed: code " +
+                    std::to_string(static_cast<int>(after)));
+            /* "re-raises rather than CONSUMING": the perfectly good field behind
+             * the rejection is not delivered either (§6.3 terminal). */
+            run((*in).others == othersBefore, label, "header-terminal-consumes-nothing",
+                "a field was delivered after the terminal rejection");
+        }
+    }
+    /* Same guard as the growth block's, plus the one the block's own README
+     * insists on: every rejection is paired with an IN-CAP CONTROL that must
+     * still answer `incomplete`, so a run of nothing but rejections would mean
+     * the controls stopped loading and the block proves nothing. */
+    run(headerRun == static_cast<int>(headers.size()) && headerRun >= 10, named("(all)"),
+        "header-limits-ran", "ran " + std::to_string(headerRun) + " of " +
+                                 std::to_string(headers.size()) + " header_limits cases");
+    run(headerRejects > 0 && headerRun - headerRejects > 0, named("(all)"),
+        "header-limits-controls", "ran " + std::to_string(headerRejects) +
+            " rejection cases and " + std::to_string(headerRun - headerRejects) +
+            " in-cap controls; the block needs both");
+
     /* --- envelope guards (corelib-cpp#100) ---
      *
      * Every group above came out of ONE read and ONE parse of the vector file.
@@ -1303,24 +1665,34 @@ int main()
         static const char kGro[] = "{\"name\":\"g\",\"field_id\":0,\"element_type\":\"string\","
                                    "\"deliver\":[],\"expect\":{\"outcome\":\"complete\","
                                    "\"length\":0}}";
+        static const char kHdr[] = "{\"name\":\"h\",\"field_id\":0,\"declared\":100,"
+                                   "\"limits\":{\"max_dyn_string_len\":16},"
+                                   "\"serialized\":\"02a206\","
+                                   "\"expect\":{\"outcome\":\"limit_exceeded\",\"terminal\":true}}";
         const std::string both  = std::string("{\"vectors\":[") + kVec +
                                   "],\"invalid_utf8\":[" + kNeg +
-                                  "],\"sequence_growth\":[" + kGro + "]}";
+                                  "],\"sequence_growth\":[" + kGro +
+                                  "],\"header_limits\":[" + kHdr + "]}";
         const std::string onlyV = std::string("{\"vectors\":[") + kVec + "]}";
         const std::string onlyN = std::string("{\"invalid_utf8\":[") + kNeg + "]}";
         const std::string onlyG = std::string("{\"sequence_growth\":[") + kGro + "]}";
-        const std::string empty = "{\"vectors\":[],\"invalid_utf8\":[],\"sequence_growth\":[]}";
+        const std::string onlyH = std::string("{\"header_limits\":[") + kHdr + "]}";
+        const std::string empty = "{\"vectors\":[],\"invalid_utf8\":[],\"sequence_growth\":[],"
+                                  "\"header_limits\":[]}";
         const std::string drift = std::string("{\"vectors_v2\":[") + kVec +
                                   "],\"invalid_utf8_v2\":[" + kNeg +
-                                  "],\"sequence_growth_v2\":[" + kGro + "]}";
+                                  "],\"sequence_growth_v2\":[" + kGro +
+                                  "],\"header_limits_v2\":[" + kHdr + "]}";
 
-        const struct { const char *label; const std::string &json; bool wantV, wantN, wantG; } cases[] = {
-            {"envelope-all-groups",         both,  true,  true,  true },
-            {"envelope-no-invalid_utf8",    onlyV, true,  false, false},
-            {"envelope-no-vectors",         onlyN, false, true,  false},
-            {"envelope-only-sequence_growth", onlyG, false, false, true },
-            {"envelope-empty-groups",       empty, false, false, false},
-            {"envelope-renamed-keys",       drift, false, false, false},
+        const struct { const char *label; const std::string &json;
+                       bool wantV, wantN, wantG, wantH; } cases[] = {
+            {"envelope-all-groups",           both,  true,  true,  true,  true },
+            {"envelope-no-invalid_utf8",      onlyV, true,  false, false, false},
+            {"envelope-no-vectors",           onlyN, false, true,  false, false},
+            {"envelope-only-sequence_growth", onlyG, false, false, true,  false},
+            {"envelope-only-header_limits",   onlyH, false, false, false, true },
+            {"envelope-empty-groups",         empty, false, false, false, false},
+            {"envelope-renamed-keys",         drift, false, false, false, false},
         };
         for (const auto &c : cases)
         {
@@ -1330,7 +1702,8 @@ int main()
             const bool ok = w.parsed &&
                             w.vectorsOk == c.wantV && (w.nVectors > 0) == c.wantV &&
                             w.negOk == c.wantN && (w.nNeg > 0) == c.wantN &&
-                            w.growthOk == c.wantG && (w.nGrowth > 0) == c.wantG;
+                            w.growthOk == c.wantG && (w.nGrowth > 0) == c.wantG &&
+                            w.headerOk == c.wantH && (w.nHeader > 0) == c.wantH;
             run(ok, named("(all)"), c.label,
                 !w.parsed ? std::string("probe envelope did not parse")
                           : "vectors ok=" + std::to_string(static_cast<int>(w.vectorsOk)) +
@@ -1338,10 +1711,13 @@ int main()
                                 ", invalid_utf8 ok=" + std::to_string(static_cast<int>(w.negOk)) +
                                 " n=" + std::to_string(w.nNeg) +
                                 ", sequence_growth ok=" + std::to_string(static_cast<int>(w.growthOk)) +
-                                " n=" + std::to_string(w.nGrowth) + "; expected ok " +
+                                " n=" + std::to_string(w.nGrowth) +
+                                ", header_limits ok=" + std::to_string(static_cast<int>(w.headerOk)) +
+                                " n=" + std::to_string(w.nHeader) + "; expected ok " +
                                 std::to_string(static_cast<int>(c.wantV)) + "/" +
                                 std::to_string(static_cast<int>(c.wantN)) + "/" +
-                                std::to_string(static_cast<int>(c.wantG)));
+                                std::to_string(static_cast<int>(c.wantG)) + "/" +
+                                std::to_string(static_cast<int>(c.wantH)));
         }
     }
 
@@ -1353,6 +1729,9 @@ int main()
     std::printf("%zu invalid_utf8 vectors, %d run, %d skipped\n", negs.size(), negRun, negSkipped);
     std::printf("%zu sequence_growth cases, %d run, %d skipped (cap %ld)\n",
                 growth.size(), growthRun, growthSkipped, kGrowthCap);
+    std::printf("%zu header_limits cases, %d run (%d rejections, %d in-cap controls), "
+                "%d skipped\n", headers.size(), headerRun, headerRejects,
+                headerRun - headerRejects, headerSkipped);
     if (failures) std::printf("first failure: %s\n", first.c_str());
     if (const char *v = std::getenv("SOFAB_LIST_FAILURES"); v && *v)
         for (const auto &f : allFailures) std::printf("  FAIL %s\n", f.c_str());
