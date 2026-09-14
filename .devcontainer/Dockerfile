@@ -11,6 +11,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     pkg-config \
     ca-certificates \
     curl \
+    ripgrep \
+    fd-find \
+    shellcheck \
+    shfmt \
+    xxd \
     valgrind \
     linux-tools-generic \
     gcovr \
