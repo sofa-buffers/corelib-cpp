@@ -156,6 +156,81 @@ jobs:
         working-directory: build
         run: ctest --output-on-failure --verbose
 
+  # ---------------------------------------------------------------------- LTO
+  # The one configuration a caller reaches for that the matrix above does not
+  # represent: the header compiled into the caller's own translation units with
+  # a whole-program view. Header-only means most of the codec is already
+  # visible within one TU at -O2, so this leg is filed as coverage of a real
+  # build, not as a hunt for a known defect (#139) -- there is none here, unlike
+  # corelib-c-cpp, which has a documented strict-aliasing residual across its
+  # C/C++ boundary (corelib-c-cpp#167).
+  #
+  # Both compilers, because their type-based alias analysis differs and so does
+  # what LTO lets each conclude. The value is in *running* the suite: it asserts
+  # exact wire bytes, so a leg that only links proves nothing.
+  #
+  # Note for anyone reading a green run as evidence: UBSan does not model
+  # strict aliasing, so the sanitizer legs say nothing about this class of
+  # problem. This leg is the only place the flags are exercised.
+  lto-x86_64:
+    needs: [gate]
+    name: x86_64 LTO (${{ matrix.cc }}, Release)
+    runs-on: ubuntu-latest
+    # A hung step must fail fast and name itself: only 20 Actions jobs can run
+    # at once across this family, and a job left on the 360-minute default
+    # holds one of those slots away from every other repo.
+    timeout-minutes: 15
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - cc: gcc
+            cxx: g++
+            packages: build-essential
+          - cc: clang
+            cxx: clang++
+            packages: build-essential clang
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Install build dependencies
+        run: |
+          # Transient apt mirror failures are the single most common way a
+          # runner is lost here, so retry before giving up.
+          for i in 1 2 3; do
+            sudo apt-get update \
+              && sudo apt-get install -y --no-install-recommends \
+                   cmake ${{ matrix.packages }} \
+              && exit 0
+            echo "::warning::apt attempt $i failed, retrying in 15s"
+            sleep 15
+          done
+          echo "::error::apt failed after 3 attempts"
+          exit 1
+
+      # -O3 is what Release already gives here; it is spelled out so the leg
+      # reads as the flag set it is meant to cover. The C flags matter too:
+      # test_vectors links the vendored C JSON reader, and leaving it out of
+      # LTO would hand the optimiser a wall in the middle of the program.
+      - name: Configure with CMake (LTO, strict aliasing)
+        run: |
+          cmake -S . -B build-lto \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_C_COMPILER=${{ matrix.cc }} \
+            -DCMAKE_CXX_COMPILER=${{ matrix.cxx }} \
+            -DCMAKE_C_FLAGS="-O3 -flto -fstrict-aliasing" \
+            -DCMAKE_CXX_FLAGS="-O3 -flto -fstrict-aliasing"
+
+      - name: Build project
+        run: cmake --build build-lto --parallel "$(nproc)"
+
+      - name: Run tests
+        working-directory: build-lto
+        run: ctest --output-on-failure --verbose
+
   # ---- moved from build-gcc-ppc64-bigendian.yaml
   ppc64-be:
     needs: [gate]

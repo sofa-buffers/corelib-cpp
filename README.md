@@ -41,16 +41,27 @@ third-party dependencies, no C backend.
 ### Built with the following compilers
 
 Non-native targets run under [QEMU](https://www.qemu.org/) user-mode emulation
-in CI. Both x86_64 legs build and run the suite in `Debug` **and** `Release`
-(`-O3 -DNDEBUG`), so a defect only the optimiser exposes cannot ship green.
+in CI. The two x86_64 matrix legs build and run the suite in `Debug` **and**
+`Release` (`-O3 -DNDEBUG`), so a defect only the optimiser exposes cannot ship
+green.
 
 | Target | Compiler | Runs |
 | - | - | - |
 | x86_64 (little endian) | GCC, Debug and Release | build + test suite |
 | x86_64 (little endian) | Clang, Debug and Release | build + test suite |
+| x86_64 (little endian) | GCC and Clang, Release + LTO | build + test suite |
 | ppc64 (big endian) | GCC, cross + static | build + test suite under QEMU |
 
-The CI badge above covers all three — they are one pipeline, and GitHub
+The LTO leg builds everything with `-O3 -flto -fstrict-aliasing` and runs the
+full suite: header-only means most of the codec is already visible inside one
+translation unit at `-O2`, so this buys little *here* (measured: one bench row
+moves, the rest are unchanged) — it is there because a caller building their own
+translation units against this header with `-flto` is a normal maxspeed build,
+and the suite asserts exact wire bytes, so running it is the check. Note that
+`-fsanitize=undefined` does not model strict aliasing, so no sanitizer run
+covers this.
+
+The CI badge above covers all four — they are one pipeline, and GitHub
 publishes one badge per workflow file.
 
 ### Packaging
