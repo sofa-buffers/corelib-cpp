@@ -239,6 +239,120 @@ static void encodeVectors()
     });
 }
 
+/* --- enum elements: an array of scoped enums travels as its declared width ---
+ *
+ * The generator stores an `enum` field's array as `std::vector<E>` or
+ * `sofab::InlineVector<E, N>` with `enum class E : <declared width>`
+ * (MESSAGE_SPEC §1). The element TYPE differs from a plain integer array; the
+ * bytes must not. Every row below therefore asserts one hex string twice --
+ * once for the integer container, once for the enum container holding the same
+ * values -- and that equality is the wire-invariance check.
+ *
+ * The wire type and the zig-zag come from the UNDERLYING type, never from the
+ * enum: `std::is_signed_v` is false for *every* enumeration, so a rule keyed off
+ * E would call each of these unsigned and quietly drop the transform from every
+ * negative constant. The signed rows (Wire::ArraySigned, header 0x14) and the
+ * unsigned ones a bitfield's width would give (Wire::ArrayUnsigned, 0x13) are
+ * both here for that reason, each carrying both extremes of its width. */
+
+enum class EI8  : std::int8_t   { V0 = 0, V1 = -1, V2 = 1,             V3 = INT8_MIN,  V4 = INT8_MAX,  V5 = -64 };
+enum class EI16 : std::int16_t  { V0 = 0, V1 = -1, V2 = 300,           V3 = INT16_MIN, V4 = INT16_MAX, V5 = -9999 };
+enum class EI32 : std::int32_t  { V0 = 0, V1 = -1, V2 = 70000,         V3 = INT32_MIN, V4 = INT32_MAX, V5 = -123456 };
+enum class EI64 : std::int64_t  { V0 = 0, V1 = -1, V2 = 1099511627776, V3 = INT64_MIN, V4 = INT64_MAX, V5 = -8589934592 };
+
+enum class EU8  : std::uint8_t  { V0 = 0, V1 = 1, V2 = 127,            V3 = 128,        V4 = UINT8_MAX,  V5 = 64 };
+enum class EU16 : std::uint16_t { V0 = 0, V1 = 1, V2 = 300,            V3 = UINT16_MAX, V4 = 32768,      V5 = 255 };
+enum class EU32 : std::uint32_t { V0 = 0, V1 = 1, V2 = 70000,          V3 = UINT32_MAX, V4 = 2147483648u, V5 = 255 };
+enum class EU64 : std::uint64_t { V0 = 0, V1 = 1, V2 = 1099511627776,  V3 = UINT64_MAX, V4 = 9223372036854775808ull, V5 = 255 };
+
+/* One row of the sweep -- six values: zero, the smallest step either way, a
+ * mid-sized one, both extremes of the width, and a high-bit case. Each row is
+ * written as enums and as the plain integers behind them, and each is followed
+ * by an EMPTY array of its own element type at id 3: a zero-count integer array
+ * is [header][count=0] whatever the element type is, so the empty enum case
+ * rides along at every width. */
+template <typename E>
+static void checkEnumRow(const char *width, const char *expectHex, const std::array<E, 6> &ena)
+{
+    using U = std::underlying_type_t<E>;
+    std::array<U, 6> plain{};
+    for (std::size_t i = 0; i < plain.size(); ++i) plain[i] = static_cast<U>(ena[i]);
+
+    char name[64];
+    std::snprintf(name, sizeof name, "array_int_%s", width);
+    checkEncode(name, expectHex, [&](auto &os){
+        os.write(2, plain).write(3, std::array<U, 0>{}); });
+    std::snprintf(name, sizeof name, "array_enum_%s", width);
+    checkEncode(name, expectHex, [&](auto &os){
+        os.write(2, ena).write(3, std::array<E, 0>{}); });
+}
+
+/* The i8 row's bytes, spelled out once: 0x14 = (2 << 3) | 4 -> id 2,
+ * Wire::ArraySigned; 0x06 = the count (the LENGTH, not a schema capacity);
+ * then the zig-zag varints 0->00, -1->01, 1->02, -128->ff01, 127->fe01,
+ * -64->7f; then 0x1c = (3 << 3) | 4 with count 0 for the empty array. */
+static constexpr const char *kEnumI8Hex = "1406000102ff01fe017f1c00";
+
+struct EnumArrMsg : sofab::IStreamMessage
+{
+    std::array<std::int8_t, 6> g{};
+    size_t count = 999;
+    void deserialize(sofab::IStreamImpl &is, sofab::id id, size_t, size_t n) noexcept override
+    {
+        if (id == 2) { count = n; sofab::read(is, g); }
+    }
+};
+
+static void enumArrayElements()
+{
+    checkEnumRow<EI8>("i8", kEnumI8Hex,
+        {EI8::V0, EI8::V1, EI8::V2, EI8::V3, EI8::V4, EI8::V5});
+    checkEnumRow<EI16>("i16", "14060001d804ffff03feff039d9c011c00",
+        {EI16::V0, EI16::V1, EI16::V2, EI16::V3, EI16::V4, EI16::V5});
+    checkEnumRow<EI32>("i32", "14060001e0c508ffffffff0ffeffffff0fff880f1c00",
+        {EI32::V0, EI32::V1, EI32::V2, EI32::V3, EI32::V4, EI32::V5});
+    checkEnumRow<EI64>("i64", "14060001808080808040ffffffffffffffffff01feffffffffffffffff01ffffffff3f1c00",
+        {EI64::V0, EI64::V1, EI64::V2, EI64::V3, EI64::V4, EI64::V5});
+
+    checkEnumRow<EU8>("u8", "130600017f8001ff01401b00",
+        {EU8::V0, EU8::V1, EU8::V2, EU8::V3, EU8::V4, EU8::V5});
+    checkEnumRow<EU16>("u16", "13060001ac02ffff03808002ff011b00",
+        {EU16::V0, EU16::V1, EU16::V2, EU16::V3, EU16::V4, EU16::V5});
+    checkEnumRow<EU32>("u32", "13060001f0a204ffffffff0f8080808008ff011b00",
+        {EU32::V0, EU32::V1, EU32::V2, EU32::V3, EU32::V4, EU32::V5});
+    checkEnumRow<EU64>("u64", "13060001808080808020ffffffffffffffffff0180808080808080808001ff011b00",
+        {EU64::V0, EU64::V1, EU64::V2, EU64::V3, EU64::V4, EU64::V5});
+
+    /* The other two container shapes a generated member can have: the dynamic
+     * one and the inline one. Same bytes again -- `write` takes whatever it can
+     * build a span over, and the element type is the only thing that changed. */
+    checkEncode("array_enum_vector", kEnumI8Hex, [](auto &os){
+        std::vector<EI8> v{EI8::V0, EI8::V1, EI8::V2, EI8::V3, EI8::V4, EI8::V5};
+        os.write(2, v).write(3, std::vector<EI8>{}); });
+    checkEncode("array_enum_inline_vector", kEnumI8Hex, [](auto &os){
+        sofab::InlineVector<EI8, 8> v{EI8::V0, EI8::V1, EI8::V2, EI8::V3, EI8::V4, EI8::V5};
+        os.write(2, v).write(3, sofab::InlineVector<EI8, 8>{}); });
+
+    /* A negative constant has to come back as itself, which is what pins the
+     * zig-zag to the signed path: a wrong signedness rule produces bytes that
+     * still parse, just as different numbers. The decode side reads the plain
+     * width (generated code binds an enum destination through
+     * `sofabgen::RawArray`), so the comparison is against the underlying
+     * values. */
+    sofab::OStreamInline<64> os;
+    std::array<EI8, 6> ena{EI8::V0, EI8::V1, EI8::V2, EI8::V3, EI8::V4, EI8::V5};
+    os.write(2, ena);
+
+    sofab::IStreamObject<EnumArrMsg> in{kMaxSpan};
+    CHECK(in.feed(os.data(), os.bytesUsed()).code() == sofab::Error::None,
+          "enum array decodes to COMPLETE");
+    CHECK((*in).count == 6, "enum array delivers its length");
+    bool same = true;
+    for (std::size_t i = 0; i < ena.size(); ++i)
+        if ((*in).g[i] != static_cast<std::int8_t>(ena[i])) same = false;
+    CHECK(same, "every enum element round-trips, negatives included");
+}
+
 /* --- decode / round-trip --- */
 
 struct ScalarMsg : sofab::IStreamMessage
@@ -8340,6 +8454,7 @@ static void decoderReuseAcrossTypes()
 int main()
 {
     encodeVectors();
+    enumArrayElements();
     roundtripScalars();
     roundtripArrays();
     roundtripNested();

@@ -431,6 +431,30 @@ namespace sofab
         }
 
         /**
+         * @brief The integer type an element travels as on the wire.
+         *
+         * Identity for an integer; the underlying type for an enumeration, whose
+         * declared width is what picks the signed or unsigned wire type and the
+         * zig-zag transform (MESSAGE_SPEC §1). `std::is_signed_v` is false for
+         * *every* enumeration, so asking the enum itself would silently answer
+         * "unsigned".
+         *
+         * The specialization is what makes it lazy: `std::conditional_t` would
+         * instantiate `std::underlying_type_t<E>` for a plain integer too, and
+         * that has no `type` — every existing integer array would stop compiling.
+         *
+         * @tparam E Element type as the caller declared it.
+         */
+        template <typename E, bool = std::is_enum_v<E>>
+        struct WireInt { using type = E; };
+        /** @brief Enumeration case of @ref WireInt: the declared underlying type. */
+        template <typename E>
+        struct WireInt<E, true> { using type = std::underlying_type_t<E>; };
+        /** @brief Alias for @ref WireInt. */
+        template <typename E>
+        using WireInt_t = typename WireInt<E>::type;
+
+        /**
          * @brief Reinterpret a float/double as the unsigned integer holding its bits.
          * @tparam F Floating-point type (`float` or `double`).
          * @param v Value whose object representation is extracted.
@@ -1792,20 +1816,23 @@ namespace sofab
         /**
          * @brief Write an array of integers as a count-prefixed run of varints.
          *
-         * The wire type is chosen from the element's signedness; signed elements
-         * are zig-zag encoded.
+         * The wire type is chosen from the signedness of the type the elements
+         * travel as (@ref detail::WireInt); signed elements are zig-zag encoded.
          *
-         * @tparam E Integral element type.
+         * @tparam E Integral or enumeration element type. An enumeration encodes
+         *         at its declared underlying width, converted per element.
          * @param fieldId Field identifier; must not exceed @ref ID_MAX.
          * @param elems Elements to encode, in order; at most @ref ARRAY_MAX of them.
          * @return @ref Error::InvalidArgument if @p fieldId is too large or
          *         @p elems holds more than @ref ARRAY_MAX elements,
          *         @ref Error::BufferFull on overflow, otherwise @ref Error::None.
          */
-        template <std::integral E>
+        template <typename E>
+            requires (std::integral<E> || std::is_enum_v<E>)
         [[nodiscard]] Error writeIntArray(sofab::id fieldId, std::span<const E> elems) noexcept
         {
-            constexpr bool isSigned = std::is_signed_v<E>;
+            using U = detail::WireInt_t<E>;
+            constexpr bool isSigned = std::is_signed_v<U>;
             if (fieldId > ID_MAX) [[unlikely]] return latch(Error::InvalidArgument);
             /* §6.2/§4.7: the element count is bounded by @ref ARRAY_MAX, the same
              * format-wide ceiling the decoder enforces on the count word — see
@@ -1837,8 +1864,12 @@ namespace sofab
              * Only the buffer tail, and every flush boundary, takes the checked
              * path — which is still pushBytes, so flushing behaviour is unchanged. */
             const auto word = [](E v) noexcept -> uint64_t {
-                if constexpr (isSigned) return detail::zigzagEncode(static_cast<int64_t>(v));
-                else                    return static_cast<uint64_t>(v);
+                /* An enum element converts here, one at a time, as it is encoded:
+                 * the span still points at the caller's array of E and is never
+                 * reinterpreted, so there is no aliasing question and no copy. */
+                const auto u = static_cast<U>(v);
+                if constexpr (isSigned) return detail::zigzagEncode(static_cast<int64_t>(u));
+                else                    return static_cast<uint64_t>(u);
             };
             const size_t n = elems.size();
             for (size_t i = 0; i < n; )
@@ -2104,8 +2135,11 @@ namespace sofab
          *
          * Handles integers (signed values are zig-zag encoded), `bool`, `float`,
          * `double`, anything convertible to `std::string_view`, contiguous ranges
-         * of integers or floats (encoded as arrays), and nested @ref sofab::OStreamMessage
-         * objects (encoded as a sub-message). Unsupported types fail to compile.
+         * of integers, enumerations or floats (encoded as arrays), and nested
+         * @ref sofab::OStreamMessage objects (encoded as a sub-message). An
+         * enumeration element travels as its declared underlying type, so a
+         * container of scoped enums needs no converted copy. Unsupported types
+         * fail to compile.
          *
          * @tparam T Deduced value type.
          * @param fieldId Field identifier; must not exceed @ref ID_MAX.
@@ -2160,7 +2194,10 @@ namespace sofab
             {
                 using Elem = typename T::value_type;
                 std::span<const Elem> sp{value};
-                if constexpr (std::is_integral_v<Elem> && !std::is_same_v<Elem, bool>)
+                /* An enumeration rides the integer path at its declared width, so a
+                 * caller holding `std::vector<Gear>` needs no converted copy. */
+                if constexpr ((std::is_integral_v<Elem> || std::is_enum_v<Elem>) &&
+                              !std::is_same_v<Elem, bool>)
                     err = writeIntArray(fieldId, sp);
                 else if constexpr (std::is_same_v<Elem, float> || std::is_same_v<Elem, double>)
                     err = writeFloatArray(fieldId, sp);
