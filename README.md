@@ -116,6 +116,12 @@ the wire, trailing default-valued ones included. A schema `count: N` is a
 capacity while the wire count `M` is the array's *length*, so `{1, 2, 3, 0, 0}`
 encodes as `M = 5` (MESSAGE_SPEC §3).
 
+An `enum` array is handed over as it is stored: `write()` takes a container of
+scoped enums — `std::vector<Gear>` with `enum class Gear : std::int8_t` — and
+encodes each element at the enum's declared underlying width, which is also what
+picks the signed or unsigned array wire type. No converted copy, and the same
+bytes as the equivalent integer array.
+
 ### Serialize stream
 
 For a message larger than the buffer, give the stream a flush callback: the
