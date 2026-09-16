@@ -2,8 +2,13 @@ FROM ubuntu:26.04
 
 ENV DEBIAN_FRONTEND=noninteractive
 
+# clang next to gcc: CI builds and runs the suite under both (the LTO leg
+# especially -- their type-based alias analysis differs, and so does what LTO
+# lets each conclude), so a devcontainer with only g++ cannot reproduce half
+# the matrix.
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
+    clang \
     cmake \
     ninja-build \
     gdb \
