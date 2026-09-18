@@ -603,6 +603,17 @@ namespace sofab
         }
 
         /**
+         * @brief The "size nothing" sizer: what a typed read does with the
+         *        caller's destination between its checks and its delivery when the
+         *        caller did not ask for sizing (the destination is used as handed).
+         */
+        struct NoSizer
+        {
+            template <typename D>
+            [[gnu::always_inline]] constexpr void operator()(D &, size_t) const noexcept {}
+        };
+
+        /**
          * @brief The element ceiling a decode destination @p T publishes, or `-1`
          *        when it publishes none.
          *
@@ -624,17 +635,6 @@ namespace sofab
          * low-level contract, where the leading elements land in the destination
          * and the rest is parsed only to stay framed.
          */
-        /**
-         * @brief The "size nothing" sizer: what a typed read does with the
-         *        caller's destination between its checks and its delivery when the
-         *        caller did not ask for sizing (the destination is used as handed).
-         */
-        struct NoSizer
-        {
-            template <typename D>
-            [[gnu::always_inline]] constexpr void operator()(D &, size_t) const noexcept {}
-        };
-
         template <typename T>
         constexpr long destCapacity() noexcept
         {
@@ -3582,17 +3582,6 @@ namespace sofab
             return true;
         }
 
-        /**
-         * @brief Would buffering this field cross @ref maxBufferedField_?
-         *
-         * @param consumed Bytes of the current top-level field already spanned.
-         * @param need Further bytes the field is now known to require (a declared
-         *        payload length, array byte-span, or per-element lower bound).
-         * @return `true` if `consumed + need` exceeds the cap. Overflow-safe: the
-         *         addition is never formed, so a caller that stated `SIZE_MAX` as
-         *         its budget gets a check that runs and never fires, rather than a
-         *         check this library switched off.
-         */
         /** @brief Upper bound of any header-declared `need` (§6.2 ceilings). */
         static constexpr uint64_t CAP_NEED_MAX =
             static_cast<uint64_t>(ARRAY_MAX) * static_cast<uint64_t>(FIXLEN_MAX);
@@ -3609,6 +3598,17 @@ namespace sofab
             return cap - reach >= CAP_NEED_MAX;
         }
 
+        /**
+         * @brief Would buffering this field cross @ref maxBufferedField_?
+         *
+         * @param consumed Bytes of the current top-level field already spanned.
+         * @param need Further bytes the field is now known to require (a declared
+         *        payload length, array byte-span, or per-element lower bound).
+         * @return `true` if `consumed + need` exceeds the cap. Overflow-safe: the
+         *         addition is never formed, so a caller that stated `SIZE_MAX` as
+         *         its budget gets a check that runs and never fires, rather than a
+         *         check this library switched off.
+         */
         [[nodiscard]] bool exceedsBuffer(size_t consumed, uint64_t need) const noexcept
         {
             if (consumed > maxBufferedField_) return true;
