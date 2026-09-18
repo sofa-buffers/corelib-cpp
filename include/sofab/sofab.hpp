@@ -624,6 +624,17 @@ namespace sofab
          * low-level contract, where the leading elements land in the destination
          * and the rest is parsed only to stay framed.
          */
+        /**
+         * @brief The "size nothing" sizer: what a typed read does with the
+         *        caller's destination between its checks and its delivery when the
+         *        caller did not ask for sizing (the destination is used as handed).
+         */
+        struct NoSizer
+        {
+            template <typename D>
+            [[gnu::always_inline]] constexpr void operator()(D &, size_t) const noexcept {}
+        };
+
         template <typename T>
         constexpr long destCapacity() noexcept
         {
@@ -5397,11 +5408,11 @@ namespace sofab
          * @return `true` when the value was read; `false` when the field was left
          *         for the decoder to skip.
          */
-        template <typename S>
-        bool readString(S &value, long bound) noexcept
+        template <typename S, typename Sizer = detail::NoSizer>
+        bool readString(S &value, long bound, Sizer sizer = {}) noexcept
         {
             if (bound < 0) { rejectUnbounded(); return false; }
-            return readStringGated(value, bound, -1);
+            return readStringGated(value, bound, -1, sizer);
         }
 
         /**
@@ -5425,11 +5436,11 @@ namespace sofab
          * @return `true` when the value was read; `false` when the field was left
          *         for the decoder to skip.
          */
-        template <typename S>
-        bool readStringCapped(S &value, long dynCap) noexcept
+        template <typename S, typename Sizer = detail::NoSizer>
+        bool readStringCapped(S &value, long dynCap, Sizer sizer = {}) noexcept
         {
             if (dynCap < 0) { rejectUnbounded(); return false; }
-            return readStringGated(value, -1, dynCap);
+            return readStringGated(value, -1, dynCap, sizer);
         }
 
     protected:
@@ -5442,8 +5453,8 @@ namespace sofab
          * why this is not public: a `(-1, -1)` call is the fail-open shape §6.2.1
          * forbids, and there is deliberately no way to spell it.
          */
-        template <typename S>
-        bool readStringGated(S &value, long bound, long dynCap) noexcept
+        template <typename S, typename Sizer>
+        bool readStringGated(S &value, long bound, long dynCap, Sizer sizer) noexcept
         {
             if (!tagMatches(Wire::Fixlen, Fix::String)) return false;      /* §7.3 */
             if (bound >= 0 && fixLen_ > static_cast<size_t>(bound))        /* §7.1/§5.2 */
@@ -5458,6 +5469,10 @@ namespace sofab
              * grown to fit it. Which of the two a destination is — static room or
              * room the caller sized — is a fact @ref detail::destRoom reads off
              * the type, not a policy this read picks. */
+            /* The caller's sizer (the free read's fitDest) runs here — after
+             * §7.3 and the bound, before the room test — so those checks are
+             * made once, not once in front of this read and again inside it. */
+            sizer(value, std::min(fixLen_, pendDone_ + static_cast<size_t>(end_ - p_)));
             return readPayload(value, /*validateUtf8*/ true);
         }
 
@@ -5485,11 +5500,11 @@ namespace sofab
          * @return `true` when the value was read; `false` when the field was left
          *         for the decoder to skip.
          */
-        template <typename B>
-        bool readBlob(B &value, long bound) noexcept
+        template <typename B, typename Sizer = detail::NoSizer>
+        bool readBlob(B &value, long bound, Sizer sizer = {}) noexcept
         {
             if (bound < 0) { rejectUnbounded(); return false; }
-            return readBlobGated(value, bound, -1);
+            return readBlobGated(value, bound, -1, sizer);
         }
 
         /**
@@ -5507,17 +5522,17 @@ namespace sofab
          * @return `true` when the value was read; `false` when the field was left
          *         for the decoder to skip.
          */
-        template <typename B>
-        bool readBlobCapped(B &value, long dynCap) noexcept
+        template <typename B, typename Sizer = detail::NoSizer>
+        bool readBlobCapped(B &value, long dynCap, Sizer sizer = {}) noexcept
         {
             if (dynCap < 0) { rejectUnbounded(); return false; }
-            return readBlobGated(value, -1, dynCap);
+            return readBlobGated(value, -1, dynCap, sizer);
         }
 
     protected:
         /** @brief The body both `blob` reads share. @copydetails readStringGated */
-        template <typename B>
-        bool readBlobGated(B &value, long bound, long dynCap) noexcept
+        template <typename B, typename Sizer>
+        bool readBlobGated(B &value, long bound, long dynCap, Sizer sizer) noexcept
         {
             if (!tagMatches(Wire::Fixlen, Fix::Blob)) return false;
             if (bound >= 0 && fixLen_ > static_cast<size_t>(bound)) /* §7.1 */
@@ -5532,6 +5547,10 @@ namespace sofab
             }
             /* §6.6.3, as in readString — one delivery path, refuse rather than
              * grow. A `blob` is never UTF-8 validated (§6.4). */
+            /* The caller's sizer (the free read's fitDest) runs here — after
+             * §7.3 and the bound, before the room test — so those checks are
+             * made once, not once in front of this read and again inside it. */
+            sizer(value, std::min(fixLen_, pendDone_ + static_cast<size_t>(end_ - p_)));
             return readPayload(value, /*validateUtf8*/ false);
         }
 
@@ -5586,11 +5605,11 @@ namespace sofab
          * @return `true` when the array was read; `false` when it was skipped (§7.3)
          *         or rejected, with the outcome already recorded on the stream.
          */
-        template <typename T>
-        bool readArray(T &dst, long schemaCount, ElemBound elem = {}) noexcept
+        template <typename T, typename Sizer = detail::NoSizer>
+        bool readArray(T &dst, long schemaCount, ElemBound elem = {}, Sizer sizer = {}) noexcept
         {
             if (schemaCount < 0) { rejectUnbounded(); return false; }
-            return readArrayGated(dst, schemaCount, -1, elem);
+            return readArrayGated(dst, schemaCount, -1, elem, sizer);
         }
 
         /**
@@ -5608,17 +5627,17 @@ namespace sofab
          * @param elem        Declared element range (@ref ElemBound).
          * @return `true` when the array was read.
          */
-        template <typename T>
-        bool readArrayCapped(T &dst, long dynCap, ElemBound elem = {}) noexcept
+        template <typename T, typename Sizer = detail::NoSizer>
+        bool readArrayCapped(T &dst, long dynCap, ElemBound elem = {}, Sizer sizer = {}) noexcept
         {
             if (dynCap < 0) { rejectUnbounded(); return false; }
-            return readArrayGated(dst, -1, dynCap, elem);
+            return readArrayGated(dst, -1, dynCap, elem, sizer);
         }
 
     protected:
         /** @brief The body both array reads share. @copydetails readStringGated */
-        template <typename T>
-        bool readArrayGated(T &dst, long schemaCount, long dynCap, ElemBound elem) noexcept
+        template <typename T, typename Sizer>
+        bool readArrayGated(T &dst, long schemaCount, long dynCap, ElemBound elem, Sizer sizer) noexcept
         {
             using Elem = typename T::value_type;
             if constexpr (std::is_same_v<Elem, float> || std::is_same_v<Elem, double>)
@@ -5703,6 +5722,7 @@ namespace sofab
                 const size_t reach = static_cast<size_t>(
                     std::min<uint64_t>(static_cast<uint64_t>(count_),
                                        static_cast<uint64_t>(pendDone_) + fillable));
+                sizer(dst, reach); /* the caller's fitDest, after the checks above */
                 if (reach > dst.size())
                 {
                     rejectDestination();
@@ -6197,6 +6217,18 @@ namespace sofab
         }
 
         /**
+         * @brief @ref fitDest as the sizer a typed read runs between its checks
+         *        and its delivery, so the free reads below state the §7.3 tag,
+         *        the bound and the reach once — inside the read — instead of
+         *        re-deriving them in front of it.
+         */
+        struct FitDest
+        {
+            template <typename D>
+            [[gnu::always_inline]] void operator()(D &dst, size_t want) const noexcept { fitDest(dst, want); }
+        };
+
+        /**
          * @brief Elements of the announced array the bytes in hand could still
          *        carry, clamped to the count itself.
          *
@@ -6271,13 +6303,8 @@ namespace sofab
     template <typename S>
     bool readString(IStreamImpl &is, S &dst, long maxlen) noexcept
     {
-        if constexpr (detail::sizable<S>)
-        if (maxlen >= 0 &&
-            is.wire() == detail::Wire::Fixlen && is.fixType() == detail::Fix::String &&
-            is.announcedSize() <= static_cast<size_t>(maxlen))
-            detail::fitDest(dst, std::min(is.announcedSize(),
-                                          is.progress() + is.available()));
-        return is.readString(dst, maxlen);
+        if constexpr (detail::sizable<S>) return is.readString(dst, maxlen, detail::FitDest{});
+        else return is.readString(dst, maxlen);
     }
 
     /**
@@ -6291,13 +6318,8 @@ namespace sofab
     template <typename S>
     bool readStringCapped(IStreamImpl &is, S &dst, long dynCap) noexcept
     {
-        if constexpr (detail::sizable<S>)
-        if (dynCap >= 0 &&
-            is.wire() == detail::Wire::Fixlen && is.fixType() == detail::Fix::String &&
-            is.announcedSize() <= static_cast<size_t>(dynCap))
-            detail::fitDest(dst, std::min(is.announcedSize(),
-                                          is.progress() + is.available()));
-        return is.readStringCapped(dst, dynCap);
+        if constexpr (detail::sizable<S>) return is.readStringCapped(dst, dynCap, detail::FitDest{});
+        else return is.readStringCapped(dst, dynCap);
     }
 
     /**
@@ -6307,13 +6329,8 @@ namespace sofab
     template <typename B>
     bool readBlob(IStreamImpl &is, B &dst, long maxlen) noexcept
     {
-        if constexpr (detail::sizable<B>)
-        if (maxlen >= 0 &&
-            is.wire() == detail::Wire::Fixlen && is.fixType() == detail::Fix::Blob &&
-            is.announcedSize() <= static_cast<size_t>(maxlen))
-            detail::fitDest(dst, std::min(is.announcedSize(),
-                                          is.progress() + is.available()));
-        return is.readBlob(dst, maxlen);
+        if constexpr (detail::sizable<B>) return is.readBlob(dst, maxlen, detail::FitDest{});
+        else return is.readBlob(dst, maxlen);
     }
 
     /**
@@ -6323,13 +6340,8 @@ namespace sofab
     template <typename B>
     bool readBlobCapped(IStreamImpl &is, B &dst, long dynCap) noexcept
     {
-        if constexpr (detail::sizable<B>)
-        if (dynCap >= 0 &&
-            is.wire() == detail::Wire::Fixlen && is.fixType() == detail::Fix::Blob &&
-            is.announcedSize() <= static_cast<size_t>(dynCap))
-            detail::fitDest(dst, std::min(is.announcedSize(),
-                                          is.progress() + is.available()));
-        return is.readBlobCapped(dst, dynCap);
+        if constexpr (detail::sizable<B>) return is.readBlobCapped(dst, dynCap, detail::FitDest{});
+        else return is.readBlobCapped(dst, dynCap);
     }
 
     /**
@@ -6354,15 +6366,8 @@ namespace sofab
     template <typename T>
     bool readArray(IStreamImpl &is, T &dst, long schemaCount, ElemBound elem = {}) noexcept
     {
-        using Elem = typename T::value_type;
-        if constexpr (detail::sizable<T>)
-        {
-            const size_t n = is.announcedCount();
-            if (schemaCount >= 0 && detail::arrayTagMatches<Elem>(is) &&
-                n <= static_cast<size_t>(schemaCount))
-                detail::fitDest(dst, detail::arrayReach(is));
-        }
-        return is.readArray(dst, schemaCount, elem);
+        if constexpr (detail::sizable<T>) return is.readArray(dst, schemaCount, elem, detail::FitDest{});
+        else return is.readArray(dst, schemaCount, elem);
     }
 
     /**
@@ -6377,15 +6382,8 @@ namespace sofab
     template <typename T>
     bool readArrayCapped(IStreamImpl &is, T &dst, long dynCap, ElemBound elem = {}) noexcept
     {
-        using Elem = typename T::value_type;
-        if constexpr (detail::sizable<T>)
-        {
-            const size_t n = is.announcedCount();
-            if (dynCap >= 0 && detail::arrayTagMatches<Elem>(is) &&
-                n <= static_cast<size_t>(dynCap))
-                detail::fitDest(dst, detail::arrayReach(is));
-        }
-        return is.readArrayCapped(dst, dynCap, elem);
+        if constexpr (detail::sizable<T>) return is.readArrayCapped(dst, dynCap, elem, detail::FitDest{});
+        else return is.readArrayCapped(dst, dynCap, elem);
     }
 
     /**
