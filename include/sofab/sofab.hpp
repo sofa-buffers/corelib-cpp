@@ -3013,6 +3013,20 @@ namespace sofab
          */
         bool spanSkip_ = false;
         /**
+         * @brief Can the field-span cap provably not fire anywhere in the window
+         *        being parsed (§6.2.1, #26)? Set once per @ref parseWindow.
+         *
+         * Every span the cap measures in one window is at most @ref spanCarry_ plus
+         * the window's length, and every header-declared `need` is at most
+         * @ref CAP_NEED_MAX (the §6.2 ceilings: ARRAY_MAX elements of at most
+         * FIXLEN_MAX bytes). When the stated budget covers both, @ref exceedsBuffer
+         * would answer `false` for every field of the window, so asking it per
+         * field is work with a known answer. This is not an unlimited mode: the
+         * receiver's number is still the only input, and a budget that could be
+         * reached keeps the per-field check exactly as before.
+         */
+        bool capInert_ = false;
+        /**
          * @brief Bytes of the current top-level field spent on SKIPPED subtrees
          *        (§6.2.1, #129 one level down).
          *
@@ -3568,6 +3582,22 @@ namespace sofab
          *         its budget gets a check that runs and never fires, rather than a
          *         check this library switched off.
          */
+        /** @brief Upper bound of any header-declared `need` (§6.2 ceilings). */
+        static constexpr uint64_t CAP_NEED_MAX =
+            static_cast<uint64_t>(ARRAY_MAX) * static_cast<uint64_t>(FIXLEN_MAX);
+
+        /**
+         * @brief Hoisted form of @ref exceedsBuffer for a whole window of @p n
+         *        bytes: `true` when no field of it can cross the budget.
+         */
+        [[nodiscard]] bool capCannotFire(size_t n) const noexcept
+        {
+            const uint64_t cap = static_cast<uint64_t>(maxBufferedField_);
+            const uint64_t reach = static_cast<uint64_t>(spanCarry_) + static_cast<uint64_t>(n);
+            if (reach < static_cast<uint64_t>(n) || reach > cap) return false;
+            return cap - reach >= CAP_NEED_MAX;
+        }
+
         [[nodiscard]] bool exceedsBuffer(size_t consumed, uint64_t need) const noexcept
         {
             if (consumed > maxBufferedField_) return true;
@@ -3716,7 +3746,7 @@ namespace sofab
              * sequence nobody asked for is the case the rule most obviously
              * protects — a peer adding a nested message at an id this schema does
              * not declare (#129). */
-            if (spanBase_ && !spanSkip_ && exceedsBuffer(spannedLive(), 0))
+            if (!capInert_ && spanBase_ && !spanSkip_ && exceedsBuffer(spannedLive(), 0))
             { exceedLimit(); return Field::Stop; }
             const uint8_t *const fieldStart = p_;
             if (!parseFieldTag())
@@ -4523,6 +4553,7 @@ namespace sofab
             incomplete_ = false;
             replay_ = suspendDepth_ >= 0;
             spanBase_ = p_;
+            capInert_ = capCannotFire(n);
             parseTopLevel();
             if (incomplete_) spanCarry_ += static_cast<size_t>(p_ - spanBase_);
             replay_ = false;
@@ -4574,7 +4605,7 @@ namespace sofab
                 fieldId = fieldId_;
                 pendDone_ = 0;
                 utf8State_ = 0;
-                if (exceedsBufferAtHeader())
+                if (!capInert_ && exceedsBufferAtHeader()) [[unlikely]]
                 {
                     /* §6.2.1/§6.3: a receiver-side cap "MUST NOT be applied to a
                      * field the schema already bounds" — there the schema governs
