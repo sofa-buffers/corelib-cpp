@@ -50,6 +50,7 @@ static constexpr long kAnyCount = static_cast<long>(sofab::ARRAY_MAX);
 #include <new>
 #include <span>
 #include <string>
+#include <tuple>
 #include <type_traits>
 #include <utility>
 #include <vector>
@@ -351,6 +352,181 @@ static void enumArrayElements()
     for (std::size_t i = 0; i < ena.size(); ++i)
         if ((*in).g[i] != static_cast<std::int8_t>(ena[i])) same = false;
     CHECK(same, "every enum element round-trips, negatives included");
+}
+
+/* --- bool elements: a container of booleans is an unsigned varint array ------
+ *
+ * CORELIB_PLAN §4.4 is canonical on encode and tolerant on decode: `true` is
+ * written as `1`, and every element other than `0` reads as `true` -- normalized
+ * on store, and bounded by NO width, so `256` and `2^64-1` are `true`, never
+ * INVALID. MESSAGE_SPEC §1 applies that rule to each element of an
+ * `array of boolean`, which travels as Wire::ArrayUnsigned (corelib-cpp#143).
+ *
+ * The encoder never writes a non-canonical boolean, so a round trip alone cannot
+ * reach the tolerant half: the decode cases below are wire bytes a foreign
+ * encoder could send. Each is fed whole and then one byte at a time, which runs
+ * the element resume (§6.6.2) on every boundary. --- */
+
+struct BoolArrMsg : sofab::IStreamMessage
+{
+    std::array<bool, 5> a{};                               /* id 204 -- read() */
+    sofab::InlineVector<bool, 5> iv;                       /* id 1   -- readArray, u8 ElemBound */
+    std::array<std::uint8_t, 5> raw{0xAA, 0xAA, 0xAA, 0xAA, 0xAA}; /* id 2 -- byte-backed view */
+    std::vector<std::array<bool, 2>> rows;                 /* id 3   -- nested rows */
+    void deserialize(sofab::IStreamImpl &is, sofab::id id, size_t, size_t) noexcept override
+    {
+        switch (id)
+        {
+            case 204: sofab::read(is, a); break;
+            /* The bound a `u8` element would carry. §4.4 gives a boolean none, so
+             * it must be ignored rather than make `256` INVALID. */
+            case 1: sofab::readArray(is, iv, 5, sofab::ElemBound::of<std::uint8_t>()); break;
+            /* How generated code binds a byte-backed member: the same `bool`
+             * element view it uses for an enum member's backing integer. */
+            case 2: { std::span<bool> v{reinterpret_cast<bool *>(raw.data()), raw.size()};
+                      is.read(v); break; }
+            case 3: { sofab::MessageSeq<std::vector<std::array<bool, 2>>> c;
+                      c.out = &rows; c.cap = 4; sofab::read(is, c); break; }
+        }
+    }
+};
+
+/* The bytes each element slot holds. Comparing `bool` lvalues cannot tell a
+ * stored `1` from a stored `2`; the object representation can. */
+template <std::size_t N>
+static std::array<std::uint8_t, N> boolBytes(const std::array<bool, N> &a)
+{
+    std::array<std::uint8_t, N> b{};
+    std::memcpy(b.data(), a.data(), N);
+    return b;
+}
+
+static void booleanArrays()
+{
+    auto decode = [](const char *hex, bool bytewise) {
+        sofab::IStreamObject<BoolArrMsg> in{kMaxSpan};
+        auto w = fromHex(hex);
+        /* Bytewise, the verdict is the last feed's: every earlier one is a
+         * cut the resume has to carry. */
+        if (bytewise)
+            for (size_t i = 0; i + 1 < w.size(); ++i) (void)in.feed(w.data() + i, 1);
+        auto r = bytewise ? in.feed(w.data() + w.size() - 1, 1) : in.feed(w.data(), w.size());
+        return std::tuple<sofab::IStreamImpl::Result, BoolArrMsg, size_t>{r, *in, in.skipped()};
+    };
+    using B5 = std::array<std::uint8_t, 5>;
+
+    for (bool bytewise : {false, true})
+    {
+        static char buf[160];
+        auto say = [&](const char *what) {
+            std::snprintf(buf, sizeof buf, "bool array [%s]: %s", bytewise ? "bytewise" : "whole", what);
+            return buf;
+        };
+
+        /* The issue's vector: id 204, count 5, `02 01 00 01 01`. The `02` is
+         * `true` and is stored as `1`, not kept. */
+        {
+            auto [r, m, sk] = decode("e30c 05 0201000101", bytewise);
+            CHECK(r.complete(), say("a canonical-and-not array decodes COMPLETE"));
+            CHECK(boolBytes(m.a) == (B5{1, 1, 0, 1, 1}), say("every non-zero element is stored as 1"));
+        }
+        /* One element, `256`: wider than a byte, still `true`, not INVALID. */
+        {
+            auto [r, m, sk] = decode("e30c 01 8002", bytewise);
+            CHECK(r.complete() && !r.invalid(), say("an element of 256 is not INVALID"));
+            CHECK(boolBytes(m.a) == (B5{1, 0, 0, 0, 0}), say("an element of 256 is true"));
+        }
+        /* One element, `2^64-1`: the widest value the accumulator holds. */
+        {
+            auto [r, m, sk] = decode("e30c 01 ffffffffffffffffff01", bytewise);
+            CHECK(r.complete(), say("an element of 2^64-1 is not INVALID"));
+            CHECK(boolBytes(m.a) == (B5{1, 0, 0, 0, 0}), say("an element of 2^64-1 is true"));
+        }
+        /* ...but a varint past 64 bits is still §4.1's INVALID: tolerance covers
+         * the value, not a malformed encoding of it. */
+        {
+            auto [r, m, sk] = decode("e30c 01 ffffffffffffffffff02", bytewise);
+            CHECK(r.invalid(), say("a >64-bit element varint is still INVALID"));
+        }
+        /* The surplus past the destination is parsed to stay framed, and is
+         * bounded by nothing either. */
+        {
+            auto [r, m, sk] = decode("e30c 07 00 01 00 01 00 8002 ffffffffffffffffff01", bytewise);
+            CHECK(r.complete(), say("a surplus of wide elements is not INVALID"));
+            CHECK(boolBytes(m.a) == (B5{0, 1, 0, 1, 0}), say("the leading elements land, the surplus does not"));
+        }
+
+        /* readArray with the ElemBound a `u8` element would carry: ignored. */
+        {
+            auto [r, m, sk] = decode("0b 03 8002 00 ffffffffffffffffff01", bytewise);
+            CHECK(r.complete(), say("readArray ignores the ElemBound for bool elements"));
+            CHECK(m.iv.size() == 3 && m.iv[0] && !m.iv[1] && m.iv[2], say("readArray stores true/false/true"));
+        }
+        /* ...and the schema `count` it does carry still binds. */
+        {
+            auto [r, m, sk] = decode("0b 06 000000000000", bytewise);
+            CHECK(r.invalid(), say("readArray: a count past the schema count is INVALID"));
+        }
+
+        /* A byte-backed member behind a `bool` view: the store is a byte store of
+         * exactly 0 or 1 into every slot the wire count reaches. */
+        {
+            auto [r, m, sk] = decode("13 05 02 00 ff01 01 00", bytewise);
+            CHECK(r.complete(), say("a byte-backed view decodes COMPLETE"));
+            CHECK(m.raw == (B5{1, 0, 1, 1, 0}), say("a byte-backed view holds only 0 and 1"));
+        }
+
+        /* §7.3: a bool element array under a contradicting wire type is not this
+         * field's value -- skipped, the destination left exactly as it was. */
+        {
+            auto [r, m, sk] = decode("e40c 02 0202" "e00c 01", bytewise);
+            CHECK(r.complete(), say("mistyped occurrences decode COMPLETE"));
+            CHECK(sk == 2, say("an ArraySigned and a scalar occurrence are each skipped"));
+            CHECK(boolBytes(m.a) == (B5{0, 0, 0, 0, 0}), say("a skipped occurrence leaves the destination untouched"));
+        }
+
+        /* Array of arrays: rows of `bool`, each row a native unsigned array. The
+         * second row's `256` is `true`; row id 2 under ArraySigned is skipped. */
+        {
+            auto [r, m, sk] = decode("1e" "03 02 0100" "0b 02 00 8002" "14 02 0202" "07", bytewise);
+            CHECK(r.complete(), say("nested bool rows decode COMPLETE"));
+            (void)sk; /* a collector's own §7.3 refusal leaves the element unconsumed,
+                       * skipped like an unknown id rather than counted */
+            CHECK(m.rows.size() == 2, say("both bool rows are placed, the mistyped row 2 is not"));
+            if (m.rows.size() == 2)
+            {
+                CHECK(boolBytes(m.rows[0]) == (std::array<std::uint8_t, 2>{1, 0}) &&
+                          boolBytes(m.rows[1]) == (std::array<std::uint8_t, 2>{0, 1}),
+                      say("every bool row element is normalized"));
+            }
+        }
+    }
+
+    /* Encode: §4.4 is canonical, `true` is `1`. Header 0x03 = id 0,
+     * Wire::ArrayUnsigned; the same bytes for every container shape. */
+    checkEncode("array_bool", "03050001010001", [](auto &os){
+        os.write(0, std::array<bool, 5>{false, true, true, false, true}); });
+    checkEncode("array_bool_inline_vector", "03050001010001" "0b00", [](auto &os){
+        os.write(0, sofab::InlineVector<bool, 8>{false, true, true, false, true})
+          .write(1, sofab::InlineVector<bool, 8>{}); });
+    /* A byte-backed member presented as `bool` elements: a byte other than 0/1
+     * is loaded as a byte and written canonically, never raw. */
+    checkEncode("array_bool_byte_backed", "0303000101", [](auto &os){
+        static const std::array<std::uint8_t, 3> raw{0, 2, 0xFF};
+        os.write(0, std::span<const bool>{reinterpret_cast<const bool *>(raw.data()), raw.size()}); });
+
+    /* Round trip: write -> read, through both destination shapes. */
+    {
+        sofab::OStreamInline<64> os;
+        const std::array<bool, 5> a{true, false, true, true, false};
+        const sofab::InlineVector<bool, 5> iv{false, false, true};
+        os.write(204, a).write(1, iv);
+        sofab::IStreamObject<BoolArrMsg> in{kMaxSpan};
+        CHECK(in.feed(os.data(), os.bytesUsed()).complete(), "bool array round trip: COMPLETE");
+        CHECK((*in).a == a, "bool array round trip: std::array");
+        CHECK((*in).iv.size() == 3 && !(*in).iv[0] && !(*in).iv[1] && (*in).iv[2],
+              "bool array round trip: InlineVector");
+    }
 }
 
 /* --- decode / round-trip --- */
@@ -8455,6 +8631,7 @@ int main()
 {
     encodeVectors();
     enumArrayElements();
+    booleanArrays();
     roundtripScalars();
     roundtripArrays();
     roundtripNested();
