@@ -1831,7 +1831,8 @@ namespace sofab
          * travel as (@ref detail::WireInt); signed elements are zig-zag encoded.
          *
          * @tparam E Integral or enumeration element type. An enumeration encodes
-         *         at its declared underlying width, converted per element.
+         *         at its declared underlying width, converted per element; a
+         *         `bool` encodes as the unsigned `0`/`1` of §4.4.
          * @param fieldId Field identifier; must not exceed @ref ID_MAX.
          * @param elems Elements to encode, in order; at most @ref ARRAY_MAX of them.
          * @return @ref Error::InvalidArgument if @p fieldId is too large or
@@ -1874,13 +1875,28 @@ namespace sofab
              * that many straight into the buffer with no per-element check at all.
              * Only the buffer tail, and every flush boundary, takes the checked
              * path — which is still pushBytes, so flushing behaviour is unchanged. */
-            const auto word = [](E v) noexcept -> uint64_t {
-                /* An enum element converts here, one at a time, as it is encoded:
-                 * the span still points at the caller's array of E and is never
-                 * reinterpreted, so there is no aliasing question and no copy. */
-                const auto u = static_cast<U>(v);
-                if constexpr (isSigned) return detail::zigzagEncode(static_cast<int64_t>(u));
-                else                    return static_cast<uint64_t>(u);
+            const auto word = [](const E &v) noexcept -> uint64_t {
+                if constexpr (std::is_same_v<E, bool>)
+                {
+                    /* §4.4 is canonical on encode: `true` is `1`. The element is
+                     * loaded as a byte, not as a `bool`, because generated code
+                     * may present a byte-backed member as `bool` elements (the
+                     * way it presents an enum member as its backing integer),
+                     * and a byte other than 0/1 is a representation a `bool`
+                     * lvalue has no value for. A character-type load is defined
+                     * for both, and `!= 0` keeps the wire canonical either way. */
+                    static_assert(sizeof(bool) == 1, "a bool element is stored as one byte");
+                    return reinterpret_cast<const unsigned char &>(v) != 0 ? 1u : 0u;
+                }
+                else
+                {
+                    /* An enum element converts here, one at a time, as it is encoded:
+                     * the span still points at the caller's array of E and is never
+                     * reinterpreted, so there is no aliasing question and no copy. */
+                    const auto u = static_cast<U>(v);
+                    if constexpr (isSigned) return detail::zigzagEncode(static_cast<int64_t>(u));
+                    else                    return static_cast<uint64_t>(u);
+                }
             };
             const size_t n = elems.size();
             for (size_t i = 0; i < n; )
@@ -2146,11 +2162,12 @@ namespace sofab
          *
          * Handles integers (signed values are zig-zag encoded), `bool`, `float`,
          * `double`, anything convertible to `std::string_view`, contiguous ranges
-         * of integers, enumerations or floats (encoded as arrays), and nested
-         * @ref sofab::OStreamMessage objects (encoded as a sub-message). An
+         * of integers, enumerations, booleans or floats (encoded as arrays), and
+         * nested @ref sofab::OStreamMessage objects (encoded as a sub-message). An
          * enumeration element travels as its declared underlying type, so a
-         * container of scoped enums needs no converted copy. Unsupported types
-         * fail to compile.
+         * container of scoped enums needs no converted copy; a boolean element
+         * travels as the unsigned `0`/`1` of §4.4. Unsupported types fail to
+         * compile.
          *
          * @tparam T Deduced value type.
          * @param fieldId Field identifier; must not exceed @ref ID_MAX.
@@ -2207,8 +2224,10 @@ namespace sofab
                 std::span<const Elem> sp{value};
                 /* An enumeration rides the integer path at its declared width, so a
                  * caller holding `std::vector<Gear>` needs no converted copy. */
-                if constexpr ((std::is_integral_v<Elem> || std::is_enum_v<Elem>) &&
-                              !std::is_same_v<Elem, bool>)
+                /* A container of `bool` joins it too: §4.4 lowers a boolean onto
+                 * the unsigned varint, and @ref writeIntArray emits each element
+                 * as its canonical `0`/`1`. */
+                if constexpr (std::is_integral_v<Elem> || std::is_enum_v<Elem>)
                     err = writeIntArray(fieldId, sp);
                 else if constexpr (std::is_same_v<Elem, float> || std::is_same_v<Elem, double>)
                     err = writeFloatArray(fieldId, sp);
@@ -4951,8 +4970,19 @@ namespace sofab
             auto store = [&](size_t i, uint64_t raw) noexcept -> bool {
                 if constexpr (Bounded)
                     if (!admits(raw)) { error_ = true; return false; }
-                if constexpr (std::is_unsigned_v<Elem>) sp[i] = static_cast<Elem>(raw);
-                else                                    sp[i] = static_cast<Elem>(detail::zigzagDecode(raw));
+                if constexpr (std::is_same_v<Elem, bool>)
+                {
+                    /* §4.4, tolerant on decode: every non-zero element is `true`
+                     * and is normalized on store, whatever its width. The store
+                     * goes through an `unsigned char` lvalue, not a `bool` one:
+                     * generated code may present a byte-backed member as `bool`
+                     * elements, and a character-type store is well-defined for
+                     * that and for a real `bool` object alike. */
+                    static_assert(sizeof(bool) == 1, "a bool element is stored as one byte");
+                    reinterpret_cast<unsigned char &>(sp[i]) = raw != 0 ? 1u : 0u;
+                }
+                else if constexpr (std::is_unsigned_v<Elem>) sp[i] = static_cast<Elem>(raw);
+                else                                         sp[i] = static_cast<Elem>(detail::zigzagDecode(raw));
                 return true;
             };
             /* Two loops rather than one with an `i < n` test inside: the
@@ -5079,9 +5109,11 @@ namespace sofab
          *
          * Call from inside a deliver callback. Handles integers (signed values are un-zig-zagged),
          * `bool`, `float`, `double`, `std::string`, nested @ref sofab::IStreamMessage
-         * objects, and writable contiguous ranges of integers or floats (excess wire
-         * elements past the span's capacity are read and discarded). On a malformed
-         * or truncated field the stream's error flag is set.
+         * objects, and writable contiguous ranges of integers, booleans or floats
+         * (excess wire elements past the span's capacity are read and discarded).
+         * A `bool` scalar or element reads every non-zero value as `true` and is
+         * bounded by no width (§4.4). On a malformed or truncated field the
+         * stream's error flag is set.
          *
          * Every destination **owns** what it receives. There is deliberately no
          * borrowing destination: a fed chunk is the caller's for the duration of
@@ -5115,7 +5147,7 @@ namespace sofab
             }
             else if constexpr (std::is_same_v<T, bool>)
             {
-                /* §4.2: bool travels as an unsigned varint. */
+                /* §4.4: bool travels as an unsigned varint; any non-zero is true. */
                 if (!tagMatches(Wire::Unsigned)) return false; /* §7.3 */
                 uint64_t raw;
                 bool ovf = false;
@@ -5293,6 +5325,17 @@ namespace sofab
                     /* No declared element width here: read() is handed a
                      * destination, not a schema. The bounded form is reached
                      * through readArray, which is handed both. */
+                    if (!readIntElements<false>(sp.first(n))) return false;
+                }
+                else if constexpr (std::is_same_v<Elem, bool>)
+                {
+                    /* Kept apart from the integral branch above on purpose: a
+                     * boolean rides the unsigned varint array form (§4.4), but is
+                     * not an integer. Every non-zero element is `true`, is
+                     * normalized on store, and is bounded by nothing -- `256` and
+                     * `2^64-1` are `true`, not INVALID -- so this read is never the
+                     * bounded instantiation, whatever the caller declared. */
+                    if (!tagMatches(Wire::ArrayUnsigned)) return false; /* §7.3 */
                     if (!readIntElements<false>(sp.first(n))) return false;
                 }
                 else if constexpr (std::is_same_v<Elem, float> || std::is_same_v<Elem, double>)
@@ -5598,7 +5641,9 @@ namespace sofab
          *                        `ElemBound::of<std::uint8_t>()` for `items: u8`.
          *                        Ignored for a float element type, which has no
          *                        narrowing to reject: `fp32`/`fp64` are carried at
-         *                        their own width on the wire.
+         *                        their own width on the wire. Ignored for a `bool`
+         *                        element too, which §4.4 bounds by no width at all:
+         *                        every non-zero element is `true`.
          * @param schemaCount     Declared `count: N`. **Required and non-negative**;
          *                        a schema-unbounded array is read through
          *                        @ref readArrayCapped.
@@ -6859,7 +6904,9 @@ namespace sofab
             else if constexpr (requires { typename Elem::value_type; })
             {
                 using RowElem = typename Elem::value_type;
-                if constexpr (std::is_integral_v<RowElem> && !std::is_same_v<RowElem, bool>)
+                /* A `bool` row lands in the unsigned arm: §4.4 lowers a boolean
+                 * onto the unsigned varint, and `std::is_unsigned_v<bool>` holds. */
+                if constexpr (std::is_integral_v<RowElem>)
                     return static_cast<int>(std::is_unsigned_v<RowElem> ? detail::Wire::ArrayUnsigned
                                                                        : detail::Wire::ArraySigned);
                 else if constexpr (std::is_same_v<RowElem, float> || std::is_same_v<RowElem, double>)

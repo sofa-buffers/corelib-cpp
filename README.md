@@ -133,6 +133,12 @@ encodes each element at the enum's declared underlying width, which is also what
 picks the signed or unsigned array wire type. No converted copy, and the same
 bytes as the equivalent integer array.
 
+A `boolean` array is a container of `bool` (`std::array<bool, N>`,
+`sofab::InlineVector<bool, N>`, a `std::span<bool>`) and travels as an unsigned
+array of `0`/`1`. Decoding is tolerant, as CORELIB_PLAN §4.4 asks: every
+non-zero element reads as `true` and is stored as `1`, with no width bound —
+`256` is `true`, not a malformed message.
+
 ### Serialize stream
 
 For a message larger than the buffer, give the stream a flush callback: the
