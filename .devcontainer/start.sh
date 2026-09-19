@@ -8,9 +8,6 @@ if [[ "${1:-}" == "rebuild" ]]; then
   REBUILD=1
 fi
 
-# Define the container image name
-IMAGE_NAME="sofab-cpp-devcontainer"
-
 # Resolve this script's directory so it works regardless of the caller's cwd.
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ENV_FILE="$SCRIPT_DIR/.env"
@@ -20,6 +17,12 @@ mkdir -p "$CLAUDE_CONFIG_DIR"
 # Derive container name from parent folder, e.g. sofab-<project-folder>
 PROJECT_NAME="$(basename "$(dirname "$SCRIPT_DIR")")"
 CONTAINER_NAME="sofab-${PROJECT_NAME}"
+# The image is per project too. A fixed name was shared with corelib-c-cpp's
+# start.sh, and since an existing image is reused rather than rebuilt, whichever
+# repo built first supplied the other's toolchain: this repo's container came up
+# with the C repo's cross compilers and without the clang its Dockerfile installs.
+# (lower-cased: a Docker image name, unlike a container name, must be.)
+IMAGE_NAME="sofab-${PROJECT_NAME,,}-devcontainer"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 env_args=()
