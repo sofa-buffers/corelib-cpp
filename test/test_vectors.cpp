@@ -897,6 +897,155 @@ bool loadHeaderCases(const sofab_json_t *root, std::vector<HeaderCase> &out, std
     return true;
 }
 
+/* --- boolean tolerance (top-level "boolean_tolerant", CORELIB_PLAN §4.4) ----
+ *
+ * "Canonical on encode, tolerant on decode": an encoder MUST write `true` as
+ * `1`, a decoder MUST read EVERY non-zero value as `true`. A boolean carries no
+ * width bound at all — unlike an `enum` or a `bitfield` (MESSAGE_SPEC §1) —
+ * so `256` and `2^64-1` at a boolean position are `true`, not INVALID and not a
+ * truncation to `false`.
+ *
+ * Hand-authored, and it has to be: these bytes are produced by nobody's
+ * conforming encoder, so the positive `vectors` block cannot reach this half of
+ * §4.4. Each case is decode-then-RE-ENCODE, because the three defects the block
+ * exists for land in three different assertions and no two of them overlap:
+ *
+ *   - answering INVALID for `256`          -> the outcome assertion
+ *   - masking `256` to the destination
+ *     width before the zero-test (`false`) -> the stored-byte assertion; the
+ *                                             outcome is `complete` and looks
+ *                                             perfect
+ *   - storing the raw `2` unnormalised     -> the re-encode assertion; both the
+ *                                             outcome and any "is it true?"
+ *                                             check pass, since `2` is true
+ *                                             under every truthiness test
+ *
+ * A runner asserting only the outcome certifies a decoder that violates §4.4 in
+ * two of the three ways. */
+
+/* The longest `expect.values` the block carries is 5; the slack is so an
+ * upstream case with more elements fails to LOAD rather than being silently
+ * truncated to what fits (the corelib-c-cpp#160 failure mode). */
+constexpr size_t kBoolMaxElems = 16;
+
+struct BoolCase
+{
+    std::string name;
+    uint32_t req = 0;
+    uint32_t fieldId = 0;
+    std::vector<uint8_t> bytes;   // `serialized_hex`
+    std::vector<uint8_t> want;    // `expect.values`, one byte per element: 0 or 1
+    std::vector<uint8_t> reenc;   // `expect.reencoded_hex`
+};
+
+bool loadBoolCases(const sofab_json_t *root, std::vector<BoolCase> &out, std::string &err)
+{
+    const sofab_json_t *arr = group(root, "boolean_tolerant", err);
+    if (!arr) return false;
+    for (size_t i = 0, n = sofab_json_array_size(arr); i < n; i++)
+    {
+        const sofab_json_t *cj = sofab_json_array_at(arr, i);
+        BoolCase c;
+        size_t nl; const char *nm = sofab_json_string(sofab_json_get(cj, "name"), &nl);
+        c.name.assign(nm ? nm : "", nm ? nl : 0);
+        if (c.name.empty()) { err = "boolean_tolerant case with no name"; return false; }
+        /* reqMask(), not hdrReqMask(): an unsatisfied tag REJECTS here (see the
+         * gate in main()), and an UNRECOGNISED tag is ignored, the way the
+         * corpus's reference runner ignores it — a tag this reader does not
+         * know contributes nothing to the needed set, so the case runs
+         * positively and every port agrees on the same behaviour when upstream
+         * adds a tag. */
+        c.req = reqMask(cj);
+        /* Read from the case, never hardcoded: every case currently carries id
+         * 0, so a hardcoded 0 is green today and writes the RE-ENCODE at the
+         * wrong id the moment upstream adds a case with another. */
+        const sofab_json_t *idj = sofab_json_get(cj, "id");
+        if (!idj) { err = c.name + ": no id"; return false; }
+        c.fieldId = static_cast<uint32_t>(sofab_json_u64(idj));
+
+        size_t sl; const char *sh = sofab_json_string(sofab_json_get(cj, "serialized_hex"), &sl);
+        if (!sh || !hex2bin(sh, sl, c.bytes)) { err = c.name + ": bad serialized_hex"; return false; }
+        if (c.bytes.empty()) { err = c.name + ": empty serialized_hex"; return false; }
+
+        const sofab_json_t *ex = sofab_json_get(cj, "expect");
+        if (!ex) { err = c.name + ": no expect"; return false; }
+        /* Read rather than assumed: "this block is always complete" is true
+         * today, and a future case carrying anything else must fail loudly
+         * instead of being silently mis-run as a positive one. */
+        size_t ol; const char *oc = sofab_json_string(sofab_json_get(ex, "outcome"), &ol);
+        if (!oc) { err = c.name + ": no expect.outcome"; return false; }
+        if (std::string(oc, ol) != "complete")
+        { err = c.name + ": unsupported expect.outcome " + std::string(oc, ol); return false; }
+
+        const sofab_json_t *vals = sofab_json_get(ex, "values");
+        if (!vals || sofab_json_type(vals) != SOFAB_JSON_ARRAY)
+        { err = c.name + ": no expect.values array"; return false; }
+        const size_t nv = sofab_json_array_size(vals);
+        if (nv == 0) { err = c.name + ": expect.values is empty"; return false; }
+        if (nv > kBoolMaxElems)
+        { err = c.name + ": " + std::to_string(nv) + " elements exceeds this runner's destination"; return false; }
+        for (size_t k = 0; k < nv; k++)
+        {
+            const sofab_json_t *bv = sofab_json_array_at(vals, k);
+            /* A JSON boolean, by construction — so the comparison downstream is
+             * against a real `true`/`false` and never against a coerced number. */
+            if (sofab_json_type(bv) != SOFAB_JSON_BOOL)
+            { err = c.name + ": expect.values element " + std::to_string(k) + " is not a JSON boolean"; return false; }
+            c.want.push_back(sofab_json_bool(bv) ? 1u : 0u);
+        }
+
+        size_t rl; const char *rh = sofab_json_string(sofab_json_get(ex, "reencoded_hex"), &rl);
+        if (!rh || !hex2bin(rh, rl, c.reenc)) { err = c.name + ": bad expect.reencoded_hex"; return false; }
+        if (c.reenc.empty()) { err = c.name + ": empty expect.reencoded_hex"; return false; }
+        out.push_back(std::move(c));
+    }
+    return true;
+}
+
+/* The destination for one boolean case.
+ *
+ * `dst` is a real `bool` array — the port's natural boolean destination, which
+ * is the storage under test — and this runner NEVER reads it as `bool`. In C++
+ * a `bool` object may only hold the representations of `false` and `true`; an
+ * object holding `2` has no value, so comparing it against `true` cannot tell
+ * you whether the decoder normalised, the comparison itself being meaningless.
+ * The bytes are inspected through a `memcpy` into `unsigned char` instead, which
+ * is what turns "the object ends up holding a representation it is ALLOWED to
+ * have" into an assertion. */
+struct BoolMsg : sofab::IStreamMessage
+{
+    uint32_t fieldId = 0;
+    size_t n = 1;                    /* elements expected: 1 == scalar */
+    bool dst[kBoolMaxElems];         /* poisoned by the caller before the feed */
+    int others = 0;                  /* fields delivered at some other id */
+    int delivered = 0;               /* deliveries of the case's own field */
+    size_t announced = 0;            /* the array header's element count */
+
+    void deserialize(sofab::IStreamImpl &is, sofab::id id, size_t, size_t) noexcept override
+    {
+        if (id != fieldId) { ++others; return; }
+        ++delivered;
+        /* The BOOLEAN read surface, chosen by the case's element count — not the
+         * unsigned reader, which would test nothing: `2` is a perfectly ordinary
+         * unsigned value and normalisation is exactly what the boolean surface
+         * adds. Nothing is asserted in here (an assertion thrown from inside a
+         * deliver callback can be swallowed or leave the stream in a state that
+         * masks the failure); what the callback saw is recorded and checked
+         * after feed() returns. */
+        if (n == 1)
+        {
+            (void)is.read(dst[0]);
+            announced = 1;
+        }
+        else
+        {
+            announced = is.announcedCount();
+            std::span<bool> sp{dst, n};
+            (void)is.read(sp);
+        }
+    }
+};
+
 /* The destination for one header case: the case's own field, read under the
  * ceiling the case configures, plus a count of every OTHER field delivered —
  * which is what turns "a further feed re-raises rather than CONSUMING" into an
@@ -942,8 +1091,8 @@ struct HeaderMsg : sofab::IStreamMessage
 struct EnvelopeWalk
 {
     bool parsed = false;
-    bool vectorsOk = false, negOk = false, growthOk = false, headerOk = false;
-    size_t nVectors = 0, nNeg = 0, nGrowth = 0, nHeader = 0;
+    bool vectorsOk = false, negOk = false, growthOk = false, headerOk = false, boolOk = false;
+    size_t nVectors = 0, nNeg = 0, nGrowth = 0, nHeader = 0, nBool = 0;
 };
 
 EnvelopeWalk walkEnvelope(const char *json)
@@ -957,15 +1106,18 @@ EnvelopeWalk walkEnvelope(const char *json)
     std::vector<NegVec> ns;
     std::vector<GrowthCase> gs;
     std::vector<HeaderCase> hs;
+    std::vector<BoolCase> bs;
     std::string e;
     w.vectorsOk = loadVectors(root, vs, e);
     w.negOk = loadNegVectors(root, ns, e);
     w.growthOk = loadGrowthCases(root, gs, e);
     w.headerOk = loadHeaderCases(root, hs, e);
+    w.boolOk = loadBoolCases(root, bs, e);
     w.nVectors = vs.size();
     w.nNeg = ns.size();
     w.nGrowth = gs.size();
     w.nHeader = hs.size();
+    w.nBool = bs.size();
     sofab_json_free(root);
     return w;
 }
@@ -1642,6 +1794,200 @@ int main()
             " rejection cases and " + std::to_string(headerRun - headerRejects) +
             " in-cap controls; the block needs both");
 
+    /* --- boolean tolerance (top-level "boolean_tolerant", CORELIB_PLAN §4.4).
+     *     Bytes nobody's conforming encoder emits, decoded through the BOOLEAN
+     *     read surface and then written back out through the boolean WRITE
+     *     surface: "tolerant on decode" and "canonical on encode" are one rule
+     *     and neither half is observable without the other. --- */
+    std::vector<BoolCase> bools;
+    if (!loadBoolCases(vf.root, bools, err))
+    {
+        std::printf("boolean_tolerant load failed: %s\n", err.c_str());
+        return 2;
+    }
+    int boolDecoded = 0, boolRejected = 0, boolChecks = 0;
+    for (const BoolCase &c : bools)
+    {
+        const auto label = named(c.name.c_str());
+        const size_t n = c.want.size();
+
+        /* §4.4 lifts the width bound the TYPE carries, never the one a BUILD
+         * has: under a narrowed accumulator a boolean carrying 2^64-1 overflows
+         * before any boolean rule can apply, and CORELIB_PLAN §6.2 makes that
+         * INVALID (§5.2.2). So an unsatisfied tag REJECTS here — it does not
+         * skip, the way it does for the `header_limits` block. Skipping would
+         * assert nothing at all, leaving the truncation this block exists to
+         * catch untested in exactly the build most likely to have it.
+         *
+         * This pure-C++20 build sets every capability bit (buildCaps()), so the
+         * branch below is unreachable today and `rejected` is always 0. It is
+         * here so a feature-reduced profile — should one ever be introduced —
+         * needs no new code, and so the gate can never be mistaken for the
+         * unconditional skip of the tagged cases that would silently drop the
+         * array and 64-bit halves of the rule. */
+        if (c.req & ~caps)
+        {
+            ++boolRejected;
+            /* A handler binding nothing: what is asserted is the VERDICT, not
+             * which fields arrived before the offending one. */
+            sofab::IStreamObject<BoolMsg> in{kMaxSpan};
+            (*in).fieldId = c.fieldId + 1;   /* never the case's own id */
+            const auto r = in.feed(c.bytes.data(), c.bytes.size());
+            static const uint8_t goodTail[] = {0x00};
+            const sofab::Error after = in.feed(goodTail, sizeof goodTail).code();
+            ++boolChecks;
+            run(r.status() == sofab::DecodeStatus::Invalid &&
+                    r.code() == sofab::Error::InvalidMessage && after == sofab::Error::InvalidMessage,
+                label, "boolean-gated-invalid",
+                "a `requires` tag this build does not satisfy must make the message INVALID "
+                "and stay INVALID; got status " + std::to_string(static_cast<int>(r.status())) +
+                    ", code " + std::to_string(static_cast<int>(r.code())) +
+                    ", after one more byte " + std::to_string(static_cast<int>(after)));
+            continue;
+        }
+
+        ++boolDecoded;
+        /* Whole, and again one byte at a time. The byte-at-a-time run is what
+         * puts the ten-byte varints of `boolean_tolerant_u64_max` and
+         * `boolean_tolerant_array_u64_max` across feed boundaries, so a value
+         * accumulator that loses its carry there cannot pass by arriving in one
+         * piece; §7.2 item 4 makes the two results identical. */
+        for (bool oneByte : {false, true})
+        {
+            const char *how = oneByte ? "-chunked" : "";
+            /* A FRESH decoder and a fresh, poisoned destination per run: a
+             * terminal verdict or leftover parser state from the previous case
+             * must not reach this one, and a retained destination would mask a
+             * decoder that never wrote. */
+            sofab::IStreamObject<BoolMsg> in{kMaxSpan};
+            BoolMsg &m = *in;
+            m.fieldId = c.fieldId;
+            m.n = n;
+            /* §8.4: neither the expected result nor a valid `bool`
+             * representation. Without it a decoder that never writes the
+             * destination at all passes `boolean_tolerant_zero` against zeroed
+             * storage and the case proves nothing. */
+            std::memset(m.dst, 0xAA, sizeof m.dst);
+
+            sofab::DecodeStatus status = sofab::DecodeStatus::Complete;
+            sofab::Error code = sofab::Error::None;
+            if (oneByte)
+                for (uint8_t b : c.bytes)
+                {
+                    const auto rr = in.feed(&b, 1);
+                    status = rr.status();
+                    code = rr.code();
+                }
+            else
+            {
+                const auto rr = in.feed(c.bytes.data(), c.bytes.size());
+                status = rr.status();
+                code = rr.code();
+            }
+            ++boolChecks;
+            run(status == sofab::DecodeStatus::Complete && code == sofab::Error::None &&
+                    m.delivered >= 1 && m.others == 0,
+                label, (std::string("boolean-decode-complete") + how).c_str(),
+                "expected complete with the case's own field delivered; got status " +
+                    std::to_string(static_cast<int>(status)) + ", code " +
+                    std::to_string(static_cast<int>(code)) + ", " +
+                    std::to_string(m.delivered) + " deliveries and " + std::to_string(m.others) +
+                    " other fields");
+            /* §13: where the decode surface exposes the wire element count, a
+             * decoder delivering fewer elements than the header declares is
+             * caught cheaply. */
+            if (n > 1)
+            {
+                ++boolChecks;
+                run(m.announced == n, label, (std::string("boolean-array-count") + how).c_str(),
+                    "the array header announces " + std::to_string(m.announced) +
+                        " elements, expect.values has " + std::to_string(n));
+            }
+
+            /* The stored REPRESENTATION, byte by byte, never the `bool` lvalue:
+             * an object holding `2` has no value in C++, so `== true` on it is
+             * already meaningless, and a truthiness comparison would map exactly
+             * the corruption under test onto a pass. */
+            unsigned char got[kBoolMaxElems];
+            std::memcpy(got, m.dst, sizeof got);
+            std::string sawBytes, wantBytes;
+            bool bytesOk = true;
+            for (size_t k = 0; k < n; k++)
+            {
+                char b[8];
+                std::snprintf(b, sizeof b, "%02x", got[k]);    sawBytes  += b;
+                std::snprintf(b, sizeof b, "%02x", c.want[k]); wantBytes += b;
+                if (got[k] != c.want[k]) bytesOk = false;
+            }
+            run(bytesOk, label, (std::string("boolean-normalised") + how).c_str(),
+                "the destination holds " + sawBytes + ", expected " + wantBytes +
+                    " (0x00 false / 0x01 true; 0xaa is the poison, i.e. never written; "
+                    "any other byte is an unnormalised raw value)");
+
+            ++boolChecks;
+            if (!bytesOk)
+            {
+                /* Reading those `bool` objects to re-encode them would be
+                 * undefined behaviour where the byte is neither 0 nor 1, and
+                 * deriving the values from the raw bytes instead would launder
+                 * the very defect just reported into a canonical `1`. So the
+                 * re-encode is not attempted — and it is still counted and still
+                 * reported as failed, because the case did not prove what it
+                 * exists to prove. */
+                run(false, label, (std::string("boolean-reencode-canonical") + how).c_str(),
+                    "not attempted: the decode destination does not hold the normalised "
+                    "values (see boolean-normalised" + std::string(how) + " above)");
+                continue;
+            }
+
+            /* §11.3: what the DECODER produced, never `expect.values` from the
+             * JSON — feeding the expectation back in makes `reencoded_hex` match
+             * trivially and leaves the decode half unverified. The byte check
+             * above is what makes reading `m.dst` as `bool` legal here. */
+            sofab::OStream os(std::make_shared<uint8_t[]>(64), 64);
+            const sofab::Error wcode =
+                (n == 1 ? os.write(c.fieldId, m.dst[0])
+                        : os.write(c.fieldId, std::span<const bool>{m.dst, n})).code();
+            os.flush();   /* nothing buffered survives the comparison */
+            const std::span<const uint8_t> out{os.data(), os.bytesUsed()};
+            /* Against `reencoded_hex`, and byte for byte: `0002` and `0001` are
+             * the same LENGTH, so a length comparison passes every case whose
+             * whole point is that the re-encode differs from the bytes fed in. */
+            const bool reencOk = wcode == sofab::Error::None && os.ok() &&
+                                 out.size() == c.reenc.size() &&
+                                 std::memcmp(out.data(), c.reenc.data(), c.reenc.size()) == 0;
+            std::string sawHex, wantHex;
+            for (uint8_t b : out)     { char t[8]; std::snprintf(t, sizeof t, "%02x", b); sawHex  += t; }
+            for (uint8_t b : c.reenc) { char t[8]; std::snprintf(t, sizeof t, "%02x", b); wantHex += t; }
+            run(reencOk, label, (std::string("boolean-reencode-canonical") + how).c_str(),
+                "re-encoded " + sawHex + ", expected " + wantHex + " (encoder code " +
+                    std::to_string(static_cast<int>(wcode)) + ", ok=" +
+                    std::to_string(static_cast<int>(os.ok())) + ")");
+        }
+    }
+    /* §12: `found` must equal `decoded + rejected`, and a run that found zero
+     * cases FAILS. Every way this block can go green while testing less — a
+     * stale vector file, a gate that skipped the tagged cases, a filter that
+     * kept only the scalars — shows up as a count, and as nothing else. A floor,
+     * never an equality: the block grows upstream. */
+    run(boolDecoded + boolRejected == static_cast<int>(bools.size()) && !bools.empty(),
+        named("(all)"), "boolean-tolerant-accounted",
+        "of " + std::to_string(bools.size()) + " boolean_tolerant cases, " +
+            std::to_string(boolDecoded) + " decoded and " + std::to_string(boolRejected) +
+            " were rejected on an unsatisfied requires tag");
+    run(static_cast<int>(bools.size()) >= 8, named("(all)"), "boolean-tolerant-present",
+        "expected at least 8 boolean_tolerant cases, saw " + std::to_string(bools.size()));
+    /* The scalar half is easy to run and the array half is easy to postpone;
+     * a runner that kept only `len(values) == 1` would lose the element-level
+     * half of §4.4 entirely and report nothing about it. */
+    {
+        int scalars = 0, arrays = 0;
+        for (const BoolCase &c : bools) (c.want.size() == 1 ? scalars : arrays)++;
+        run(scalars >= 5 && arrays >= 2, named("(all)"), "boolean-tolerant-both-shapes",
+            "expected at least 5 scalar and 2 array cases, saw " + std::to_string(scalars) +
+                " and " + std::to_string(arrays));
+    }
+
     /* --- envelope guards (corelib-cpp#100) ---
      *
      * Every group above came out of ONE read and ONE parse of the vector file.
@@ -1669,30 +2015,38 @@ int main()
                                    "\"limits\":{\"max_dyn_string_len\":16},"
                                    "\"serialized\":\"02a206\","
                                    "\"expect\":{\"outcome\":\"limit_exceeded\",\"terminal\":true}}";
+        static const char kBool[] = "{\"name\":\"b\",\"requires\":[],\"id\":0,"
+                                    "\"serialized_hex\":\"0002\","
+                                    "\"expect\":{\"outcome\":\"complete\",\"values\":[true],"
+                                    "\"reencoded_hex\":\"0001\"}}";
         const std::string both  = std::string("{\"vectors\":[") + kVec +
                                   "],\"invalid_utf8\":[" + kNeg +
                                   "],\"sequence_growth\":[" + kGro +
-                                  "],\"header_limits\":[" + kHdr + "]}";
+                                  "],\"header_limits\":[" + kHdr +
+                                  "],\"boolean_tolerant\":[" + kBool + "]}";
         const std::string onlyV = std::string("{\"vectors\":[") + kVec + "]}";
         const std::string onlyN = std::string("{\"invalid_utf8\":[") + kNeg + "]}";
         const std::string onlyG = std::string("{\"sequence_growth\":[") + kGro + "]}";
         const std::string onlyH = std::string("{\"header_limits\":[") + kHdr + "]}";
+        const std::string onlyB = std::string("{\"boolean_tolerant\":[") + kBool + "]}";
         const std::string empty = "{\"vectors\":[],\"invalid_utf8\":[],\"sequence_growth\":[],"
-                                  "\"header_limits\":[]}";
+                                  "\"header_limits\":[],\"boolean_tolerant\":[]}";
         const std::string drift = std::string("{\"vectors_v2\":[") + kVec +
                                   "],\"invalid_utf8_v2\":[" + kNeg +
                                   "],\"sequence_growth_v2\":[" + kGro +
-                                  "],\"header_limits_v2\":[" + kHdr + "]}";
+                                  "],\"header_limits_v2\":[" + kHdr +
+                                  "],\"boolean_tolerant_v2\":[" + kBool + "]}";
 
         const struct { const char *label; const std::string &json;
-                       bool wantV, wantN, wantG, wantH; } cases[] = {
-            {"envelope-all-groups",           both,  true,  true,  true,  true },
-            {"envelope-no-invalid_utf8",      onlyV, true,  false, false, false},
-            {"envelope-no-vectors",           onlyN, false, true,  false, false},
-            {"envelope-only-sequence_growth", onlyG, false, false, true,  false},
-            {"envelope-only-header_limits",   onlyH, false, false, false, true },
-            {"envelope-empty-groups",         empty, false, false, false, false},
-            {"envelope-renamed-keys",         drift, false, false, false, false},
+                       bool wantV, wantN, wantG, wantH, wantB; } cases[] = {
+            {"envelope-all-groups",           both,  true,  true,  true,  true,  true },
+            {"envelope-no-invalid_utf8",      onlyV, true,  false, false, false, false},
+            {"envelope-no-vectors",           onlyN, false, true,  false, false, false},
+            {"envelope-only-sequence_growth", onlyG, false, false, true,  false, false},
+            {"envelope-only-header_limits",   onlyH, false, false, false, true,  false},
+            {"envelope-only-boolean_tolerant",onlyB, false, false, false, false, true },
+            {"envelope-empty-groups",         empty, false, false, false, false, false},
+            {"envelope-renamed-keys",         drift, false, false, false, false, false},
         };
         for (const auto &c : cases)
         {
@@ -1703,7 +2057,8 @@ int main()
                             w.vectorsOk == c.wantV && (w.nVectors > 0) == c.wantV &&
                             w.negOk == c.wantN && (w.nNeg > 0) == c.wantN &&
                             w.growthOk == c.wantG && (w.nGrowth > 0) == c.wantG &&
-                            w.headerOk == c.wantH && (w.nHeader > 0) == c.wantH;
+                            w.headerOk == c.wantH && (w.nHeader > 0) == c.wantH &&
+                            w.boolOk == c.wantB && (w.nBool > 0) == c.wantB;
             run(ok, named("(all)"), c.label,
                 !w.parsed ? std::string("probe envelope did not parse")
                           : "vectors ok=" + std::to_string(static_cast<int>(w.vectorsOk)) +
@@ -1713,11 +2068,14 @@ int main()
                                 ", sequence_growth ok=" + std::to_string(static_cast<int>(w.growthOk)) +
                                 " n=" + std::to_string(w.nGrowth) +
                                 ", header_limits ok=" + std::to_string(static_cast<int>(w.headerOk)) +
-                                " n=" + std::to_string(w.nHeader) + "; expected ok " +
+                                " n=" + std::to_string(w.nHeader) +
+                                ", boolean_tolerant ok=" + std::to_string(static_cast<int>(w.boolOk)) +
+                                " n=" + std::to_string(w.nBool) + "; expected ok " +
                                 std::to_string(static_cast<int>(c.wantV)) + "/" +
                                 std::to_string(static_cast<int>(c.wantN)) + "/" +
                                 std::to_string(static_cast<int>(c.wantG)) + "/" +
-                                std::to_string(static_cast<int>(c.wantH)));
+                                std::to_string(static_cast<int>(c.wantH)) + "/" +
+                                std::to_string(static_cast<int>(c.wantB)));
         }
     }
 
@@ -1732,6 +2090,9 @@ int main()
     std::printf("%zu header_limits cases, %d run (%d rejections, %d in-cap controls), "
                 "%d skipped\n", headers.size(), headerRun, headerRejects,
                 headerRun - headerRejects, headerSkipped);
+    std::printf("%zu boolean_tolerant cases found, %d decoded, %d rejected "
+                "(unsatisfied requires), %d checks\n",
+                bools.size(), boolDecoded, boolRejected, boolChecks);
     if (failures) std::printf("first failure: %s\n", first.c_str());
     if (const char *v = std::getenv("SOFAB_LIST_FAILURES"); v && *v)
         for (const auto &f : allFailures) std::printf("  FAIL %s\n", f.c_str());

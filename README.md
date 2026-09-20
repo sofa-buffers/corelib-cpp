@@ -722,9 +722,11 @@ Six suites run under CTest:
 - **`test_vectors`** — replays the shared `assets/test_vectors.json` for encode,
   decode, byte-at-a-time streaming and field skipping (every vector carrying
   `skip_ids`, whole and one byte at a time): the `vectors`, `invalid_utf8`,
-  `sequence_growth` and `header_limits` groups, plus guards that fail when the
-  file's envelope drifts or the loader stops carrying the sizes the vectors
-  need.
+  `sequence_growth`, `header_limits` and `boolean_tolerant` groups — the last
+  being §4.4's "canonical on encode, tolerant on decode", where every non-zero
+  value at a boolean position decodes to `true` and re-encodes to `1` — plus
+  guards that fail when the file's envelope drifts or the loader stops carrying
+  the sizes the vectors need.
 - **`test_bench_tools`** — holds the benchmark tooling to BENCH_SPEC: the
   workload list, both output tables, and the cross-port parity sizes.
 - **`test_ci_workflows`** — reads `.github/workflows/` and requires both build
