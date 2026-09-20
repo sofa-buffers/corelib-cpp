@@ -57,7 +57,7 @@ The vectors it loads are **also vendored**, from the same upstream:
 
 | File | Upstream source | Pinned at | `md5` |
 |------|-----------------|-----------|-------|
-| `../../assets/test_vectors.json` | [`sofa-buffers/corelib-c-cpp`](https://github.com/sofa-buffers/corelib-c-cpp) → `assets/test_vectors.json` | commit `3aa34353be0a` (2026-09-03) | `793040a0f844116ccd20b1f9edd53a7d` |
+| `../../assets/test_vectors.json` | [`sofa-buffers/corelib-c-cpp`](https://github.com/sofa-buffers/corelib-c-cpp) → `assets/test_vectors.json` | commit `35f2df77ac2d` (2026-09-19) | `72d6cfe07fc801fc08a39b5ba435086e` |
 
 `test_vectors.json` is the cross-language source of truth for the wire format and
 is copied verbatim into every SofaBuffers corelib. We track the copy vendored in
