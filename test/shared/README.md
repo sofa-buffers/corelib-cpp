@@ -33,15 +33,18 @@ fixed-size, and main() measures the largest loaded skip list, id, array and
 payload against the sizes the current file needs, so a cap that truncated one
 would fail loudly rather than quietly test less.
 
-The file carries four top-level groups and this repo runs all four: `vectors`
+The file carries six top-level groups and this repo runs five of them: `vectors`
 (the wire-format ground truth), `invalid_utf8` (negative `string` payloads),
 `sequence_growth` (CORELIB_PLAN §7.2 item 8 — a wrapper array's container growth,
 keyed by a delivery sequence of element ids rather than by bytes, with indices
-relative to the port's own configured `max_dyn_array_count`) and `header_limits`
+relative to the port's own configured `max_dyn_array_count`), `header_limits`
 (§6.2.1/§6.3 — bytes that declare a length or count and then end, with no payload
-behind them). The growth block is gated by a `dynamic_arrays` capability tag: a
-statically bounded profile never grows and skips it. This corelib collects into
-`std::vector`, so it runs it.
+behind them) and `boolean_tolerant` (§4.4 — see below). The sixth,
+`header_limits_nested`, is not adopted here yet; an unknown top-level block is
+ignored by a consumer that does not know it, which is the corpus's
+forward-compatibility rule. The growth block is gated by a `dynamic_arrays`
+capability tag: a statically bounded profile never grows and skips it. This
+corelib collects into `std::vector`, so it runs it.
 
 `header_limits` is gated by `receiver_caps`, a *profile* capability: a port
 declares it when its generated code carries §6.2.1 receiver caps distinct from
@@ -52,6 +55,36 @@ an unsatisfied `requires` tag means **skip**, for every tag, and not the
 reduced-build rejection a *vector* gets: the cases assert a rejection with a
 specific category, so a build that cannot represent the construct would reject
 it for an unrelated reason and appear to pass while testing nothing.
+
+`boolean_tolerant` (CORELIB_PLAN §4.4) is the one block whose bytes no conforming
+encoder produces, which is why it is hand-authored and cannot live in `vectors`:
+"canonical on encode, tolerant on decode" says an encoder MUST write `true` as
+`1` while a decoder MUST read **every** non-zero value as `true`. A boolean
+carries no width bound at all — unlike an `enum` or a `bitfield`
+(MESSAGE_SPEC §1) — so `2`, `256` and `2^64-1` at a boolean position are `true`,
+never `INVALID` and never truncated to `false`. Each case is therefore run as a
+decode **and** a re-encode, whole and one byte at a time, because the three
+defects it exists for land in three different assertions: answering `INVALID`
+for `256` fails the outcome check; masking `256` down to the destination width
+before the zero-test yields `false` with a *perfect* outcome and fails only the
+stored-value check; storing the raw `2` passes both the outcome and any
+truthiness check and fails only the re-encode, which must emit `1`. The stored
+value is compared as **bytes**, copied out of the `bool` destination: a C++
+`bool` object holding `2` has no value at all, so comparing it against `true`
+would be meaningless rather than revealing, and the destination is poisoned with
+`0xaa` first so a decoder that never writes it cannot pass `boolean_tolerant_zero`
+against zeroed storage.
+
+In that block an unsatisfied `requires` tag means **reject**, not skip — the
+opposite of `header_limits` and the same rule a *vector* gets: §4.4 lifts the
+width bound the *type* carries, never the one a *build* has, so under a narrowed
+accumulator (§6.2.2) a boolean carrying `2^64-1` overflows before any boolean
+rule can apply and `INVALID` (§5.2.2) is the conformant answer. Skipping would
+assert nothing at all, leaving the truncation the block exists to catch untested
+in exactly the build most likely to have it. This full-feature C++20 build
+satisfies every tag, so all eight cases run positively and the reject branch is
+unreachable; it is implemented anyway so a feature-reduced profile would need no
+new code.
 
 The vectors it loads are **also vendored**, from the same upstream:
 
@@ -98,8 +131,8 @@ happens:
    authoritative format description.
 
    The **envelope** — the file's top-level keys — is upstream's too, and it has
-   grown a key three times (`invalid_utf8`, then `sequence_growth`, then
-   `header_limits`). `test/test_vectors.cpp` reads and parses
+   grown a key four times (`invalid_utf8`, then `sequence_growth`, then
+   `header_limits`, then `boolean_tolerant`). `test/test_vectors.cpp` reads and parses
    the file exactly once and walks every group off that single parse; each walker
    demands its own top-level key and fails the run when it is absent, renamed or
    empty. A re-sync that reshapes the envelope therefore shows up as a red
