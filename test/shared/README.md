@@ -33,18 +33,16 @@ fixed-size, and main() measures the largest loaded skip list, id, array and
 payload against the sizes the current file needs, so a cap that truncated one
 would fail loudly rather than quietly test less.
 
-The file carries six top-level groups and this repo runs five of them: `vectors`
+The file carries six top-level groups and this repo runs all six: `vectors`
 (the wire-format ground truth), `invalid_utf8` (negative `string` payloads),
 `sequence_growth` (CORELIB_PLAN §7.2 item 8 — a wrapper array's container growth,
 keyed by a delivery sequence of element ids rather than by bytes, with indices
 relative to the port's own configured `max_dyn_array_count`), `header_limits`
 (§6.2.1/§6.3 — bytes that declare a length or count and then end, with no payload
-behind them) and `boolean_tolerant` (§4.4 — see below). The sixth,
-`header_limits_nested`, is not adopted here yet; an unknown top-level block is
-ignored by a consumer that does not know it, which is the corpus's
-forward-compatibility rule. The growth block is gated by a `dynamic_arrays`
-capability tag: a statically bounded profile never grows and skips it. This
-corelib collects into `std::vector`, so it runs it.
+behind them), `header_limits_nested` (the same bytes one or two sequence frames
+deeper) and `boolean_tolerant` (§4.4 — see below). The growth block is gated by a
+`dynamic_arrays` capability tag: a statically bounded profile never grows and
+skips it. This corelib collects into `std::vector`, so it runs it.
 
 `header_limits` is gated by `receiver_caps`, a *profile* capability: a port
 declares it when its generated code carries §6.2.1 receiver caps distinct from
@@ -55,6 +53,25 @@ an unsatisfied `requires` tag means **skip**, for every tag, and not the
 reduced-build rejection a *vector* gets: the cases assert a rejection with a
 specific category, so a build that cannot represent the construct would reject
 it for an unrelated reason and appear to pass while testing nothing.
+
+`header_limits_nested` is the **depth** axis of that same block, and a separate
+top-level key deliberately: its byte strings open with a sequence header, so a
+runner that ignored the new `frames` key would bind its ceiling at the top level,
+cap nothing, and answer `incomplete` where the case demands `limit_exceeded`. It
+adds `frames` — the chain of sequence field ids the target field is nested in,
+outermost first — and nothing else; the loader, the leaf read and the terminality
+rule are the flat block's, shared. Depth is its own axis because a port can carry
+the schema bound into a sequence and leave the receiver cap bound at the top
+level.
+
+That block runs a **second, independent pass with the ceiling lifted**, and that
+pass is what makes it evidence. Its cases end at end-of-input with one or two
+frames still open, which is a fully sufficient second reason to answer
+`incomplete` — so a rejection that came from somewhere else entirely (a depth
+guard, a refusal of unclosed frames) would pass the forward pass while never
+consulting the ceiling under test. Lifting the ceiling must change the answer;
+the pass asserts only that it *changed*, and asserts how many cases it checked,
+because a control loop that examined nothing is green and proves nothing.
 
 `boolean_tolerant` (CORELIB_PLAN §4.4) is the one block whose bytes no conforming
 encoder produces, which is why it is hand-authored and cannot live in `vectors`:
@@ -131,13 +148,13 @@ happens:
    authoritative format description.
 
    The **envelope** — the file's top-level keys — is upstream's too, and it has
-   grown a key four times (`invalid_utf8`, then `sequence_growth`, then
-   `header_limits`, then `boolean_tolerant`). `test/test_vectors.cpp` reads and parses
-   the file exactly once and walks every group off that single parse; each walker
-   demands its own top-level key and fails the run when it is absent, renamed or
-   empty. A re-sync that reshapes the envelope therefore shows up as a red
-   `test_vectors` reporting `vector file has no non-empty "<key>" array`, not as
-   a green run that silently tested nothing.
+   grown a key five times (`invalid_utf8`, then `sequence_growth`, then
+   `header_limits`, then `header_limits_nested`, then `boolean_tolerant`).
+   `test/test_vectors.cpp` reads and parses the file exactly once and walks every
+   group off that single parse; each walker demands its own top-level key and
+   fails the run when it is absent, renamed or empty. A re-sync that reshapes the
+   envelope therefore shows up as a red `test_vectors` reporting `vector file has
+   no non-empty "<key>" array`, not as a green run that silently tested nothing.
 
 After any re-sync, run the suite (`ctest --test-dir build`) — a green
 `test_vectors` run is what proves this implementation still matches the shared
