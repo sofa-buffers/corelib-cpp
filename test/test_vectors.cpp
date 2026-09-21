@@ -706,11 +706,16 @@ struct HeaderCase
 {
     std::string name;
     uint32_t req = 0;
+    std::vector<std::string> reqTags;          // the `requires` names, to say WHICH gated
     uint32_t fieldId = 0;
     long declared = -1;                        // the length/count the header claims
     HKind kind{};
     HCeil ceiling{};
     long bound = 0;                            // the ceiling's number
+    /* `header_limits_nested` only: the chain of SEQUENCE field ids the target
+     * field is nested in, outermost first. Empty in the flat block, where the
+     * field arrives in the top-level scope. */
+    std::vector<uint32_t> frames;
     std::vector<uint8_t> bytes;                // `serialized`
     std::vector<std::vector<uint8_t>> chunks;  // `chunks`, or empty: feed whole
     HOut want{};
@@ -741,10 +746,22 @@ bool hdrVarint(const std::vector<uint8_t> &b, size_t &at, uint64_t &out)
  * a wrong read leaves the field for the decoder to skip (§7.3), and a skipped
  * field is never capped (§6.2.1) — so the whole block would report a green
  * `incomplete` while testing nothing. */
-bool hdrDecode(const std::vector<uint8_t> &b, uint32_t &id, HKind &kind, uint64_t &declared)
+bool hdrDecode(const std::vector<uint8_t> &b, const std::vector<uint32_t> &frames,
+               uint32_t &id, HKind &kind, uint64_t &declared)
 {
     size_t at = 0;
     uint64_t head = 0;
+    /* The nested block's bytes open one sequence per entry of `frames` before
+     * the target field's own header. Walking them here is what CHECKS the chain
+     * the runner is about to build against the chain the bytes actually carry:
+     * a receiver wired one level too shallow would never reach the ceiling, and
+     * the case would report a green `incomplete` while testing nothing. */
+    for (uint32_t want : frames)
+    {
+        if (!hdrVarint(b, at, head)) return false;
+        if ((head & 7) != 6) return false;                     /* not a sequence open */
+        if (static_cast<uint32_t>(head >> 3) != want) return false;
+    }
     if (!hdrVarint(b, at, head)) return false;
     id = static_cast<uint32_t>(head >> 3);
     switch (head & 7)
@@ -776,7 +793,7 @@ bool hdrDecode(const std::vector<uint8_t> &b, uint32_t &id, HKind &kind, uint64_
  * while testing nothing. For the same reason an UNKNOWN tag skips rather than
  * being ignored the way reqMask() ignores it for a vector: a tag this reader
  * cannot evaluate is a tag it cannot claim to satisfy. */
-uint32_t hdrReqMask(const sofab_json_t *cj)
+uint32_t hdrReqMask(const sofab_json_t *cj, std::vector<std::string> *tags = nullptr)
 {
     uint32_t mask = 0;
     const sofab_json_t *req = sofab_json_get(cj, "requires");
@@ -785,13 +802,30 @@ uint32_t hdrReqMask(const sofab_json_t *cj)
         size_t tl; const char *tn = sofab_json_string(sofab_json_array_at(req, k), &tl);
         const uint32_t bit = tn ? capFromName(tn) : 0;
         mask |= bit ? bit : CAP_UNKNOWN;
+        if (tags) tags->emplace_back(tn ? tn : "", tn ? tl : 0);
     }
     return mask;
 }
 
-bool loadHeaderCases(const sofab_json_t *root, std::vector<HeaderCase> &out, std::string &err)
+/* Which of a gated case's own tags this build does not satisfy — so the summary
+ * can NAME the reason rather than report an unexplained skip. */
+std::string hdrGatedBy(const HeaderCase &c, uint32_t caps)
 {
-    const sofab_json_t *arr = group(root, "header_limits", err);
+    std::string why;
+    for (const std::string &t : c.reqTags)
+    {
+        const uint32_t bit = capFromName(t.c_str());
+        if (((bit ? bit : CAP_UNKNOWN) & ~caps) == 0) continue;
+        if (!why.empty()) why += ", ";
+        why += t;
+    }
+    return why.empty() ? std::string("(unknown)") : why;
+}
+
+bool loadHeaderCases(const sofab_json_t *root, const char *key, bool wantFrames,
+                     std::vector<HeaderCase> &out, std::string &err)
+{
+    const sofab_json_t *arr = group(root, key, err);
     if (!arr) return false;
     size_t n = sofab_json_array_size(arr);
     for (size_t i = 0; i < n; i++)
@@ -800,8 +834,24 @@ bool loadHeaderCases(const sofab_json_t *root, std::vector<HeaderCase> &out, std
         HeaderCase c;
         size_t nl; const char *nm = sofab_json_string(sofab_json_get(cj, "name"), &nl);
         c.name.assign(nm ? nm : "", nm ? nl : 0);
-        c.req = hdrReqMask(cj);
+        c.req = hdrReqMask(cj, &c.reqTags);
         c.fieldId = static_cast<uint32_t>(sofab_json_u64(sofab_json_get(cj, "field_id")));
+
+        /* `frames` is the ONE key the nested block adds, and the whole of what
+         * it adds. A flat case carrying one would bind its ceiling at the top
+         * level while its field arrived a frame down, so the key is refused
+         * there rather than ignored. */
+        const sofab_json_t *fr = sofab_json_get(cj, "frames");
+        if (wantFrames)
+        {
+            if (!fr || sofab_json_type(fr) != SOFAB_JSON_ARRAY || sofab_json_array_size(fr) == 0)
+            { err = c.name + ": a nested case needs a non-empty \"frames\" chain"; return false; }
+            for (size_t k = 0, nf = sofab_json_array_size(fr); k < nf; k++)
+                c.frames.push_back(
+                    static_cast<uint32_t>(sofab_json_u64(sofab_json_array_at(fr, k))));
+        }
+        else if (fr)
+        { err = c.name + ": \"frames\" outside the nested block"; return false; }
         const sofab_json_t *dec = sofab_json_get(cj, "declared");
         c.declared = dec ? static_cast<long>(sofab_json_i64(dec)) : -1;
 
@@ -866,8 +916,9 @@ bool loadHeaderCases(const sofab_json_t *root, std::vector<HeaderCase> &out, std
         uint32_t wireId = 0;
         uint64_t wireDeclared = 0;
         HKind wireKind{};
-        if (!hdrDecode(c.bytes, wireId, wireKind, wireDeclared))
-        { err = c.name + ": serialized is not a length/count header this reader knows"; return false; }
+        if (!hdrDecode(c.bytes, c.frames, wireId, wireKind, wireDeclared))
+        { err = c.name + ": serialized is not the frame chain plus a length/count "
+                         "header this reader knows"; return false; }
         if (wireId != c.fieldId)
         { err = c.name + ": the bytes declare id " + std::to_string(wireId) +
                 ", the case says field_id " + std::to_string(c.fieldId); return false; }
@@ -1053,32 +1104,145 @@ struct BoolMsg : sofab::IStreamMessage
 struct HeaderMsg : sofab::IStreamMessage
 {
     const HeaderCase *hc = nullptr;
+    /* >= 0: read under THIS ceiling instead of the case's. The negative control
+     * (see the nested block below) is the only caller that sets it, and it
+     * lifts the same KIND of ceiling the case states — a schema case keeps
+     * going through readString, a cap case through readStringCapped — because
+     * lifting the other one would leave the rejection in place and prove
+     * nothing. */
+    long lifted = -1;
     int others = 0;
     std::string text;
     std::vector<uint8_t> blob;
     std::vector<uint64_t> nums;
 
+    /* Nothing was materialised for the field: §6.2.1 is "rejected, never
+     * clamped", so a ceiling that fired must leave the destination untouched. */
+    [[nodiscard]] bool untouched() const { return text.empty() && blob.empty() && nums.empty(); }
+
     void deserialize(sofab::IStreamImpl &is, sofab::id id, size_t, size_t) noexcept override
     {
         if (!hc || id != hc->fieldId) { ++others; return; }
         const bool capped = hc->ceiling == HCeil::Cap;
+        const long ceiling = lifted >= 0 ? lifted : hc->bound;
         switch (hc->kind)
         {
             case HKind::Str:
-                if (capped) (void)sofab::readStringCapped(is, text, hc->bound);
-                else        (void)sofab::readString(is, text, hc->bound);
+                if (capped) (void)sofab::readStringCapped(is, text, ceiling);
+                else        (void)sofab::readString(is, text, ceiling);
                 break;
             case HKind::Blob:
-                if (capped) (void)sofab::readBlobCapped(is, blob, hc->bound);
-                else        (void)sofab::readBlob(is, blob, hc->bound);
+                if (capped) (void)sofab::readBlobCapped(is, blob, ceiling);
+                else        (void)sofab::readBlob(is, blob, ceiling);
                 break;
             case HKind::Arr:
-                if (capped) (void)sofab::readArrayCapped(is, nums, hc->bound);
-                else        (void)sofab::readArray(is, nums, hc->bound);
+                if (capped) (void)sofab::readArrayCapped(is, nums, ceiling);
+                else        (void)sofab::readArray(is, nums, ceiling);
                 break;
         }
     }
 };
+
+/* --- the same ceiling one or two frames deeper ("header_limits_nested") ------
+ *
+ * Every case of the flat block puts its field at the top level, which leaves
+ * one axis untested: the IDENTICAL over-ceiling header delivered INSIDE an open
+ * sequence. This block is that axis and only that axis — same keys, same
+ * outcome vocabulary, same terminality rule, same pairing of each rejection
+ * with an in-cap control — plus `frames`, the chain of sequence field ids the
+ * target field is nested in.
+ *
+ *     3e 1e 02 a2 06   then EOF
+ *     ^^ id 7, wire type 6: open a sequence          frames[0]
+ *        ^^ id 3, wire type 6: open another          frames[1]
+ *           ^^^^^^^^ the flat block's own bytes, now two frames down
+ *
+ * Depth is its own axis because a port can carry the SCHEMA bound into a
+ * sequence and leave the RECEIVER CAP bound at the top level, where these bytes
+ * never reach it — and then answer `incomplete` for a reason that looks
+ * entirely plausible, because a frame really is open.
+ *
+ * That plausibility is why the negative control below is load-bearing here and
+ * not merely good practice: these cases end at end-of-input with one or two
+ * frames unclosed, so `incomplete` has a SECOND, independent justification. A
+ * port that rejected for some unrelated reason — a depth guard, a refusal of
+ * unclosed frames — would pass the forward pass without ever consulting the
+ * ceiling under test. Only lifting the ceiling and watching the answer change
+ * tells the two apart. --- */
+
+/* One link of the frame chain. At depth d it binds the sequence the case names
+ * at frames[d] and descends; at the innermost depth it delegates to the FLAT
+ * block's leaf, unchanged. Sharing that leaf is the point: the two blocks are
+ * required to differ in where the field arrives and in nothing else, and a
+ * nested leaf of its own could pass by a mechanism the flat one never uses.
+ *
+ * A resumed delivery (§6.6.2, a chunk boundary inside the sequence) needs no
+ * special case: the decoder replays the open levels' field ids, so dispatching
+ * on the id re-enters exactly the same link. */
+struct NestedFrame : sofab::IStreamMessage
+{
+    const std::vector<uint32_t> *frames = nullptr;
+    size_t depth = 0;
+    NestedFrame *child = nullptr;
+    HeaderMsg *leaf = nullptr;
+
+    void deserialize(sofab::IStreamImpl &is, sofab::id id, size_t size, size_t count) noexcept override
+    {
+        if (frames && depth < frames->size())
+        {
+            if (id == static_cast<sofab::id>((*frames)[depth]) && child) is.read(*child);
+            return;                       /* anything else at this depth: let it skip */
+        }
+        if (leaf) leaf->deserialize(is, id, size, count);
+    }
+};
+
+/* The whole receiver for one nested case: the stream, the chain built to the
+ * case's exact depth (outermost first), and the shared leaf at the bottom. */
+struct NestedRig
+{
+    sofab::IStreamObject<NestedFrame> in{kMaxSpan};
+    HeaderMsg leaf;
+    std::vector<NestedFrame> deeper;   // depths 1..n; depth 0 is the stream's own handler
+    std::vector<uint32_t> frames;
+
+    NestedRig(const HeaderCase &c, long lifted)
+        : deeper(c.frames.size()), frames(c.frames)
+    {
+        leaf.hc = &c;
+        leaf.lifted = lifted;
+        (*in).frames = &frames;
+        (*in).depth = 0;
+        (*in).leaf = &leaf;
+        (*in).child = deeper.empty() ? nullptr : &deeper[0];
+        for (size_t d = 0; d < deeper.size(); d++)
+        {
+            deeper[d].frames = &frames;
+            deeper[d].depth = d + 1;
+            deeper[d].leaf = &leaf;
+            deeper[d].child = (d + 1 < deeper.size()) ? &deeper[d + 1] : nullptr;
+        }
+    }
+
+    sofab::Error feed(const std::vector<uint8_t> &b)
+    {
+        return in.feed(b.data(), b.size()).code();
+    }
+};
+
+sofab::Error hdrWant(HOut o)
+{
+    return o == HOut::LimitExceeded ? sofab::Error::LimitExceeded
+         : o == HOut::Invalid       ? sofab::Error::InvalidMessage
+                                    : sofab::Error::Incomplete;
+}
+
+const char *hdrWantName(HOut o)
+{
+    return o == HOut::LimitExceeded ? "limit_exceeded"
+         : o == HOut::Invalid       ? "invalid"
+                                    : "incomplete";
+}
 
 /* --- envelope-drift guard (corelib-cpp#100) ---------------------------------
  *
@@ -1091,8 +1255,9 @@ struct HeaderMsg : sofab::IStreamMessage
 struct EnvelopeWalk
 {
     bool parsed = false;
-    bool vectorsOk = false, negOk = false, growthOk = false, headerOk = false, boolOk = false;
-    size_t nVectors = 0, nNeg = 0, nGrowth = 0, nHeader = 0, nBool = 0;
+    bool vectorsOk = false, negOk = false, growthOk = false, headerOk = false;
+    bool nestedOk = false, boolOk = false;
+    size_t nVectors = 0, nNeg = 0, nGrowth = 0, nHeader = 0, nNested = 0, nBool = 0;
 };
 
 EnvelopeWalk walkEnvelope(const char *json)
@@ -1106,17 +1271,20 @@ EnvelopeWalk walkEnvelope(const char *json)
     std::vector<NegVec> ns;
     std::vector<GrowthCase> gs;
     std::vector<HeaderCase> hs;
+    std::vector<HeaderCase> hns;
     std::vector<BoolCase> bs;
     std::string e;
     w.vectorsOk = loadVectors(root, vs, e);
     w.negOk = loadNegVectors(root, ns, e);
     w.growthOk = loadGrowthCases(root, gs, e);
-    w.headerOk = loadHeaderCases(root, hs, e);
+    w.headerOk = loadHeaderCases(root, "header_limits", false, hs, e);
+    w.nestedOk = loadHeaderCases(root, "header_limits_nested", true, hns, e);
     w.boolOk = loadBoolCases(root, bs, e);
     w.nVectors = vs.size();
     w.nNeg = ns.size();
     w.nGrowth = gs.size();
     w.nHeader = hs.size();
+    w.nNested = hns.size();
     w.nBool = bs.size();
     sofab_json_free(root);
     return w;
@@ -1727,7 +1895,7 @@ int main()
      *     is a fixed byte string that DECLARES a length or count and then ends,
      *     fed under the ceiling the case itself names. --- */
     std::vector<HeaderCase> headers;
-    if (!loadHeaderCases(vf.root, headers, err))
+    if (!loadHeaderCases(vf.root, "header_limits", false, headers, err))
     {
         std::printf("header_limits load failed: %s\n", err.c_str());
         return 2;
@@ -1738,12 +1906,8 @@ int main()
         if (c.req & ~caps) { ++headerSkipped; continue; }   /* SKIP, for every tag */
         ++headerRun;
         const auto label = named(c.name.c_str());
-        const sofab::Error want = c.want == HOut::LimitExceeded ? sofab::Error::LimitExceeded
-                                : c.want == HOut::Invalid       ? sofab::Error::InvalidMessage
-                                                                : sofab::Error::Incomplete;
-        const char *wantName = c.want == HOut::LimitExceeded ? "limit_exceeded"
-                             : c.want == HOut::Invalid       ? "invalid"
-                                                             : "incomplete";
+        const sofab::Error want = hdrWant(c.want);
+        const char *wantName = hdrWantName(c.want);
 
         sofab::IStreamObject<HeaderMsg> in{kMaxSpan};
         (*in).hc = &c;
@@ -1765,7 +1929,7 @@ int main()
         /* ARCHITECTURE §9.5: "a claimed oversize fails fast even if the payload
          * never arrives" — the ceiling answered at the word, before the
          * destination was sized, so nothing was materialised for it. */
-        run((*in).text.empty() && (*in).blob.empty() && (*in).nums.empty(), label,
+        run((*in).untouched(), label,
             "header-nothing-materialised",
             "the rejected header still left a value in the destination");
         if (c.terminal)
@@ -1793,6 +1957,147 @@ int main()
         "header-limits-controls", "ran " + std::to_string(headerRejects) +
             " rejection cases and " + std::to_string(headerRun - headerRejects) +
             " in-cap controls; the block needs both");
+
+    /* --- header ceilings one and two frames deeper (top-level
+     *     "header_limits_nested", §6.2.1/§6.3). The same bytes the flat block
+     *     feeds, delivered INSIDE the sequence chain the case names, against a
+     *     receiver built to exactly that depth. See the NestedFrame note. --- */
+    std::vector<HeaderCase> nested;
+    if (!loadHeaderCases(vf.root, "header_limits_nested", true, nested, err))
+    {
+        std::printf("header_limits_nested load failed: %s\n", err.c_str());
+        return 2;
+    }
+    int nestedRan = 0, nestedGated = 0, nestedRejects = 0, nestedDeep = 0;
+    std::vector<std::string> nestedGatedBy;
+    for (const HeaderCase &c : nested)
+    {
+        if (c.req & ~caps)                              /* SKIP, for every tag */
+        {
+            ++nestedGated;
+            nestedGatedBy.push_back(c.name + " (" + hdrGatedBy(c, caps) + ")");
+            continue;
+        }
+        ++nestedRan;
+        if (c.frames.size() >= 2) ++nestedDeep;
+        const auto label = named(c.name.c_str());
+        const sofab::Error want = hdrWant(c.want);
+        const char *wantName = hdrWantName(c.want);
+
+        NestedRig rig{c, /*lifted=*/-1};
+        sofab::Error code = sofab::Error::None;
+        if (c.chunks.empty())
+            code = rig.feed(c.bytes);
+        else
+        {
+            /* No case in this block carries `chunks` today; the two blocks share
+             * a key set, so it is honoured anyway — and every feed BEFORE the
+             * last must answer `incomplete`, since an earlier verdict would mean
+             * the decoder answered on bytes it had not seen. */
+            for (size_t k = 0; k < c.chunks.size(); k++)
+            {
+                code = rig.feed(c.chunks[k]);
+                if (k + 1 < c.chunks.size())
+                    run(code == sofab::Error::Incomplete, label, "nested-chunk-incomplete",
+                        "chunk " + std::to_string(k) + " answered before the last feed: code " +
+                            std::to_string(static_cast<int>(code)));
+            }
+        }
+        run(code == want, label, "nested-outcome",
+            std::string("expected ") + wantName + ", got code " +
+                std::to_string(static_cast<int>(code)));
+
+        if (c.want == HOut::Incomplete) continue;       /* more bytes may still lift it */
+        ++nestedRejects;
+        run(rig.leaf.untouched(), label, "nested-nothing-materialised",
+            "the rejected header still left a value in the destination");
+        if (c.terminal)
+        {
+            /* The payload the header promised: bytes that WOULD complete the
+             * field if anything could. Asking the stream what its last error was
+             * would not distinguish a decoder that consumes them and moves on. */
+            const std::vector<uint8_t> more(8, 0x61);
+            const int othersBefore = rig.leaf.others;
+            const sofab::Error after = rig.in.feed(more.data(), more.size()).code();
+            run(after == want, label, "nested-terminal",
+                "the rejection did not survive the next feed: code " +
+                    std::to_string(static_cast<int>(after)));
+            run(rig.leaf.others == othersBefore, label, "nested-terminal-consumes-nothing",
+                "a field was delivered after the terminal rejection");
+            /* Checked AFTER the second feed, so a LATE materialisation is caught
+             * too — clamping that also reports the error passes every other
+             * assertion here. */
+            run(rig.leaf.untouched(), label, "nested-terminal-still-empty",
+                "a value appeared in the destination after the terminal rejection");
+        }
+    }
+
+    /* THE NEGATIVE CONTROL, and the reason this block can claim to test
+     * anything. A second, independent pass with the ceiling LIFTED: the
+     * rejection must go away. If it does not, the bytes were refused by
+     * something other than the ceiling — the open frames at end-of-input are an
+     * entirely sufficient reason to answer `incomplete`, and a depth guard or a
+     * strict-mode path would produce a rejection that looks identical. Assert
+     * only that the answer CHANGED, not what it changed to: what is being
+     * proved is that the ceiling caused it. */
+    {
+        constexpr long kLifted = 1 << 16;   /* far above every `declared` here */
+        int controlled = 0;
+        for (const HeaderCase &c : nested)
+        {
+            if (c.req & ~caps) continue;
+            if (c.want == HOut::Incomplete) continue;   /* only a rejection can be lifted */
+            const auto label = named(c.name.c_str());
+            /* Lift the same KIND the case states: NestedRig routes `lifted`
+             * through the same capped/bounded read the forward pass used, so a
+             * schema case gets a lifted schema bound and a cap case a lifted
+             * receiver cap. Lifting the other one would change nothing. */
+            NestedRig rig{c, kLifted};
+            sofab::Error code = sofab::Error::None;
+            if (c.chunks.empty()) code = rig.feed(c.bytes);
+            else for (const std::vector<uint8_t> &part : c.chunks) code = rig.feed(part);
+            ++controlled;
+            run(code != hdrWant(c.want), label, "nested-control-ceiling-caused-it",
+                std::string("with the ceiling lifted to ") + std::to_string(kLifted) +
+                    " the answer is still " + hdrWantName(c.want) +
+                    ", so the rejection did not come from the ceiling");
+        }
+        /* A control loop that examined nothing is green and proves nothing, so
+         * the count is asserted — against the number the FORWARD pass counted,
+         * which is computed independently of this loop, and against the absolute
+         * four when nothing was gated. Every rejection in this block is
+         * reachable with a lifted ceiling: unlike the flat block's 1 GiB
+         * amplification case, which is exactly the allocation §6.2.1 exists to
+         * prevent, none of these declares a size too large to admit, so the
+         * control has no exemption and covers all of them. */
+        run(controlled == nestedRejects && controlled > 0, named("(all)"),
+            "nested-control-count", "the control checked " + std::to_string(controlled) +
+                " cases, the forward pass saw " + std::to_string(nestedRejects) +
+                " rejections");
+        run(nestedGated > 0 || controlled == 4, named("(all)"), "nested-control-count-full",
+            "nothing was gated, so the control must cover all four rejections; it checked " +
+                std::to_string(controlled));
+    }
+
+    run(nestedRan + nestedGated == static_cast<int>(nested.size()), named("(all)"),
+        "nested-ran-plus-gated", "ran " + std::to_string(nestedRan) + " + gated " +
+            std::to_string(nestedGated) + " != " + std::to_string(nested.size()) + " cases");
+    /* This build compiles nothing out and carries §6.2.1 receiver caps, so it
+     * runs the block whole; a port that legitimately gates must stay
+     * distinguishable in the output from one whose capability probe broke. */
+    run(nestedGated == 0 && nestedRan == static_cast<int>(nested.size()), named("(all)"),
+        "nested-ran", "ran " + std::to_string(nestedRan) + " of " +
+            std::to_string(nested.size()) + " header_limits_nested cases");
+    run(nestedRejects > 0 && nestedRan - nestedRejects > 0, named("(all)"),
+        "nested-controls", "ran " + std::to_string(nestedRejects) +
+            " rejection cases and " + std::to_string(nestedRan - nestedRejects) +
+            " in-cap controls; the block needs both");
+    /* Depth 2 exists because one level may be special-cased — a chain builder
+     * off by one descends once and then treats the INNER sequence header as the
+     * target field. A run that only ever saw frames of length 1 would not catch
+     * that, so its presence is asserted rather than assumed. */
+    run(nestedDeep > 0, named("(all)"), "nested-depth2-ran",
+        "no case with two frames ran; depth 2 is a separate axis from depth 1");
 
     /* --- boolean tolerance (top-level "boolean_tolerant", CORELIB_PLAN §4.4).
      *     Bytes nobody's conforming encoder emits, decoded through the BOOLEAN
@@ -2015,6 +2320,15 @@ int main()
                                    "\"limits\":{\"max_dyn_string_len\":16},"
                                    "\"serialized\":\"02a206\","
                                    "\"expect\":{\"outcome\":\"limit_exceeded\",\"terminal\":true}}";
+        /* The same case a frame deeper: the nested walker owns its own key and
+         * demands the `frames` chain, so a file that dropped the key -- or an
+         * upstream rename -- is a loud failure rather than a silent run of
+         * nothing. */
+        static const char kNst[] = "{\"name\":\"hn\",\"field_id\":0,\"declared\":100,"
+                                   "\"frames\":[7],"
+                                   "\"limits\":{\"max_dyn_string_len\":16},"
+                                   "\"serialized\":\"3e02a206\","
+                                   "\"expect\":{\"outcome\":\"limit_exceeded\",\"terminal\":true}}";
         static const char kBool[] = "{\"name\":\"b\",\"requires\":[],\"id\":0,"
                                     "\"serialized_hex\":\"0002\","
                                     "\"expect\":{\"outcome\":\"complete\",\"values\":[true],"
@@ -2023,30 +2337,42 @@ int main()
                                   "],\"invalid_utf8\":[" + kNeg +
                                   "],\"sequence_growth\":[" + kGro +
                                   "],\"header_limits\":[" + kHdr +
+                                  "],\"header_limits_nested\":[" + kNst +
                                   "],\"boolean_tolerant\":[" + kBool + "]}";
         const std::string onlyV = std::string("{\"vectors\":[") + kVec + "]}";
         const std::string onlyN = std::string("{\"invalid_utf8\":[") + kNeg + "]}";
         const std::string onlyG = std::string("{\"sequence_growth\":[") + kGro + "]}";
         const std::string onlyH = std::string("{\"header_limits\":[") + kHdr + "]}";
+        const std::string onlyX = std::string("{\"header_limits_nested\":[") + kNst + "]}";
         const std::string onlyB = std::string("{\"boolean_tolerant\":[") + kBool + "]}";
+        /* `frames` belongs to the nested block alone: in the flat one it would
+         * bind the ceiling at the top level while the field arrived a frame
+         * down, so the flat walker refuses it instead of ignoring it. */
+        const std::string crossed = std::string("{\"header_limits\":[") + kNst + "]}";
+        const std::string flatDeep = std::string("{\"header_limits_nested\":[") + kHdr + "]}";
         const std::string empty = "{\"vectors\":[],\"invalid_utf8\":[],\"sequence_growth\":[],"
-                                  "\"header_limits\":[],\"boolean_tolerant\":[]}";
+                                  "\"header_limits\":[],\"header_limits_nested\":[],"
+                                  "\"boolean_tolerant\":[]}";
         const std::string drift = std::string("{\"vectors_v2\":[") + kVec +
                                   "],\"invalid_utf8_v2\":[" + kNeg +
                                   "],\"sequence_growth_v2\":[" + kGro +
                                   "],\"header_limits_v2\":[" + kHdr +
+                                  "],\"header_limits_nested_v2\":[" + kNst +
                                   "],\"boolean_tolerant_v2\":[" + kBool + "]}";
 
         const struct { const char *label; const std::string &json;
-                       bool wantV, wantN, wantG, wantH, wantB; } cases[] = {
-            {"envelope-all-groups",           both,  true,  true,  true,  true,  true },
-            {"envelope-no-invalid_utf8",      onlyV, true,  false, false, false, false},
-            {"envelope-no-vectors",           onlyN, false, true,  false, false, false},
-            {"envelope-only-sequence_growth", onlyG, false, false, true,  false, false},
-            {"envelope-only-header_limits",   onlyH, false, false, false, true,  false},
-            {"envelope-only-boolean_tolerant",onlyB, false, false, false, false, true },
-            {"envelope-empty-groups",         empty, false, false, false, false, false},
-            {"envelope-renamed-keys",         drift, false, false, false, false, false},
+                       bool wantV, wantN, wantG, wantH, wantX, wantB; } cases[] = {
+            {"envelope-all-groups",           both,  true,  true,  true,  true,  true,  true },
+            {"envelope-no-invalid_utf8",      onlyV, true,  false, false, false, false, false},
+            {"envelope-no-vectors",           onlyN, false, true,  false, false, false, false},
+            {"envelope-only-sequence_growth", onlyG, false, false, true,  false, false, false},
+            {"envelope-only-header_limits",   onlyH, false, false, false, true,  false, false},
+            {"envelope-only-header_limits_nested", onlyX, false, false, false, false, true,  false},
+            {"envelope-only-boolean_tolerant", onlyB, false, false, false, false, false, true },
+            {"envelope-frames-in-flat-block", crossed, false, false, false, false, false, false},
+            {"envelope-nested-without-frames", flatDeep, false, false, false, false, false, false},
+            {"envelope-empty-groups",         empty, false, false, false, false, false, false},
+            {"envelope-renamed-keys",         drift, false, false, false, false, false, false},
         };
         for (const auto &c : cases)
         {
@@ -2058,6 +2384,7 @@ int main()
                             w.negOk == c.wantN && (w.nNeg > 0) == c.wantN &&
                             w.growthOk == c.wantG && (w.nGrowth > 0) == c.wantG &&
                             w.headerOk == c.wantH && (w.nHeader > 0) == c.wantH &&
+                            w.nestedOk == c.wantX && (w.nNested > 0) == c.wantX &&
                             w.boolOk == c.wantB && (w.nBool > 0) == c.wantB;
             run(ok, named("(all)"), c.label,
                 !w.parsed ? std::string("probe envelope did not parse")
@@ -2069,12 +2396,15 @@ int main()
                                 " n=" + std::to_string(w.nGrowth) +
                                 ", header_limits ok=" + std::to_string(static_cast<int>(w.headerOk)) +
                                 " n=" + std::to_string(w.nHeader) +
+                                ", header_limits_nested ok=" + std::to_string(static_cast<int>(w.nestedOk)) +
+                                " n=" + std::to_string(w.nNested) +
                                 ", boolean_tolerant ok=" + std::to_string(static_cast<int>(w.boolOk)) +
                                 " n=" + std::to_string(w.nBool) + "; expected ok " +
                                 std::to_string(static_cast<int>(c.wantV)) + "/" +
                                 std::to_string(static_cast<int>(c.wantN)) + "/" +
                                 std::to_string(static_cast<int>(c.wantG)) + "/" +
                                 std::to_string(static_cast<int>(c.wantH)) + "/" +
+                                std::to_string(static_cast<int>(c.wantX)) + "/" +
                                 std::to_string(static_cast<int>(c.wantB)));
         }
     }
@@ -2090,6 +2420,14 @@ int main()
     std::printf("%zu header_limits cases, %d run (%d rejections, %d in-cap controls), "
                 "%d skipped\n", headers.size(), headerRun, headerRejects,
                 headerRun - headerRejects, headerSkipped);
+    /* ran and gated, both stated: a capability probe that broke, or a tag this
+     * reader stopped recognising, turns the block into a no-op that reports
+     * green, and the two numbers summing to the total is the cheap guard. */
+    std::printf("%zu header_limits_nested cases, %d run (%d rejections, %d in-cap controls, "
+                "%d at depth 2), %d gated\n", nested.size(), nestedRan, nestedRejects,
+                nestedRan - nestedRejects, nestedDeep, nestedGated);
+    for (const std::string &g : nestedGatedBy)
+        std::printf("  gated: %s\n", g.c_str());
     std::printf("%zu boolean_tolerant cases found, %d decoded, %d rejected "
                 "(unsatisfied requires), %d checks\n",
                 bools.size(), boolDecoded, boolRejected, boolChecks);
