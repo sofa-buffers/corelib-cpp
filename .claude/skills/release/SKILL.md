@@ -20,7 +20,8 @@ version *without* the `v` (`1.2.3`); the workflow strips it (`${GITHUB_REF_NAME#
 would not even trigger the consistency check (`tags: [ 'v*' ]`).
 
 The flow mirrors v0.10.0: a `release/vX.Y.Z` branch with one `chore(release): X.Y.Z`
-commit → PR → merge → GitHub Release that creates the tag on the merge commit.
+commit → PR → rebase-merge → GitHub Release that creates the tag on the new `main` HEAD
+(the `chore(release)` commit; there is no merge commit — see step 5).
 
 Target version: `$ARGUMENTS` (if empty, propose one in step 2 and ask).
 
@@ -100,12 +101,13 @@ in line with the `vX.Y.Z` tag that follows this merge. The git tag stays the sou
 truth." — then what changed since the previous tag, **naming every breaking change** with
 its Crucible finding / CORELIB_PLAN § reference, and why that makes it minor vs. patch.
 
-Wait for CI to be green, then merge (ask the user first; try `gh pr merge` once —
-if refused, hand the user the command).
+Wait for CI to be green, then merge (ask the user first). **The repo allows rebase merges
+only** — merge commits and squash are disabled — so it is `gh pr merge <N> --rebase`. Try it
+once; if refused, hand the user the command.
 
 ## 6. Tag + GitHub Release
 
-Only after the merge, on the merge commit on `main`:
+Only after the merge, on the new `main` HEAD (the rebased `chore(release)` commit):
 
 ```bash
 git checkout main && git pull -p
@@ -126,6 +128,6 @@ gh run watch <run-id>
 If it fails, a manifest disagrees with the tag: do **not** move the tag silently — report
 to the user (fix = new patch release, or delete + re-create the tag only with explicit OK).
 
-Finally delete the release branch locally (`git branch -D release/vX.Y.Z` — ask, it is a
-squash/merge-deleted branch) and report: version, PR, release URL, consistency-check result.
+Finally delete the release branch locally (`git branch -D release/vX.Y.Z` — ask; after a
+rebase merge its commit has a new hash on `main`, so `-d` refuses) and report: version, PR, release URL, consistency-check result.
 Never touch `origin/badges`.
