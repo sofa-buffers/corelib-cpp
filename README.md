@@ -826,16 +826,16 @@ compiled at `-O3` (lower is better, **bold** is the row's winner):
 
 | Workload | C | C++ wrapper | this (pure C++20) |
 |---|--:|--:|--:|
-| encode: u64 array (1000)   |    125 999 |    126 028 | **35 046** (−72 %) |
-| encode: typical message    |        966 |      1 063 | **226** (−77 %) |
+| encode: u64 array (1000)   |    125 999 |    126 028 | **35 033** (−72 %) |
+| encode: typical message    |        966 |      1 063 | **204** (−79 %) |
 | encode: blob 1MB one-shot  | 10 000 162 | 10 000 191 | **1 000 026** (−90 %) |
-| encode: blob 1MB streaming | **10 004 819** | 10 009 790 | 13 009 127 (+30 %) |
-| encode: composite          |     16 164 |     16 501 | **11 514** (−29 %) |
-| decode: u64 array (1000)   |    300 432 |    300 433 | **43 839** (−85 %) |
-| decode: typical message    |      2 109 |      2 108 | **1 275** (−40 %) |
-| decode: blob 1MB           | 25 011 323 | 25 011 327 | **3 654 639** (−85 %) |
-| decode: composite          |     32 168 |     36 533 | **22 417** (−30 %) |
-| decode: composite skip-all |     25 411 |     25 411 | **7 671** (−70 %) |
+| encode: blob 1MB streaming | **10 004 819** | 10 009 790 | 13 009 117 (+30 %) |
+| encode: composite          |     16 164 |     16 501 | **11 494** (−29 %) |
+| decode: u64 array (1000)   |    303 434 |    303 438 | **41 852** (−86 %) |
+| decode: typical message    |      2 165 |      2 167 | **1 425** (−34 %) |
+| decode: blob 1MB           | 25 011 325 | 25 011 332 | **284 314** (−99 %) |
+| decode: composite          |     32 340 |     36 708 | **25 159** (−22 %) |
+| decode: composite skip-all |     25 570 |     25 573 | **8 373** (−67 %) |
 
 Percentages are against the C column. The last column is this tree, reproduced
 with `bash bench/run_callgrind.sh`; the two C columns are the current reading
@@ -848,7 +848,7 @@ library **13× more instructions** to put the same megabyte through a 4096-byte
 buffer with a flush sink than to write it contiguously: `pushBytes` falls back to
 a byte-at-a-time loop the moment the run does not fit the buffer, where the
 one-shot row takes the `memcpy` branch. And `decode: composite skip-all` costs
-**7 671** against **22 417** to decode it, so about two-thirds of a decode is the
+**8 373** against **25 159** to decode it, so about two-thirds of a decode is the
 destinations, not the parse.
 
 **`encode: blob 1MB streaming` is the one row this library loses.** The C core has
@@ -859,7 +859,7 @@ Optimising for the buffer that holds the whole message does not pay when the
 buffer deliberately cannot. Closing the gap means a bounded `memcpy` per flush
 window instead of the byte loop.
 
-On the nine rows it wins, the pure-C++20 port is **1.4× to 10× cheaper** because
+On the nine rows it wins, the pure-C++20 port is **1.3× to 88× cheaper** because
 it fuses header+value writes, composes fields straight into the buffer, and
 parses in place without the C port's per-field bookkeeping. The narrowest margins
 are the `composite` rows, where the message is mostly small varlen fields and
