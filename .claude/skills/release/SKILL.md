@@ -13,6 +13,12 @@ Every manifest that carries a version must equal the tag *at the tagged commit*,
 `v*` tag pushes only) fails the tag. Between releases a manifest may run ahead of the
 newest tag — that is correct, not broken.
 
+**Tag format: a lowercase `v` followed by the bare version**, e.g. `v1.2.3` — never `1.2.3`,
+`V1.2.3` or `v1.2.3-foo` unless the user asks for a pre-release suffix. The manifests carry the
+version *without* the `v` (`1.2.3`); the workflow strips it (`${GITHUB_REF_NAME#v}`). If
+`$ARGUMENTS` is given as `v1.2.3`, strip the `v` for the manifests. A tag without the `v`
+would not even trigger the consistency check (`tags: [ 'v*' ]`).
+
 The flow mirrors v0.10.0: a `release/vX.Y.Z` branch with one `chore(release): X.Y.Z`
 commit → PR → merge → GitHub Release that creates the tag on the merge commit.
 
