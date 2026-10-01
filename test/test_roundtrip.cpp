@@ -8627,6 +8627,201 @@ static void decoderReuseAcrossTypes()
     checkStreamReuse<Utf8SkipMsg>("Utf8SkipMsg");
 }
 
+/* --- RowSeq: a row the stream cannot read on its own -----------------------
+ *
+ * A row that is itself a wrapper sequence (array<array<string>>) is neither a
+ * message nor a span of scalars, so MessageSeq cannot read it; RowSeq takes the
+ * row read from the caller and owns everything else -- the §7.3 skip, the index
+ * bound in §6.3's categories, the placement and the §7.4 reset. None of that is
+ * wire-visible from the encoder's side, so it is pinned here.
+ *
+ * Wire notes: a tag byte is (id << 3) | wire, a string element is `02 0a 41`
+ * (id 0, fixlen word len 1 / subtype string, "A"), and a row is a sequence of
+ * those closed by `07`. --- */
+
+/* The row read for array<array<string>>, row `count: 3`, element `maxlen: 8`. */
+struct StrRowReader
+{
+    static constexpr sofab::detail::Wire wire() noexcept { return sofab::detail::Wire::SequenceStart; }
+    void operator()(sofab::IStreamImpl &is, std::vector<std::string> &row) const noexcept
+    {
+        sofab::StringSeq c{row, 3, 8, -1, -1};
+        sofab::read(is, c);
+    }
+};
+
+/* The same row in heap-free storage. */
+struct FixedStrRowReader
+{
+    static constexpr sofab::detail::Wire wire() noexcept { return sofab::detail::Wire::SequenceStart; }
+    void operator()(sofab::IStreamImpl &is, sofab::InlineVector<sofab::FixedString<8>, 3> &row) const noexcept
+    {
+        sofab::StringSeq c{row, 3, 8, -1, -1};
+        sofab::read(is, c);
+    }
+};
+
+/* A row that arrives as a native array but has to be read by the caller -- the
+ * shape of an enum or boolean row, which binds through a view of its elements. */
+struct ByteRowReader
+{
+    static constexpr sofab::detail::Wire wire() noexcept { return sofab::detail::Wire::ArrayUnsigned; }
+    void operator()(sofab::IStreamImpl &is, std::vector<uint8_t> &row) const noexcept
+    {
+        (void)sofab::readArray(is, row, 3);
+    }
+};
+
+struct RowSeqMsg : sofab::IStreamMessage
+{
+    std::vector<std::vector<std::string>> grid;                            /* id 1 -- count 3 */
+    std::vector<std::vector<std::string>> open;                            /* id 2 -- unbounded, cap 4 */
+    sofab::InlineVector<sofab::InlineVector<sofab::FixedString<8>, 3>, 2> fixed; /* id 3 -- count 2 */
+    std::vector<std::vector<std::string>> nobound;                         /* id 4 -- unbounded, no cap */
+    std::vector<std::vector<uint8_t>> bytes;                               /* id 5 -- count 2 */
+    void deserialize(sofab::IStreamImpl &is, sofab::id id, size_t, size_t) noexcept override
+    {
+        switch (id)
+        {
+            case 1: { sofab::RowSeq c{grid, 3, -1, StrRowReader{}}; sofab::read(is, c); break; }
+            case 2: { sofab::RowSeq c{open, -1, 4, StrRowReader{}}; sofab::read(is, c); break; }
+            case 3: { sofab::RowSeq c{fixed, 2, -1, FixedStrRowReader{}}; sofab::read(is, c); break; }
+            case 4: { sofab::RowSeq c{nobound, -1, -1, StrRowReader{}}; sofab::read(is, c); break; }
+            case 5: { sofab::RowSeq c{bytes, 2, -1, ByteRowReader{}}; sofab::read(is, c); break; }
+        }
+    }
+};
+
+static_assert(std::is_same_v<decltype(sofab::RowSeq{std::declval<std::vector<std::vector<std::string>> &>(), 1L, 1L,
+                                                    StrRowReader{}})::Container,
+                             std::vector<std::vector<std::string>>>,
+              "RowSeq deduces its container from the destination");
+static_assert(sofab::RowSeq<std::vector<std::vector<std::string>>, StrRowReader>::elemWire
+                  == static_cast<int>(sofab::detail::Wire::SequenceStart),
+              "RowSeq publishes the reader's row wire type to the stream");
+static_assert(sofab::RowSeq<sofab::InlineVector<sofab::InlineVector<sofab::FixedString<8>, 3>, 2>,
+                            FixedStrRowReader>::elemDestCap == 2,
+              "RowSeq publishes a heap-free destination's capacity");
+static_assert(sizeof(sofab::RowSeq<std::vector<std::vector<std::string>>, StrRowReader>)
+                  == sizeof(sofab::RowSeq<std::vector<std::vector<std::string>>, ByteRowReader>),
+              "a stateless reader costs the collector nothing");
+
+static void rowSeqCollector()
+{
+    auto feed = [](const char *hex) {
+        sofab::IStreamObject<RowSeqMsg> in{kMaxSpan};
+        auto w = fromHex(hex);
+        auto r = in.feed(w.data(), w.size());
+        return std::pair<sofab::IStreamImpl::Result, RowSeqMsg>{r, *in};
+    };
+
+    /* §5.1: rows at id 0 and id 2 are the THREE-row array [["A"], [], ["B"]]. */
+    const char *gap = "0e 06 020a41 07 16 020a42 07 07";
+    {
+        auto [r, m] = feed(gap);
+        CHECK(r.complete(), "RowSeq: the id-gap wire decodes COMPLETE");
+        CHECK(m.grid.size() == 3, "RowSeq: the id gap is filled, length 3");
+        if (m.grid.size() == 3)
+            CHECK(m.grid[0] == std::vector<std::string>{"A"} && m.grid[1].empty()
+                      && m.grid[2] == std::vector<std::string>{"B"},
+                  "RowSeq: every row lands at its id: [[A], [], [B]]");
+    }
+    {
+        /* The same wire, one byte per feed: a row re-entered after a chunk
+         * boundary is the SAME occurrence, so nothing already placed is reset. */
+        sofab::IStreamObject<RowSeqMsg> in{kMaxSpan};
+        auto w = fromHex(gap);
+        bool complete = false;
+        for (size_t i = 0; i < w.size(); ++i) complete = in.feed(&w[i], 1).complete();
+        CHECK(complete, "RowSeq: byte-by-byte feed decodes COMPLETE");
+        CHECK((*in).grid.size() == 3 && (*in).grid[0] == std::vector<std::string>{"A"}
+                  && (*in).grid[2] == std::vector<std::string>{"B"},
+              "RowSeq: byte-by-byte feed places the same rows");
+    }
+
+    /* §7.3 before §5.1: an over-index element that IS a row is INVALID, one that
+     * contradicts the row's wire type is not an element at all and is skipped. */
+    {
+        auto [r, m] = feed("0e 1e 07 07");
+        (void)m;
+        CHECK(r.invalid(), "RowSeq: a well-typed row at id == count is INVALID");
+    }
+    {
+        auto [r, m] = feed("0e 18 01 07");
+        CHECK(r.complete() && m.grid.empty(), "RowSeq: a mis-typed element past the count is skipped");
+        CHECK(r.skipped() == 1, "RowSeq: and the skip is counted once");
+    }
+    {
+        auto [r, m] = feed("0e 00 01 07");
+        CHECK(r.complete() && m.grid.empty(), "RowSeq: a mis-typed in-range element is skipped and places nothing");
+    }
+    {
+        /* a valid row followed by a mis-typed over-index one: length 1, not 4 */
+        auto [r, m] = feed("0e 06 020a41 07 18 01 07");
+        CHECK(r.complete() && m.grid.size() == 1, "RowSeq: a skipped element does not extend the array");
+    }
+
+    /* §7.4: a repeated field id replaces the array whole... */
+    {
+        auto [r, m] = feed("0e 06 020a41 07 07 0e 0e 020a42 07 07");
+        CHECK(r.complete(), "RowSeq: a repeated field decodes COMPLETE");
+        CHECK(m.grid.size() == 2 && m.grid[0].empty() && m.grid[1] == std::vector<std::string>{"B"},
+              "RowSeq: the later occurrence replaces the array whole");
+    }
+    /* ...but an occurrence skipped under §7.3 is not an occurrence. */
+    {
+        auto [r, m] = feed("0e 06 020a41 07 07 08 01");
+        CHECK(r.complete() && m.grid.size() == 1 && m.grid[0] == std::vector<std::string>{"A"},
+              "RowSeq: a mis-typed repeat leaves the earlier value intact");
+    }
+
+    /* §6.3's other two tiers: the receiver cap, and no bound at all. */
+    {
+        auto [r, m] = feed("16 1e 07 07");
+        const bool placed = r.complete() && m.open.size() == 4;
+        CHECK(placed, "RowSeq: an index under the receiver cap is placed");
+    }
+    {
+        auto [r, m] = feed("16 26 07 07");
+        (void)m;
+        CHECK(r.code() == sofab::Error::LimitExceeded, "RowSeq: an index at the receiver cap is LimitExceeded");
+    }
+    {
+        auto [r, m] = feed("26 06 07 07");
+        (void)m;
+        CHECK(r.code() == sofab::Error::InvalidArgument,
+              "RowSeq: a growable array with neither count nor cap is refused, not read as unlimited");
+    }
+
+    /* heap-free storage: the schema count is the bound, and nothing allocates */
+    {
+        sofab::IStreamObject<RowSeqMsg> in{kMaxSpan};
+        auto w = fromHex("1e 0e 020a41 07 07");
+        const unsigned long afterCtor = g_allocCount;
+        auto r = in.feed(w.data(), w.size());
+        CHECK(r.complete() && (*in).fixed.size() == 2 && (*in).fixed[1].size() == 1,
+              "RowSeq<InlineVector>: the row lands at id 1");
+        CHECK(g_allocCount == afterCtor, "RowSeq<InlineVector>: collecting into heap-free storage allocates nothing");
+    }
+    {
+        auto [r, m] = feed("1e 16 07 07");
+        (void)m;
+        CHECK(r.invalid(), "RowSeq<InlineVector>: a row at id == count is INVALID");
+    }
+
+    /* a row whose wire type is a native array, read by the caller */
+    {
+        auto [r, m] = feed("2e 0b 02 0101 07");
+        CHECK((r.complete() && m.bytes.size() == 2 && m.bytes[0].empty()
+               && m.bytes[1] == std::vector<uint8_t>({1, 1})),
+              "RowSeq: an array-wire row is placed and read by its reader");
+    }
+    {
+        auto [r, m] = feed("2e 0e 07 07");
+        CHECK(r.complete() && m.bytes.empty(), "RowSeq: a sequence where an array row is declared is skipped");
+    }
+}
+
 int main()
 {
     encodeVectors();
@@ -8667,6 +8862,7 @@ int main()
     messageSeqStorageProfiles();
     nestedNativeRowBounds();
     overIndexSkipOrdering();
+    rowSeqCollector();
     skippedSubtreeSuspendsBound();
     truncatedNestedFieldIsNotDeclined();
     heapFreeStorage();
