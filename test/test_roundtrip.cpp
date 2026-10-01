@@ -8703,7 +8703,7 @@ static_assert(sofab::RowSeq<sofab::InlineVector<sofab::InlineVector<sofab::Fixed
                             FixedStrRowReader>::elemDestCap == 2,
               "RowSeq publishes a heap-free destination's capacity");
 static_assert(sizeof(sofab::RowSeq<std::vector<std::vector<std::string>>, StrRowReader>)
-                  == sizeof(sofab::RowSeq<std::vector<std::vector<std::string>>, ByteRowReader>),
+                  == sizeof(sofab::IStreamMessage) + sizeof(void *) + 2 * sizeof(long),
               "a stateless reader costs the collector nothing");
 
 static void rowSeqCollector()
