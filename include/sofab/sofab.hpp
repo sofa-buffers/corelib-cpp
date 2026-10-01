@@ -6998,6 +6998,116 @@ namespace sofab
         }
     };
 
+    /**
+     * @brief Collects a wrapper sequence whose elements are **rows the stream
+     *        cannot read on its own** — a row that is itself a wrapper sequence
+     *        (`array<array<string>>`, `array<array<struct>>`, deeper), or a row
+     *        that must bind through a view of its elements (an `enum` or
+     *        `boolean` row).
+     *
+     * @ref MessageSeq hands each element to @ref IStreamImpl::read, which reads
+     * a message or a span of native scalars and nothing else. A row of strings
+     * is neither, so its read has to be stated by the caller: that is
+     * @p Reader, and it is the only part of a row collector that differs
+     * between schemas. Everything else is the wrapper-array rule every collector
+     * here applies, in the same order:
+     *
+     * 1. **§7.3 first.** An element whose wire type contradicts the row's is
+     *    not an element of this array at all. It is skipped like an unknown id,
+     *    before the index bound — so it cannot breach it — and before the
+     *    placement, so the destination is left exactly as it was. The row's wire
+     *    type is published as @ref elemWire, so the stream runs the same test
+     *    one step earlier, at the element header, and applies the bound only to
+     *    an element that survives it.
+     * 2. **§5.1 index bound**, in §6.3's three categories
+     *    (@ref detail::seqIndexAdmitted): the schema `count` (`cap`,
+     *    `InvalidMessage`), else the receiver cap (`dynCap`, `LimitExceeded`),
+     *    and the destination's own capacity (@ref elemDestCap).
+     * 3. **Placement.** The element id IS the index: the container is grown with
+     *    default rows up to it and the row is read in place at `dest[id]`.
+     * 4. **§7.4.** A repeated field id replaces the array whole, via
+     *    @ref prepare.
+     *
+     * @tparam C      Destination container of rows — `std::vector<Row>` or
+     *                `InlineVector<Row, N>`; deduced from the constructor.
+     * @tparam Reader The row read, one level down. A default-constructible type
+     *                with
+     *                - `static constexpr detail::Wire wire()`, the wire type a
+     *                  row of this schema arrives with — @c SequenceStart for a
+     *                  row that is a wrapper sequence, the array wire type of the
+     *                  backing integer for an enum or boolean row; and
+     *                - `void operator()(IStreamImpl &, typename C::value_type &)`,
+     *                  reading the row that was placed.
+     *
+     *                `wire()` is a function rather than a constant because a
+     *                local class — which is where generated code declares the
+     *                reader, next to the field it reads — may not have static
+     *                data members.
+     *
+     * @par Example
+     * @code
+     * // array<array<string>>: outer count 2, row count 3, element maxlen 8
+     * struct Row {
+     *     static constexpr sofab::detail::Wire wire() noexcept { return sofab::detail::Wire::SequenceStart; }
+     *     void operator()(sofab::IStreamImpl &is, std::vector<std::string> &row) const noexcept {
+     *         sofab::StringSeq c{row, 3, 8, -1, -1}; sofab::read(is, c);
+     *     }
+     * };
+     * sofab::RowSeq c{grid, 2, -1, Row{}}; sofab::read(is, c);
+     * @endcode
+     */
+    template <typename C, typename Reader>
+    struct RowSeq : IStreamMessage
+    {
+        /** Destination container. */
+        using Container = C;
+        /** Row type: the container's element. */
+        using Elem = typename C::value_type;
+
+        C &out;
+        /** Schema `count` N, or -1; an id at or past N is INVALID (§5.1/§7.1). */
+        long cap;
+        /** @copydoc StringSeq::dynCap */
+        long dynCap;
+        /** The row read (@p Reader). */
+        [[no_unique_address]] Reader readRow;
+
+        /** @copydoc StringSeq::elemDestCap */
+        static constexpr long elemDestCap = detail::destCapacity<C>();
+
+        /** @brief The row's wire type, published to the stream (§7.3), as
+         *         @ref StringSeq::elemWire is. */
+        static constexpr int elemWire = static_cast<int>(Reader::wire());
+
+        /**
+         * @param o        Destination; rows are placed at their index id.
+         * @param capacity Schema `count` N, or -1 for an unbounded array.
+         * @param indexCap The caller's `max_dyn_array_count` (@ref dynCap), or -1
+         *                 when none was supplied. Mandatory, as on @ref StringSeq:
+         *                 a schema-unbounded growable array with neither is
+         *                 refused with @ref Error::InvalidArgument, never read as
+         *                 unlimited (§6.2.1).
+         * @param reader   The row read.
+         */
+        explicit RowSeq(C &o, long capacity, long indexCap, Reader reader = {}) noexcept
+            : out(o), cap(capacity), dynCap(indexCap), readRow(reader) {}
+
+        /** §7.4 replace-whole, and absent ⇒ never called: @copydoc StringSeq::prepare */
+        void prepare() noexcept { out.clear(); }
+
+        void deserialize(IStreamImpl &is, sofab::id id, size_t, size_t) noexcept override
+        {
+            /* Decide, place, read in place -- see MessageSeq::deserialize. The
+             * §7.3 test is repeated here although the stream has already run it
+             * for a bounded array: `deserialize` is public, and an unbounded array
+             * publishes no bound for the stream to key on. */
+            if (static_cast<int>(is.wire()) != elemWire) return; /* §7.3 */
+            if (!detail::seqIndexAdmitted(is, id, cap, dynCap, elemDestCap)) return;
+            while (out.size() <= static_cast<size_t>(id)) (void)out.emplace_back();
+            readRow(is, out[static_cast<size_t>(id)]);
+        }
+    };
+
     /* No encode-side trailing-default trim helper lives here, deliberately.
      *
      * A `trimTail` used to, narrowing a container to its non-default prefix

@@ -365,7 +365,8 @@ to skip. Handing the number in makes both conditions a property of the structure
 A wrapper array — an array of `string`, `blob`, `struct` or nested rows — carries
 no count header: its length is *highest present id + 1*, so the element **index**
 is what the cap binds, and it is checked before the container is extended. The
-`StringSeq` / `BlobSeq` / `MessageSeq` collectors take it as their `dynCap`.
+`StringSeq` / `BlobSeq` / `MessageSeq` / `RowSeq` collectors take it as their
+`dynCap`.
 
 **A nested row has a second axis, and it states its own pair.** In
 `array<array<u32>>` the outer array's length is the row **index**, bounded by
@@ -383,6 +384,30 @@ sofab::MessageSeq<std::vector<std::vector<uint32_t>>> c;
 c.out = &numrows; c.cap = 2; c.rowCap = 3;
 sofab::read(is, c);
 ```
+
+**A row the stream cannot read on its own goes through `RowSeq`.** `MessageSeq`
+reads a row of native scalars itself. A row that is itself a wrapper sequence
+(`array<array<string>>`, `array<array<struct>>`, deeper) is not a span of
+scalars, and an `enum` or `boolean` row has to bind through a view of its
+elements. For those, `RowSeq` takes the row read from the caller as a *reader*
+and does the rest: the §7.3 skip, the index bound in §6.3's three categories,
+the placement at `dest[id]` and the §7.4 reset. The reader states the row's wire
+type through a static `wire()` and reads the placed row in `operator()`:
+
+```cpp
+// array<array<string>>: outer count 2, row count 3, element maxlen 8
+struct Row {
+    static constexpr sofab::detail::Wire wire() noexcept { return sofab::detail::Wire::SequenceStart; }
+    void operator()(sofab::IStreamImpl &is, std::vector<std::string> &row) const noexcept {
+        sofab::StringSeq c{row, 3, 8, -1, -1}; sofab::read(is, c);
+    }
+};
+sofab::RowSeq c{grid, /*count*/ 2, /*dynCap*/ -1, Row{}};
+sofab::read(is, c);
+```
+
+Like `StringSeq`, `RowSeq` takes the schema `count` and the receiver cap as
+constructor arguments, so neither can be left out.
 
 #### Strict UTF-8 validation (`SOFAB_STRICT_UTF8`, default ON)
 
@@ -566,8 +591,8 @@ the bytes arrive, whole or one byte at a time.
   top-level field may span and is a **required** constructor argument. The three
   per-field caps — `max_dyn_string_len`, `max_dyn_blob_len`,
   `max_dyn_array_count` — are **arguments**, not settings: the `…Capped` reads
-  take one, and the `StringSeq` / `BlobSeq` / `MessageSeq` collectors take one as
-  `dynCap` for the element index of a wrapper array — and, on `MessageSeq`, as
+  take one, and the `StringSeq` / `BlobSeq` / `MessageSeq` / `RowSeq` collectors
+  take one as `dynCap` for the element index of a wrapper array — and, on `MessageSeq`, as
   `rowDynCap` for the element count of a native nested row. Nothing defaults: the
   numbers belong to generated code, which knows the schema and the target, and an
   omitted one is a compile error or an `Error::InvalidArgument`, never "no cap"
