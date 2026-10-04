@@ -44,6 +44,8 @@
 #include <type_traits>
 #include <vector>
 
+#include "sofab/bits_equal.hpp"
+
 /**
  * @def SOFAB_STRICT_UTF8
  * @brief Compile-time gate for strict UTF-8 validation of `string` payloads
