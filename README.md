@@ -409,6 +409,20 @@ sofab::read(is, c);
 Like `StringSeq`, `RowSeq` takes the schema `count` and the receiver cap as
 constructor arguments, so neither can be left out.
 
+#### Float arrays: `sofab::bitsEqual`
+
+An array field is omitted from the encoding when it equals its declared default
+(MESSAGE_SPEC §2), and floats round-trip bit for bit (CORELIB_PLAN §4.6), so the
+comparison must be on bit patterns, not IEEE `==`: `[-0.0, 1.5]` is not
+`[0.0, 1.5]`, and a NaN equals another NaN only when every bit is the same.
+`sofab::bitsEqual(a, b)` (in `sofab/bits_equal.hpp`, included by `sofab.hpp`) is
+true iff both sequences have the same length and the same 32-bit (`float`) or
+64-bit (`double`) pattern at every index. It takes any contiguous sized range of
+`float` or `double` on either side (`std::vector`, `sofab::InlineVector`,
+`std::array`, `std::span`, a C array) or a braced list as the second argument,
+and compares the length first, then the bytes in one `memcmp`. It allocates
+nothing.
+
 #### Strict UTF-8 validation (`SOFAB_STRICT_UTF8`, default ON)
 
 A `string` carries UTF-8 text; `blob` is the type for opaque bytes. With
@@ -740,10 +754,13 @@ is unchanged and every other build option (`SOFAB_ENABLE_COVERAGE`,
 peer. CI builds and conformance-tests the default, strict configuration as well
 as the non-strict one.
 
-Six suites run under CTest:
+Seven suites run under CTest:
 
 - **`test_roundtrip`** — encode/decode/nested/chunked/skip, the three-valued
   outcome, malformed input, the terminal latch, and §2 sequence framing.
+- **`test_bits_equal`** — `sofab::bitsEqual`: signed zero, NaN payloads,
+  infinities, subnormals, length mismatch, long arrays, both widths, and a
+  cross-check against a plain bit loop.
 - **`test_vectors`** — replays the shared `assets/test_vectors.json` for encode,
   decode, byte-at-a-time streaming and field skipping (every vector carrying
   `skip_ids`, whole and one byte at a time): the `vectors`, `invalid_utf8`,

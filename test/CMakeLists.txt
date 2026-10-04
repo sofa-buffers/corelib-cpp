@@ -16,6 +16,12 @@ target_compile_definitions(test_roundtrip PRIVATE
 target_link_libraries(test_roundtrip PRIVATE sofab_cpp)
 add_test(NAME test_roundtrip COMMAND test_roundtrip)
 
+# sofab::bitsEqual: bit-pattern equality of float arrays (the default-omission test).
+add_executable(test_bits_equal test_bits_equal.cpp)
+target_compile_options(test_bits_equal PRIVATE -Wall -Wextra -Wpedantic -Werror)
+target_link_libraries(test_bits_equal PRIVATE sofab_cpp)
+add_test(NAME test_bits_equal COMMAND test_bits_equal)
+
 # The README's generator example, compiled and run. The example lives here as a
 # real translation unit; the test also checks that README.md still shows exactly
 # these lines, so a documented example cannot drift from one that compiles.
@@ -66,5 +72,6 @@ set_tests_properties(test_vendored_provenance PROPERTIES SKIP_RETURN_CODE 77)
 
 if(SOFAB_ENABLE_COVERAGE)
     target_link_libraries(test_roundtrip PRIVATE sofab_coverage)
+    target_link_libraries(test_bits_equal PRIVATE sofab_coverage)
     target_link_libraries(test_vectors PRIVATE sofab_coverage)
 endif()
