@@ -8822,6 +8822,116 @@ static void rowSeqCollector()
     }
 }
 
+/* --- the encode-side bound refusal and the static storage's clamp ----------
+ *
+ * generator#656. A value past a bound only the schema knows (a string's
+ * `maxlen`, an array's `count`) is refused at encode by the generated code,
+ * which calls OStreamImpl::rejectArgument: the corelib holds no bound, it only
+ * latches InvalidArgument so the verdict reports it and nothing more is
+ * written. The static storage (FixedString / FixedBytes / InlineVector) clamps
+ * at ASSIGNMENT instead, by contract: the first N bytes or elements are kept,
+ * the rest is dropped, and a string is never cut inside a UTF-8 character. --- */
+
+/* A message whose serialize() refuses its value the way generated code does. */
+struct RefusingMsg : sofab::Message
+{
+    std::string s;
+    sofab::OStreamImpl::Result serialize(sofab::OStreamImpl &os) const noexcept override
+    {
+        (void)os.write(0, uint64_t{1});
+        if (s.size() > 4) { return os.rejectArgument(); }
+        return os.write(1, std::string_view{s});
+    }
+    void deserialize(sofab::IStreamImpl &, sofab::id, size_t, size_t) noexcept override {}
+};
+
+static void encodeBoundRefusalAndAssignmentClamp()
+{
+    /* rejectArgument: the Result and the stream verdict both say InvalidArgument,
+     * and a condemned stream writes nothing more. */
+    {
+        sofab::OStreamInline<64> os;
+        (void)os.write(sofab::id(1), uint64_t{1});
+        const size_t before = os.bytesUsed();
+        auto r = os.rejectArgument();
+        CHECK(!r.ok() && r == sofab::Error::InvalidArgument && r.code() == sofab::Error::InvalidArgument,
+              "rejectArgument: the Result carries InvalidArgument");
+        CHECK(!os.ok() && os.error() == sofab::Error::InvalidArgument,
+              "rejectArgument: the stream verdict latches InvalidArgument");
+        CHECK(os.bytesUsed() == before, "rejectArgument: the refusal itself writes nothing");
+        (void)os.write(sofab::id(2), uint64_t{2});
+        CHECK(!os.ok() && os.error() == sofab::Error::InvalidArgument,
+              "rejectArgument: a later healthy write does not clear the verdict");
+    }
+    /* First failure wins: a refusal after an overflow keeps BufferFull. */
+    {
+        sofab::OStreamInline<2> os;
+        (void)os.write(sofab::id(1), std::string_view("too long for two bytes"));
+        CHECK(os.error() == sofab::Error::BufferFull, "rejectArgument control: the overflow latched first");
+        auto r = os.rejectArgument();
+        CHECK(r == sofab::Error::InvalidArgument && os.error() == sofab::Error::BufferFull,
+              "rejectArgument: the first latched failure is kept");
+    }
+    /* Through a message: the refused message encodes to nothing as a success,
+     * the one at its bound encodes. */
+    {
+        RefusingMsg m;
+        m.s = "abcde";
+        sofab::OStreamInline<64> os;
+        auto r = m.serialize(os);
+        CHECK(!r.ok() && !os.ok() && os.error() == sofab::Error::InvalidArgument,
+              "rejectArgument: a refusing serialize() fails the whole encode");
+        m.s = "abcd";
+        sofab::OStreamInline<64> ok;
+        const bool done = m.serialize(ok).ok();
+        CHECK(done && ok.ok() &&
+                  toHex(std::span<const uint8_t>(ok.data(), ok.bytesUsed())) == "0001" "0a2261626364",
+              "rejectArgument control: a value at its bound encodes");
+    }
+
+    /* FixedString: clamp to N bytes, at a character boundary. */
+    {
+        sofab::FixedString<4> a{"xxxxx"};
+        CHECK(a.view() == "xxxx", "FixedString clamp: ASCII is cut at N bytes");
+        sofab::FixedString<4> b{"xxx\xC3\xA9"};               /* xxx + U+00E9 */
+        CHECK(b.view() == "xxx" && b.size() == 3 && b.c_str()[3] == '\0',
+              "FixedString clamp: a 2-byte character that would straddle N is left out whole");
+        sofab::FixedString<4> c{std::string("\xC3\xA9\xC3\xA9\xC3\xA9")};
+        CHECK(c.view() == "\xC3\xA9\xC3\xA9", "FixedString clamp: whole characters up to N are kept");
+        sofab::FixedString<4> d;
+        d = std::string_view("a\xF0\x9F\x98\x80");             /* a + U+1F600 */
+        CHECK(d.view() == "a", "FixedString clamp: a 4-byte character is left out whole");
+        sofab::FixedString<5> e{"a\xF0\x9F\x98\x80"};
+        CHECK(e.size() == 5, "FixedString clamp control: a value at N bytes is kept whole");
+        sofab::FixedString<3> f{"\xF0\x9F\x98\x80"};
+        CHECK(f.empty() && f.c_str()[0] == '\0', "FixedString clamp: nothing fits, nothing is kept");
+        sofab::FixedString<2> g{"a\xE2\x82\xAC"};              /* a + U+20AC, 3 bytes */
+        CHECK(g.view() == "a", "FixedString clamp: a 3-byte character is left out whole");
+        sofab::FixedString<4> h;
+        h = std::string("ab");
+        h = "\xC3\xA9xyz";
+        CHECK(h.view() == "\xC3\xA9xy", "FixedString clamp: a boundary right at N keeps the cut there");
+    }
+    /* InlineVector / FixedBytes: the first N are kept, the rest dropped. */
+    {
+        sofab::InlineVector<uint32_t, 3> v;
+        for (uint32_t x : {1u, 2u, 3u, 4u, 5u}) v.push_back(x);
+        CHECK(v.size() == 3 && v[0] == 1 && v[1] == 2 && v[2] == 3,
+              "InlineVector clamp: push_back past N drops the value, the held ones stay");
+        sofab::InlineVector<sofab::FixedString<4>, 3> t;
+        for (const char *x : {"a", "b", "c", "d"}) t.push_back(sofab::FixedString<4>{x});
+        const sofab::FixedString<4> keep{"zz"};
+        t.push_back(keep);
+        CHECK(t.size() == 3 && t[2].view() == "c",
+              "InlineVector clamp: push_back (move and copy) past N keeps the last held element");
+        sofab::InlineVector<uint16_t, 2> w{7, 8, 9};
+        CHECK(w.size() == 2 && w[1] == 8, "InlineVector clamp: an over-long list keeps its first N");
+        sofab::FixedBytes<4> b{1, 2, 3, 4, 5};
+        for (int i = 0; i < 3; ++i) b.push_back(9);
+        CHECK(b.size() == 4 && b.data()[3] == 4, "FixedBytes clamp: bytes past N are dropped");
+    }
+}
+
 int main()
 {
     encodeVectors();
@@ -8866,6 +8976,7 @@ int main()
     skippedSubtreeSuspendsBound();
     truncatedNestedFieldIsNotDeclined();
     heapFreeStorage();
+    encodeBoundRefusalAndAssignmentClamp();
     allocationMeasurement();
     destinationReuse();
     varintWidthSweep();

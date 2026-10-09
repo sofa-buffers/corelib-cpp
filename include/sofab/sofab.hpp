@@ -743,13 +743,37 @@ namespace sofab
      * what a schema means.
      */
 
+    namespace detail
+    {
+        /*!
+         * @brief Length of the longest prefix of @p sv that is at most @p n bytes
+         *        and does not end inside a UTF-8 character; @p sv is longer
+         *        than @p n.
+         *
+         * The over-long half of @ref FixedString's assignment-time clamp, one
+         * copy for every capacity: the cut moves back while the first byte left
+         * out is a continuation byte (10xxxxxx), so a valid UTF-8 @p sv keeps a
+         * valid UTF-8 prefix. The common case -- the value fits -- stays inline
+         * in @ref FixedString::assign, where a literal's length folds away.
+         */
+        inline std::size_t utf8Prefix(std::string_view sv, std::size_t n) noexcept
+        {
+            while (n > 0 && (static_cast<unsigned char>(sv[n]) & 0xC0u) == 0x80u)
+            {
+                --n;
+            }
+            return n;
+        }
+    } // namespace detail
+
     /*!
      * @brief Fixed-capacity, heap-free string of up to @p N characters.
      *
      * A drop-in, embedded-friendly stand-in for @c std::string on both the encode
      * and decode paths. The characters live in an inline @c std::array, so an
-     * instance allocates nothing, never throws (overflow clamps to @p N), and
-     * compiles cleanly under @c -fno-exceptions / @c -fno-rtti. The buffer never
+     * instance allocates nothing, never throws (an over-long value is clamped to
+     * @p N bytes at a UTF-8 character boundary, see @ref assign), and compiles
+     * cleanly under @c -fno-exceptions / @c -fno-rtti. The buffer never
      * moves, so an instance stays a valid decode destination across every
      * @ref IStreamImpl::feed chunk.
      *
@@ -787,7 +811,7 @@ namespace sofab
         FixedString() noexcept = default;
 
         /*!
-         * @brief Construct from a NUL-terminated C string (truncated to @p N).
+         * @brief Construct from a NUL-terminated C string (clamped to @p N, see @ref assign).
          * @param s  Source string, or @c nullptr for an empty string.
          */
         FixedString(const char *s) noexcept
@@ -796,7 +820,7 @@ namespace sofab
         }
 
         /*!
-         * @brief Construct from a string view (truncated to @p N).
+         * @brief Construct from a string view (clamped to @p N, see @ref assign).
          * @param sv  Source characters (may contain embedded NULs).
          */
         FixedString(std::string_view sv) noexcept
@@ -813,21 +837,21 @@ namespace sofab
             assign(std::string_view{s});
         }
 
-        /*! @brief Assign from a NUL-terminated C string (truncated to @p N). */
+        /*! @brief Assign from a NUL-terminated C string (clamped to @p N, see @ref assign). */
         FixedString &operator=(const char *s) noexcept
         {
             assign(s ? std::string_view{s} : std::string_view{});
             return *this;
         }
 
-        /*! @brief Assign from a string view (truncated to @p N). */
+        /*! @brief Assign from a string view (clamped to @p N, see @ref assign). */
         FixedString &operator=(std::string_view sv) noexcept
         {
             assign(sv);
             return *this;
         }
 
-        /*! @brief Assign from a @c std::string (truncated to @p N). */
+        /*! @brief Assign from a @c std::string (clamped to @p N, see @ref assign). */
         FixedString &operator=(const std::string &s) noexcept
         {
             assign(std::string_view{s});
@@ -835,13 +859,21 @@ namespace sofab
         }
 
         /*!
-         * @brief Replace the contents with @p sv, truncated to @p N characters.
+         * @brief Replace the contents with @p sv, clamped to @p N bytes.
+         *
+         * The assignment-time clamp is a documented contract of the static
+         * storage (the generator's `allow_dynamic: false`): a value longer than
+         * @p N is cut, not refused, before any encoder sees it. The cut never
+         * lands inside a UTF-8 character -- it moves back to the start of the
+         * character that would not fit whole, so the kept prefix is valid UTF-8
+         * whenever @p sv is.
+         *
          * @param sv  Source characters (may contain embedded NULs).
          * @return Reference to @c *this.
          */
         FixedString &assign(std::string_view sv) noexcept
         {
-            len_ = sv.size() > N ? N : sv.size();
+            len_ = sv.size() <= N ? sv.size() : detail::utf8Prefix(sv, N);
             for (std::size_t i = 0; i < len_; ++i)
             {
                 buf_[i] = sv[i];
@@ -985,7 +1017,7 @@ namespace sofab
         FixedBytes() noexcept = default;
 
         /*!
-         * @brief Construct from a brace-enclosed list of bytes (truncated to @p N).
+         * @brief Construct from a brace-enclosed list of bytes (clamped to @p N; extra bytes are dropped).
          *
          * Providing this constructor makes @c FixedBytes a non-aggregate, so a
          * brace-init such as @c b = {1, 2, 3} routes through here and sets
@@ -999,13 +1031,13 @@ namespace sofab
             assign(init);
         }
 
-        /*! @brief Replace the contents from a brace-enclosed list (truncated to @p N). */
+        /*! @brief Replace the contents from a brace-enclosed list (clamped to @p N; extra bytes are dropped). */
         FixedBytes &operator=(std::initializer_list<std::uint8_t> init) noexcept
         {
             return assign(init);
         }
 
-        /*! @brief Replace the contents from a brace-enclosed list (truncated to @p N). */
+        /*! @brief Replace the contents from a brace-enclosed list (clamped to @p N; extra bytes are dropped). */
         FixedBytes &assign(std::initializer_list<std::uint8_t> init) noexcept
         {
             len_ = 0;
@@ -1138,7 +1170,7 @@ namespace sofab
         InlineVector() noexcept = default;
 
         /*!
-         * @brief Construct from a brace-enclosed list of elements (truncated to @p N).
+         * @brief Construct from a brace-enclosed list of elements (clamped to @p N; extra elements are dropped).
          *
          * The presence of this constructor makes @c InlineVector a non-aggregate:
          * @c v = {a, b, c} routes here and sets @ref size, instead of aggregate
@@ -1151,13 +1183,13 @@ namespace sofab
             assign(init);
         }
 
-        /*! @brief Replace the contents from a brace-enclosed list (truncated to @p N). */
+        /*! @brief Replace the contents from a brace-enclosed list (clamped to @p N; extra elements are dropped). */
         InlineVector &operator=(std::initializer_list<T> init) noexcept
         {
             return assign(init);
         }
 
-        /*! @brief Replace the contents from a brace-enclosed list (truncated to @p N). */
+        /*! @brief Replace the contents from a brace-enclosed list (clamped to @p N; extra elements are dropped). */
         InlineVector &assign(std::initializer_list<T> init) noexcept
         {
             len_ = 0;
@@ -1239,10 +1271,17 @@ namespace sofab
             return buf_[i];
         }
 
-        /*! @brief Append a copy of @p v (no-op growth once at capacity @p N). */
-        void push_back(const T &v) noexcept { emplace_back() = v; }
-        /*! @brief Append @p v by move (no-op growth once at capacity @p N). */
-        void push_back(T &&v) noexcept { emplace_back() = static_cast<T &&>(v); }
+        /*!
+         * @brief Append a copy of @p v; once at capacity @p N, @p v is dropped.
+         *
+         * The assignment-time clamp of the static storage: elements past @p N
+         * are left out and the ones already held are kept, so a filled container
+         * holds the first @p N values it was given. (@ref emplace_back, the
+         * decode-side binder, reuses the last slot instead.)
+         */
+        void push_back(const T &v) noexcept { if (len_ < N) buf_[len_++] = v; }
+        /*! @brief Append @p v by move; dropped once at capacity @p N (see above). */
+        void push_back(T &&v) noexcept { if (len_ < N) buf_[len_++] = static_cast<T &&>(v); }
 
         /*! @brief Reference to the last element. */
         T &back() noexcept { return buf_[len_ - 1]; }
@@ -2158,6 +2197,30 @@ namespace sofab
          *         @ref MAX_DEPTH, §6.4's UTF-8 rule), else @ref Error::None.
          */
         [[nodiscard]] Error error() const noexcept { return failure_; }
+
+        /**
+         * @brief Refuse the value being encoded: latch @ref Error::InvalidArgument.
+         *
+         * The hook a generated `serialize()` calls when a field's value is past
+         * a bound only the schema knows -- a string or blob longer than its
+         * `maxlen`, an array with more elements than its `count`. The corelib
+         * holds no schema bound; it records the refusal, so that @ref ok and
+         * @ref error report it exactly like its own §6.2 / §6.4 refusals and no
+         * byte of the message is returned as a success (§5.1). Writes nothing
+         * itself. The encode-side counterpart of IStreamImpl::invalidate.
+         *
+         * Cold and out of line: the refusal is the rare path, and keeping it
+         * out of a generated serialize() keeps that function small enough for
+         * GCC to go on inlining the writes into it (measured: the bench
+         * schema's encode is 11546 Ir/op with this, 12423 with the hook
+         * inlined at its 18 call sites, 11904 before any guard existed).
+         *
+         * @return A Result carrying @ref Error::InvalidArgument.
+         */
+        [[gnu::cold, gnu::noinline]] Result rejectArgument() noexcept
+        {
+            return Result{*this, latch(Error::InvalidArgument)};
+        }
 
         /**
          * @brief Write a field, dispatching on the value's type.
