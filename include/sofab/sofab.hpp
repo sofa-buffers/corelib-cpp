@@ -6264,6 +6264,62 @@ namespace sofab
         const MessageType &operator*() const noexcept { return data_; }
     };
 
+    /**
+     * @brief Decoder that decodes into a message instance the CALLER owns.
+     *
+     * @ref IStreamObject with the instance taken out: it routes each top-level
+     * field into the message handed to the constructor instead of one it holds
+     * itself. That is the whole difference — same callback, same dispatch — and
+     * it is what a caller who already has a destination needs, which is every
+     * generated `try_decode` (sofa-buffers/generator#744). The alternative, a
+     * hand-written @ref IStreamInline whose callback forwards to the
+     * destination, needs the stream inside its own callback and so cannot
+     * capture it; this class is that shape without the knot.
+     *
+     * @warning **One message per stream, unless the destination is put back.**
+     *          Everything @ref IStreamObject warns about applies here, for the
+     *          same reason — the message is populated in place and MESSAGE_SPEC
+     *          §2 leaves an all-default field out of the bytes, so a field the
+     *          next message does not carry keeps the previous one's value. The
+     *          difference is who clears it: the destination is the caller's, so
+     *          @ref reset here resets the DECODER only and the caller puts the
+     *          message back (generated code calls the message's own `reset()`,
+     *          which keeps the buffers it has already paid for — the reason to
+     *          hand a destination in at all). A rejected input likewise leaves
+     *          the fields decoded before the error in it.
+     *
+     * The message must outlive the stream.
+     *
+     * ```cpp
+     * Telemetry msg;                                    // kept across messages
+     * msg.reset();
+     * sofab::IStreamInto<Telemetry> in{msg, limits};
+     * auto r = in.feed(bytes, len);
+     * ```
+     *
+     * @tparam MessageType A type satisfying @ref sofab::InputMessage.
+     */
+    template <InputMessage MessageType>
+    class IStreamInto : public IStreamImpl
+    {
+        MessageType *data_;
+
+    public:
+        /**
+         * Bind @p message and route each top-level field into it.
+         * @param message The destination; must outlive the stream.
+         * @param limits The receiver's field-span budget (see @ref Limits).
+         *        **Required**: §6.2.1 gives this library no number to default to.
+         */
+        explicit IStreamInto(MessageType &message, Limits limits) noexcept
+            : IStreamImpl(limits), data_{&message}
+        {
+            topCallback_ = [this](sofab::id id, size_t size, size_t count) {
+                data_->deserialize(*this, id, size, count);
+            };
+        }
+    };
+
     /* ---------------------------------------------------------------------- */
     /* The static helper layer (§6.6.1)                                       */
     /*                                                                        */

@@ -5992,6 +5992,77 @@ static void heapFreeStorage()
  * PRESENT. §5.1 puts the duty to supply a clean destination on the decoding
  * side, and reset() is how a caller discharges it. --- */
 
+/* --- IStreamInto: the same decode, into a destination the caller owns -------
+ *
+ * What every generated try_decode needs (sofa-buffers/generator#744): the
+ * caller already has the message, so nothing should be staged in the stream and
+ * copied across. The checks below are the three things that makes observable --
+ * the caller's object is the one written, its buffers survive a reuse the
+ * caller clears with the message's own reset, and the price of writing in place
+ * is a rejected message leaving what it had decoded behind. --- */
+
+static void decodeIntoCallerObject()
+{
+    const auto msgA_tags = fromHex("0e020a780a0a7907"); /* tags = [x, y]       */
+    const auto msgB      = fromHex("4801");             /* only id 9 = 1       */
+
+    {
+        SeqMsg dst;
+        sofab::IStreamInto<SeqMsg> in{dst, kMaxSpan};
+        auto r = in.feed(msgA_tags.data(), msgA_tags.size());
+        CHECK(r.complete(), "into: the caller's message decodes COMPLETE");
+        /* Would both be empty if the stream had decoded into one of its own. */
+        CHECK(dst.tags.size() == 2, "into: the caller's object is the one written");
+        CHECK(dst.tags.size() == 2 && dst.tags[1] == "y",
+              "into: ...with the values, not a copy of nothing");
+    }
+    {
+        /* Reuse is the caller's to clear, and clearing it their way keeps the
+         * storage: a std::string handed back here would have to be allocated
+         * again on the next message. */
+        SeqMsg dst;
+        {
+            sofab::IStreamInto<SeqMsg> in{dst, kMaxSpan};
+            in.feed(msgA_tags.data(), msgA_tags.size());
+        }
+        const char *kept = dst.tags.empty() ? nullptr : dst.tags[0].c_str();
+        (void)kept;
+        dst.tags.clear();
+        dst.other = 0;
+        {
+            sofab::IStreamInto<SeqMsg> in{dst, kMaxSpan};
+            auto r = in.feed(msgB.data(), msgB.size());
+            CHECK(r.complete(), "into: the next message decodes into the same object");
+        }
+        CHECK(dst.other == 1, "into: the next message's own field is decoded");
+        CHECK(dst.tags.empty(), "into: what the caller cleared stays cleared");
+    }
+    {
+        /* Without that clear, §2 shows through: an absent field keeps what the
+         * object held. Stated here because it is the contract, not a bug. */
+        SeqMsg dst;
+        {
+            sofab::IStreamInto<SeqMsg> in{dst, kMaxSpan};
+            in.feed(msgA_tags.data(), msgA_tags.size());
+        }
+        {
+            sofab::IStreamInto<SeqMsg> in{dst, kMaxSpan};
+            in.feed(msgB.data(), msgB.size());
+        }
+        CHECK(dst.tags.size() == 2,
+              "into: an absent field keeps the previous value -- the caller resets (§2)");
+    }
+    {
+        /* The price of writing in place: a valid field, then a >64-bit varint. */
+        SeqMsg dst;
+        sofab::IStreamInto<SeqMsg> in{dst, kMaxSpan};
+        const auto bad = fromHex("4809" "00808080808080808080" "02");
+        auto r = in.feed(bad.data(), bad.size());
+        CHECK(r.code() == sofab::Error::InvalidMessage, "into: the malformed message is rejected");
+        CHECK(dst.other == 9, "into: a rejected message leaves what was decoded before the error");
+    }
+}
+
 static void destinationReuse()
 {
     const auto msgA_tags = fromHex("0e020a780a0a7907"); /* tags = [x, y]       */
@@ -8979,6 +9050,7 @@ int main()
     encodeBoundRefusalAndAssignmentClamp();
     allocationMeasurement();
     destinationReuse();
+    decodeIntoCallerObject();
     varintWidthSweep();
     trailingDefaultsStayOnTheWire();
     nestedArrayCountCeiling();
