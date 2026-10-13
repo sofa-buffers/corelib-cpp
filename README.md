@@ -197,6 +197,23 @@ wrapper sequence is present. MESSAGE_SPEC §5.1 places this duty on the decoding
 side. (`IStreamInline` has the same `reset()` but owns no destination; a
 callback-driven decoder clears its own targets.)
 
+#### Decoding into an object you already hold — `IStreamInto`
+
+`IStreamObject` owns the message it fills, so a caller who already has one can
+only decode into the stream's instance and copy it across afterwards. Bind the
+destination instead:
+
+```cpp
+Sensor dst;                                        // yours, reused
+sofab::IStreamInto<Sensor> in{dst, sofab::Limits{64 * 1024}};
+in.feed(a.data(), a.size());                       // writes straight into dst
+```
+
+Nothing is staged and copied, and `dst` keeps the buffers it has already paid
+for. Everything above still holds, with one difference: the destination is
+yours, so putting it back between messages is yours too — `reset()` here
+resets the decoder alone.
+
 ### Deserialize stream
 
 `feed()` takes whatever bytes have arrived; a field straddling a chunk boundary
